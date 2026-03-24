@@ -50,7 +50,7 @@ So the current design should be read as:
 - two lower live kernels
 - one GraphQL adapter layer that can sit on top of either kernel
 
-For the broader runtime/control-plane direction, see `crates/database/live-runtime-unification.md`.
+For the broader runtime/control-plane direction, see `crates/database/live-runtime-architecture.md`.
 
 ## 3. Current end-to-end shape
 

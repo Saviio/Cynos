@@ -471,7 +471,7 @@ deliberate design choices rather than unplanned gaps.
 ## Related docs
 
 - `crates/gql/batched-rendering-design.md`
-- `crates/database/live-runtime-unification.md`
+- `crates/database/live-runtime-architecture.md`
 
 ## License
 
