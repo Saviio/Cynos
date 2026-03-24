@@ -112,18 +112,6 @@ impl GraphqlSubscribers {
     }
 }
 
-fn build_graphql_response(
-    cache: &TableCache,
-    catalog: &cynos_gql::GraphqlCatalog,
-    field: &cynos_gql::bind::BoundRootField,
-    rows: &[Rc<Row>],
-) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
-    let root_field = cynos_gql::execute::render_root_field_rows(cache, catalog, field, rows)?;
-    Ok(cynos_gql::GraphqlResponse::new(
-        cynos_gql::ResponseValue::object(alloc::vec![root_field]),
-    ))
-}
-
 fn build_graphql_response_batched(
     cache: &TableCache,
     catalog: &cynos_gql::GraphqlCatalog,
@@ -133,16 +121,6 @@ fn build_graphql_response_batched(
     rows: &[Rc<Row>],
 ) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
     cynos_gql::batch_render::render_graphql_response(cache, catalog, field, plan, state, rows)
-}
-
-fn build_graphql_response_from_owned_rows(
-    cache: &TableCache,
-    catalog: &cynos_gql::GraphqlCatalog,
-    field: &cynos_gql::bind::BoundRootField,
-    rows: &[Row],
-) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
-    let rows: Vec<Rc<Row>> = rows.iter().cloned().map(Rc::new).collect();
-    build_graphql_response(cache, catalog, field, &rows)
 }
 
 fn build_graphql_response_from_owned_rows_batched(
@@ -403,7 +381,7 @@ pub struct GraphqlSubscriptionObservable {
     cache: Rc<RefCell<TableCache>>,
     catalog: cynos_gql::GraphqlCatalog,
     field: cynos_gql::bind::BoundRootField,
-    batch_plan: Option<cynos_gql::GraphqlBatchPlan>,
+    batch_plan: cynos_gql::GraphqlBatchPlan,
     batch_state: cynos_gql::GraphqlBatchState,
     dependency_table_names: HashMap<TableId, String>,
     root_table_ids: HashSet<TableId>,
@@ -420,6 +398,7 @@ impl GraphqlSubscriptionObservable {
         cache: Rc<RefCell<TableCache>>,
         catalog: cynos_gql::GraphqlCatalog,
         field: cynos_gql::bind::BoundRootField,
+        batch_plan: cynos_gql::GraphqlBatchPlan,
         dependency_table_bindings: Vec<(TableId, String)>,
         root_table_ids: HashSet<TableId>,
         initial_rows: Vec<Rc<Row>>,
@@ -428,9 +407,7 @@ impl GraphqlSubscriptionObservable {
         Self {
             compiled_plan,
             cache,
-            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
-                .ok()
-                .filter(|plan| plan.has_relations()),
+            batch_plan,
             batch_state: cynos_gql::GraphqlBatchState::default(),
             dependency_table_names: dependency_table_bindings.into_iter().collect(),
             catalog,
@@ -509,16 +486,13 @@ impl GraphqlSubscriptionObservable {
             return;
         }
 
-        if let Some(plan) = self.batch_plan.as_ref() {
-            match build_snapshot_batch_invalidation(
-                &self.dependency_table_names,
-                changes,
-                root_changed,
-            ) {
-                Ok(invalidation) => self.batch_state.apply_invalidation(plan, &invalidation),
-                Err(()) => {
-                    self.batch_state = cynos_gql::GraphqlBatchState::default();
-                }
+        match build_snapshot_batch_invalidation(&self.dependency_table_names, changes, root_changed)
+        {
+            Ok(invalidation) => self
+                .batch_state
+                .apply_invalidation(&self.batch_plan, &invalidation),
+            Err(()) => {
+                self.batch_state = cynos_gql::GraphqlBatchState::default();
             }
         }
         self.response_dirty = true;
@@ -575,20 +549,15 @@ impl GraphqlSubscriptionObservable {
         }
 
         let cache = self.cache.borrow();
-        let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_batched(
-                &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &self.root_rows,
-            )
-            .ok()?,
-            None => {
-                build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows).ok()?
-            }
-        };
+        let response = build_graphql_response_batched(
+            &cache,
+            &self.catalog,
+            &self.field,
+            &self.batch_plan,
+            &mut self.batch_state,
+            &self.root_rows,
+        )
+        .ok()?;
         let changed = self
             .response
             .as_ref()
@@ -607,17 +576,14 @@ impl GraphqlSubscriptionObservable {
 
     fn render_response_js_value(&mut self) -> JsValue {
         let cache = self.cache.borrow();
-        let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_batched(
-                &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &self.root_rows,
-            ),
-            None => build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows),
-        };
+        let response = build_graphql_response_batched(
+            &cache,
+            &self.catalog,
+            &self.field,
+            &self.batch_plan,
+            &mut self.batch_state,
+            &self.root_rows,
+        );
         match response {
             Ok(response) => graphql_response_to_js_value(&response),
             Err(_) => JsValue::NULL,
@@ -630,7 +596,7 @@ pub struct GraphqlDeltaObservable {
     cache: Rc<RefCell<TableCache>>,
     catalog: cynos_gql::GraphqlCatalog,
     field: cynos_gql::bind::BoundRootField,
-    batch_plan: Option<cynos_gql::GraphqlBatchPlan>,
+    batch_plan: cynos_gql::GraphqlBatchPlan,
     batch_state: cynos_gql::GraphqlBatchState,
     dependency_table_names: HashMap<TableId, String>,
     has_nested_relations: bool,
@@ -645,15 +611,14 @@ impl GraphqlDeltaObservable {
         cache: Rc<RefCell<TableCache>>,
         catalog: cynos_gql::GraphqlCatalog,
         field: cynos_gql::bind::BoundRootField,
+        batch_plan: cynos_gql::GraphqlBatchPlan,
         dependency_table_bindings: Vec<(TableId, String)>,
         initial_rows: Vec<Row>,
     ) -> Self {
         Self {
             view: MaterializedView::with_initial(dataflow, initial_rows),
             cache,
-            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
-                .ok()
-                .filter(|plan| plan.has_relations()),
+            batch_plan,
             batch_state: cynos_gql::GraphqlBatchState::default(),
             dependency_table_names: dependency_table_bindings.into_iter().collect(),
             catalog,
@@ -712,30 +677,26 @@ impl GraphqlDeltaObservable {
             return;
         }
 
-        let batch_invalidation = self.batch_plan.as_ref().map(|plan| {
-            build_delta_batch_invalidation(
-                plan,
-                &self.dependency_table_names,
-                table_id,
-                &deltas,
-                false,
-            )
-        });
+        let batch_invalidation = build_delta_batch_invalidation(
+            &self.batch_plan,
+            &self.dependency_table_names,
+            table_id,
+            &deltas,
+            false,
+        );
         let output_deltas = self.view.on_table_change(table_id, deltas);
         if output_deltas.is_empty() && !self.has_nested_relations {
             return;
         }
 
-        if let Some(plan) = self.batch_plan.as_ref() {
-            match batch_invalidation {
-                Some(Ok(mut invalidation)) => {
-                    invalidation.root_changed = !output_deltas.is_empty();
-                    self.batch_state.apply_invalidation(plan, &invalidation);
-                }
-                Some(Err(())) => {
-                    self.batch_state = cynos_gql::GraphqlBatchState::default();
-                }
-                None => {}
+        match batch_invalidation {
+            Ok(mut invalidation) => {
+                invalidation.root_changed = !output_deltas.is_empty();
+                self.batch_state
+                    .apply_invalidation(&self.batch_plan, &invalidation);
+            }
+            Err(()) => {
+                self.batch_state = cynos_gql::GraphqlBatchState::default();
             }
         }
         self.response_dirty = true;
@@ -759,21 +720,15 @@ impl GraphqlDeltaObservable {
 
         let rows = self.view.result();
         let cache = self.cache.borrow();
-        let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_from_owned_rows_batched(
-                &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &rows,
-            )
-            .ok()?,
-            None => {
-                build_graphql_response_from_owned_rows(&cache, &self.catalog, &self.field, &rows)
-                    .ok()?
-            }
-        };
+        let response = build_graphql_response_from_owned_rows_batched(
+            &cache,
+            &self.catalog,
+            &self.field,
+            &self.batch_plan,
+            &mut self.batch_state,
+            &rows,
+        )
+        .ok()?;
         let changed = self
             .response
             .as_ref()
@@ -793,19 +748,14 @@ impl GraphqlDeltaObservable {
     fn render_response_js_value(&mut self) -> JsValue {
         let rows = self.view.result();
         let cache = self.cache.borrow();
-        let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_from_owned_rows_batched(
-                &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &rows,
-            ),
-            None => {
-                build_graphql_response_from_owned_rows(&cache, &self.catalog, &self.field, &rows)
-            }
-        };
+        let response = build_graphql_response_from_owned_rows_batched(
+            &cache,
+            &self.catalog,
+            &self.field,
+            &self.batch_plan,
+            &mut self.batch_state,
+            &rows,
+        );
         match response {
             Ok(response) => graphql_response_to_js_value(&response),
             Err(_) => JsValue::NULL,

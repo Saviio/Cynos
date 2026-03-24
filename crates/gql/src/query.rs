@@ -136,7 +136,7 @@ mod tests {
             .get_table_mut("users")
             .unwrap()
             .insert(Row::new(
-                1,
+                1_001,
                 alloc::vec![Value::Int64(1), Value::String("Alice".into())],
             ))
             .unwrap();
@@ -144,7 +144,7 @@ mod tests {
             .get_table_mut("users")
             .unwrap()
             .insert(Row::new(
-                2,
+                1_002,
                 alloc::vec![Value::Int64(2), Value::String("Bob".into())],
             ))
             .unwrap();
@@ -152,7 +152,7 @@ mod tests {
             .get_table_mut("orders")
             .unwrap()
             .insert(Row::new(
-                10,
+                2_010,
                 alloc::vec![Value::Int64(10), Value::Int64(1), Value::Float64(50.0)],
             ))
             .unwrap();
@@ -160,7 +160,7 @@ mod tests {
             .get_table_mut("orders")
             .unwrap()
             .insert(Row::new(
-                11,
+                2_011,
                 alloc::vec![Value::Int64(11), Value::Int64(1), Value::Float64(120.0)],
             ))
             .unwrap();
@@ -168,7 +168,7 @@ mod tests {
             .get_table_mut("orders")
             .unwrap()
             .insert(Row::new(
-                12,
+                2_012,
                 alloc::vec![Value::Int64(12), Value::Int64(2), Value::Float64(80.0)],
             ))
             .unwrap();
@@ -351,6 +351,33 @@ mod tests {
         assert_eq!(users.len(), 2);
         assert_eq!(int64(field(object_fields(&users[0]), "id")), 1);
         assert_eq!(int64(field(object_fields(&users[1]), "id")), 2);
+    }
+
+    #[test]
+    fn execute_operation_renders_nested_relations_for_mutation_payloads() {
+        let mut cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+
+        let inserted = execute_operation(
+            &mut cache,
+            &catalog,
+            "mutation { insertOrders(input: [{ id: 13, user_id: 2, total: 42 }]) { id total buyer { id name } } }",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let root = object_fields(&inserted.response.data);
+        let orders = list_items(field(root, "insertOrders"));
+        assert_eq!(orders.len(), 1);
+
+        let order = object_fields(&orders[0]);
+        assert_eq!(int64(field(order, "id")), 13);
+        assert_eq!(float64(field(order, "total")), 42.0);
+
+        let buyer = object_fields(field(order, "buyer"));
+        assert_eq!(int64(field(buyer, "id")), 2);
+        assert_eq!(string(field(buyer, "name")), "Bob");
     }
 
     #[test]

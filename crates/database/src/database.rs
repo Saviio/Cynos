@@ -653,6 +653,8 @@ fn compile_graphql_live_plan(
 
     let root_plan = cynos_gql::build_root_field_plan(&catalog, &field)
         .map_err(|error| JsValue::from_str(error.message()))?;
+    let batch_plan = cynos_gql::compile_batch_plan(&catalog, &field)
+        .map_err(|error| JsValue::from_str(error.message()))?;
     let mut root_dependency_tables = root_plan.logical_plan.collect_tables();
     if !root_dependency_tables
         .iter()
@@ -683,6 +685,7 @@ fn compile_graphql_live_plan(
                 dependency_set.clone(),
                 catalog.clone(),
                 field.clone(),
+                batch_plan.clone(),
                 dependency_table_bindings.clone(),
                 &root_plan,
             )? {
@@ -710,6 +713,7 @@ fn compile_graphql_live_plan(
         initial_output.summary,
         catalog,
         field,
+        batch_plan,
         dependency_table_bindings,
     ))
 }
@@ -767,6 +771,7 @@ fn build_graphql_delta_live_plan(
     dependency_set: LiveDependencySet,
     catalog: cynos_gql::GraphqlCatalog,
     field: cynos_gql::bind::BoundRootField,
+    batch_plan: cynos_gql::GraphqlBatchPlan,
     dependency_table_bindings: Vec<(TableId, String)>,
     root_plan: &cynos_gql::RootFieldPlan,
 ) -> Result<Option<LivePlan>, JsValue> {
@@ -798,6 +803,7 @@ fn build_graphql_delta_live_plan(
         initial_owned,
         catalog,
         field,
+        batch_plan,
         dependency_table_bindings,
     )))
 }

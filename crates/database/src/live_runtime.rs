@@ -122,12 +122,14 @@ pub(crate) struct RowsDeltaAdapterPlan {
 pub(crate) struct GraphqlSnapshotAdapterPlan {
     pub catalog: GraphqlCatalog,
     pub field: BoundRootField,
+    pub batch_plan: cynos_gql::GraphqlBatchPlan,
     pub dependency_table_bindings: Vec<(TableId, String)>,
 }
 
 pub(crate) struct GraphqlDeltaAdapterPlan {
     pub catalog: GraphqlCatalog,
     pub field: BoundRootField,
+    pub batch_plan: cynos_gql::GraphqlBatchPlan,
     pub dependency_table_bindings: Vec<(TableId, String)>,
 }
 
@@ -209,6 +211,7 @@ impl LivePlan {
         initial_summary: QueryResultSummary,
         catalog: GraphqlCatalog,
         field: BoundRootField,
+        batch_plan: cynos_gql::GraphqlBatchPlan,
         dependency_table_bindings: Vec<(TableId, String)>,
     ) -> Self {
         Self {
@@ -225,6 +228,7 @@ impl LivePlan {
             adapter: AdapterPlan::GraphqlSnapshot(GraphqlSnapshotAdapterPlan {
                 catalog,
                 field,
+                batch_plan,
                 dependency_table_bindings,
             }),
         }
@@ -236,6 +240,7 @@ impl LivePlan {
         initial_rows: Vec<Row>,
         catalog: GraphqlCatalog,
         field: BoundRootField,
+        batch_plan: cynos_gql::GraphqlBatchPlan,
         dependency_table_bindings: Vec<(TableId, String)>,
     ) -> Self {
         Self {
@@ -251,6 +256,7 @@ impl LivePlan {
             adapter: AdapterPlan::GraphqlDelta(GraphqlDeltaAdapterPlan {
                 catalog,
                 field,
+                batch_plan,
                 dependency_table_bindings,
             }),
         }
@@ -349,6 +355,7 @@ impl LivePlan {
             cache,
             adapter.catalog,
             adapter.field,
+            adapter.batch_plan,
             adapter.dependency_table_bindings,
             root_table_ids,
             kernel.initial_rows,
@@ -387,6 +394,7 @@ impl LivePlan {
             cache,
             adapter.catalog,
             adapter.field,
+            adapter.batch_plan,
             adapter.dependency_table_bindings,
             kernel.initial_rows,
         )));

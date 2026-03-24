@@ -272,6 +272,28 @@ pub fn render_graphql_response(
     ])))
 }
 
+pub fn render_root_field_batched(
+    cache: &TableCache,
+    catalog: &GraphqlCatalog,
+    field: &BoundRootField,
+    plan: &GraphqlBatchPlan,
+    state: &mut GraphqlBatchState,
+    rows: &[Rc<Row>],
+) -> GqlResult<ResponseField> {
+    render_root_field(cache, catalog, field, plan, state, rows)
+}
+
+pub fn render_root_field_batched_stateless(
+    cache: &TableCache,
+    catalog: &GraphqlCatalog,
+    field: &BoundRootField,
+    plan: &GraphqlBatchPlan,
+    rows: &[Rc<Row>],
+) -> GqlResult<ResponseField> {
+    let mut state = GraphqlBatchState::default();
+    render_root_field(cache, catalog, field, plan, &mut state, rows)
+}
+
 fn render_root_field(
     cache: &TableCache,
     catalog: &GraphqlCatalog,
@@ -814,7 +836,7 @@ fn find_single_column_index_name<'a>(store: &'a RowStore, column_name: &str) -> 
 mod tests {
     use super::*;
     use crate::plan::build_root_field_plan;
-    use crate::query::{execute_query, PreparedQuery};
+    use crate::query::PreparedQuery;
     use cynos_core::schema::TableBuilder;
     use cynos_core::DataType;
     use hashbrown::{HashMap, HashSet};
@@ -973,6 +995,22 @@ mod tests {
         cache
     }
 
+    fn execute_with_recursive(
+        cache: &TableCache,
+        catalog: &GraphqlCatalog,
+        query: &str,
+    ) -> GraphqlResponse {
+        let prepared = PreparedQuery::parse(query).unwrap();
+        let bound = prepared.bind(catalog, None).unwrap();
+        let field = bound.fields.into_iter().next().unwrap();
+        let root_plan = build_root_field_plan(catalog, &field).unwrap();
+        let rows =
+            execute_logical_plan(cache, &root_plan.table_name, root_plan.logical_plan).unwrap();
+        let field = crate::execute::render_root_field_rows_recursive(cache, catalog, &field, &rows)
+            .unwrap();
+        GraphqlResponse::new(ResponseValue::object(alloc::vec![field]))
+    }
+
     fn execute_with_batch(
         cache: &TableCache,
         catalog: &GraphqlCatalog,
@@ -1017,7 +1055,7 @@ mod tests {
         let catalog = GraphqlCatalog::from_table_cache(&cache);
         let query = "{ users(orderBy: [{ field: ID, direction: ASC }]) { id name posts(orderBy: [{ field: ID, direction: DESC }], limit: 1) { id title } } }";
 
-        let expected = execute_query(&cache, &catalog, query, None, None).unwrap();
+        let expected = execute_with_recursive(&cache, &catalog, query);
         let actual = execute_with_batch(&cache, &catalog, query);
 
         assert_eq!(actual, expected);
@@ -1029,7 +1067,7 @@ mod tests {
         let catalog = GraphqlCatalog::from_table_cache(&cache);
         let query = "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name posts(where: { id: { gte: 11 } }, orderBy: [{ field: ID, direction: ASC }]) { id title comments(orderBy: [{ field: ID, direction: ASC }]) { id body } } } } }";
 
-        let expected = execute_query(&cache, &catalog, query, None, None).unwrap();
+        let expected = execute_with_recursive(&cache, &catalog, query);
         let actual = execute_with_batch(&cache, &catalog, query);
 
         assert_eq!(actual, expected);

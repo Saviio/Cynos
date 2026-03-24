@@ -8,14 +8,20 @@ use core::cmp::Ordering;
 use cynos_core::pattern_match::like;
 use cynos_core::{reserve_row_ids, Row, Value};
 use cynos_jsonb::{JsonPath, JsonbBinary};
-use cynos_storage::{RowStore, TableCache};
+#[cfg(test)]
+use cynos_storage::RowStore;
+use cynos_storage::TableCache;
 
+use crate::batch_render::render_root_field_batched_stateless;
 use crate::bind::{
-    BoundCollectionQuery, BoundColumnAssignment, BoundField, BoundFilter, BoundInsertRow,
-    BoundOperation, BoundRootField, BoundRootFieldKind, BoundSelectionSet, ColumnPredicate,
-    JsonPredicate, PredicateOp,
+    BoundCollectionQuery, BoundColumnAssignment, BoundFilter, BoundInsertRow, BoundOperation,
+    BoundRootField, BoundRootFieldKind, ColumnPredicate, JsonPredicate, PredicateOp,
 };
-use crate::catalog::{GraphqlCatalog, RelationMeta};
+#[cfg(test)]
+use crate::bind::{BoundField, BoundSelectionSet};
+use crate::catalog::GraphqlCatalog;
+#[cfg(test)]
+use crate::catalog::RelationMeta;
 use crate::error::{GqlError, GqlErrorKind, GqlResult};
 use crate::plan::{build_root_field_plan, build_table_query_plan, execute_logical_plan};
 use crate::response::{GraphqlResponse, ResponseField, ResponseValue};
@@ -82,6 +88,17 @@ pub fn execute_bound_operation_mut(
 }
 
 pub fn render_root_field_rows(
+    cache: &TableCache,
+    catalog: &GraphqlCatalog,
+    field: &BoundRootField,
+    rows: &[Rc<Row>],
+) -> GqlResult<ResponseField> {
+    let plan = crate::compile_batch_plan(catalog, field)?;
+    render_root_field_batched_stateless(cache, catalog, field, &plan, rows)
+}
+
+#[cfg(test)]
+pub(crate) fn render_root_field_rows_recursive(
     cache: &TableCache,
     catalog: &GraphqlCatalog,
     field: &BoundRootField,
@@ -210,18 +227,15 @@ fn execute_query_root_field_fallback(
 ) -> GqlResult<ResponseField> {
     match &field.kind {
         BoundRootFieldKind::Collection {
-            table_name,
-            query,
-            selection,
+            table_name, query, ..
         } => {
             let rows = select_collection_rows_fallback(cache, table_name, query)?;
-            let value = render_row_list(cache, catalog, table_name, &rows, selection)?;
-            Ok(ResponseField::new(field.response_key.clone(), value))
+            render_root_field_rows(cache, catalog, field, &rows)
         }
         BoundRootFieldKind::ByPk {
             table_name,
             pk_values,
-            selection,
+            ..
         } => {
             let store = cache.get_table(table_name).ok_or_else(|| {
                 GqlError::new(
@@ -229,12 +243,8 @@ fn execute_query_root_field_fallback(
                     format!("table `{}` was not found", table_name),
                 )
             })?;
-            let row = store.get_by_pk_values(pk_values).into_iter().next();
-            let value = match row {
-                Some(row) => execute_row_selection(cache, catalog, table_name, &row, selection)?,
-                None => ResponseValue::Null,
-            };
-            Ok(ResponseField::new(field.response_key.clone(), value))
+            let rows: Vec<Rc<Row>> = store.get_by_pk_values(pk_values);
+            render_root_field_rows(cache, catalog, field, &rows)
         }
         _ => Err(GqlError::new(
             GqlErrorKind::Unsupported,
@@ -426,6 +436,7 @@ fn select_collection_rows_fallback(
     Ok(apply_collection_query(rows, query))
 }
 
+#[cfg(test)]
 fn render_row_list(
     cache: &TableCache,
     catalog: &GraphqlCatalog,
@@ -442,6 +453,7 @@ fn render_row_list(
     Ok(ResponseValue::list(values))
 }
 
+#[cfg(test)]
 fn execute_row_selection(
     cache: &TableCache,
     catalog: &GraphqlCatalog,
@@ -491,6 +503,7 @@ fn execute_row_selection(
     Ok(ResponseValue::object(fields))
 }
 
+#[cfg(test)]
 fn execute_forward_relation(
     cache: &TableCache,
     catalog: &GraphqlCatalog,
@@ -523,6 +536,7 @@ fn execute_forward_relation(
     }
 }
 
+#[cfg(test)]
 fn execute_reverse_relation(
     cache: &TableCache,
     catalog: &GraphqlCatalog,
@@ -567,6 +581,7 @@ fn execute_reverse_relation(
     Ok(ResponseValue::list(values))
 }
 
+#[cfg(test)]
 fn fetch_rows_by_column(store: &RowStore, column_name: &str, value: &Value) -> Vec<Rc<Row>> {
     if let Some(index_name) = find_single_column_index_name(store, column_name) {
         return fetch_rows_by_index_or_scan(store, index_name, column_name, value);
@@ -586,6 +601,7 @@ fn fetch_rows_by_column(store: &RowStore, column_name: &str, value: &Value) -> V
         .collect()
 }
 
+#[cfg(test)]
 fn fetch_rows_by_index_or_scan(
     store: &RowStore,
     index_name: &str,
@@ -613,6 +629,7 @@ fn fetch_rows_by_index_or_scan(
         .collect()
 }
 
+#[cfg(test)]
 fn find_single_column_index_name<'a>(store: &'a RowStore, column_name: &str) -> Option<&'a str> {
     store
         .schema()
