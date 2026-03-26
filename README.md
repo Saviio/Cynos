@@ -19,7 +19,7 @@ The public JS package lives in `js/packages/core` as `@cynos/core`. The Rust cra
   - `trace()`: incremental view maintenance (IVM), callback receives `{ added, removed }` deltas for incrementalizable queries.
 - A shared live runtime abstraction in `cynos-database` that batches table changes once and fans them out to row subscriptions and GraphQL subscriptions across snapshot and delta backends.
 - Prepared query handles via `prepare()`, which reuse the compiled physical plan and expose `exec()`, `execBinary()`, and `getSchemaLayout()` for repeated execution.
-- A Rust/WASM-first GraphQL adapter via `cynos-gql`, including generated SDL, root `query` / `mutation` / `subscription` fields, prepared GraphQL operations, planner-backed root-table execution for `where` / `orderBy` / `limit` / `offset`, and batched nested relation rendering to avoid in-memory N+1 work during live payload assembly.
+- An engine-native GraphQL surface via `cynos-gql`, including generated SDL, root `query` / `mutation` / `subscription` fields, prepared GraphQL operations, planner-backed root-table execution for `where` / `orderBy` / `limit` / `offset`, shared live-runtime integration with `observe()` / `changes()` / `trace()`, and batched nested relation rendering for live payload assembly.
 - Compiled single-table execution fast paths that can fuse scan/filter/project work and apply row-local reactive patches for simple subscriptions instead of always re-running the full query.
 - Binary query results via `execBinary()` + `getSchemaLayout()` + `ResultSet` for low-overhead WASM-to-JS transfer.
 - JSONB building blocks including a compact binary codec, a JSONPath subset parser/evaluator, JSONB operators, and extraction helpers for GIN indexing.
@@ -180,12 +180,31 @@ Notes:
 
 ## GraphQL Quick Start
 
-Cynos can expose the current table cache as a GraphQL schema directly from Rust/WASM. The GraphQL layer lives in `cynos-gql`, and the JS package exposes it through:
+Cynos can expose the current table cache as a GraphQL schema directly from Rust/WASM. More
+importantly, GraphQL in Cynos is attached at the engine boundary: schema is derived from the
+current database metadata, root reads lower into the native planner, mutations execute through
+native row operations, and subscriptions reuse the same live runtime control plane as
+`observe()` / `changes()` / `trace()`.
+
+For readers familiar with systems such as Hasura or PostGraphile, the main difference here is the
+integration boundary. In Cynos, GraphQL is not primarily a separate service tier over the
+database; it is one of the native query surfaces of the engine itself.
+
+The JS package exposes that surface through:
 
 - `db.graphqlSchema()`: render the current schema as SDL
 - `db.graphql(query, variables?, operationName?)`: execute a query or mutation and return `{ data }`
 - `db.subscribeGraphql(query, variables?, operationName?)`: create a live GraphQL subscription
 - `db.prepareGraphql(query, operationName?)`: reuse a parsed GraphQL document across executions
+
+Operationally, that means:
+
+- schema comes from the current `TableCache`
+- root `query` / `subscription` fields lower into `cynos-query`
+- mutations run through native row operations
+- GraphQL subscriptions share the same live runtime control plane as the row-oriented APIs
+- live nested relation payloads are assembled with Rust-side batching rather than a
+  resolver-per-parent-row execution pattern
 
 Example schema setup with explicit relation names:
 
@@ -346,7 +365,12 @@ const prepared = db.prepareGraphql(
 const sub = prepared.subscribe();
 ```
 
-Runtime note: GraphQL subscriptions compile the root field into the existing planner path, then choose a snapshot/re-query or delta/IVM backend depending on query shape. Nested relation payloads are assembled with Rust-side batching so multi-level relations do not degrade into row-by-row in-memory N+1 fetch patterns.
+Runtime note: GraphQL subscriptions compile the root field into the existing planner path, then
+choose a snapshot/re-query or delta/IVM backend depending on query shape. This does not expose
+`trace()` row deltas directly; GraphQL subscriptions still deliver GraphQL `{ data }` snapshots.
+But the lower live kernels are shared, and nested relation payloads are assembled with Rust-side
+batching so multi-level live payloads do not degrade into row-by-row in-memory N+1 fetch
+patterns.
 
 ### Filters, ordering, and scalars
 
@@ -394,15 +418,24 @@ Current scalar mapping:
 - `Bytes -> Bytes`
 - `Jsonb -> JSON`
 
-### Current GraphQL subset limits
+### Current GraphQL scope boundaries
 
-The current GraphQL surface is intentionally focused on table access and live queries. Today it does not support:
+The current GraphQL surface is intentionally focused on table access and live queries. A few
+areas are better understood as deliberate scope boundaries than as accidental omissions:
 
-- fragments
-- full GraphQL introspection
-- multi-root subscriptions
+- fragments are not implemented; in the current Cynos usage model, GraphQL operations are often
+  prepared close to the database boundary with concrete selections
+- full GraphQL introspection is not implemented; Cynos already owns the schema metadata and can
+  render SDL directly via `db.graphqlSchema()`, which is often the more relevant capability in an
+  embedded setting
+- broader directive support is intentionally minimal; `@include` and `@skip` map cleanly to
+  bind-time selection pruning, while other directive families do not currently map as naturally to
+  the planner and live-query model
+- multi-root subscriptions are intentionally unsupported; they add significant dependency-tracking,
+  backend-selection, invalidation, and materialization complexity for relatively low practical ROI
 
-`@include`, `@skip`, and `__typename` are supported, but GraphQL subscriptions must select exactly one concrete root field.
+`@include`, `@skip`, and `__typename` are supported. GraphQL subscriptions must select exactly one
+concrete root field.
 
 ## Reactive Modes
 
@@ -629,7 +662,7 @@ Notes:
 - Cynos is in-memory only. There is no durable on-disk storage engine yet.
 - Transactions are journaled commit/rollback over in-memory state; this is not durable storage in the traditional ACID database sense.
 - `trace()` only works for plans that the physical planner can lower to incremental dataflow.
-- The GraphQL layer is currently a focused table/query subset: fragments, full introspection, and multi-root subscriptions are not implemented yet, and subscriptions currently require a single concrete root field.
+- The GraphQL layer is intentionally focused on table/query semantics and live queries: fragments and full introspection are not implemented, subscriptions require a single concrete root field, and multi-root subscriptions are intentionally left out because they add substantial complexity for relatively low payoff in the current model.
 - Storage/query integration currently materializes B+Tree and GIN indexes from schema definitions. A standalone hash index implementation also exists in the workspace, but it is not the default secondary-index path in `RowStore` today.
 - JavaScript `Int64` values are exposed through JS-friendly paths as numbers, so values outside the safe integer range lose precision unless the calling pattern is designed around that limitation.
 
