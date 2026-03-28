@@ -8,6 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use cynos_core::schema::{Table, TableBuilder};
 use cynos_core::DataType;
+use cynos_jsonb::JsonPath;
 use wasm_bindgen::prelude::*;
 
 /// Column options for table creation.
@@ -105,6 +106,7 @@ struct IndexDef {
     name: String,
     columns: Vec<String>,
     unique: bool,
+    gin_paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +190,7 @@ impl JsTableBuilder {
             name: name.to_string(),
             columns: cols,
             unique: false,
+            gin_paths: None,
         });
         self
     }
@@ -207,20 +210,29 @@ impl JsTableBuilder {
             name: name.to_string(),
             columns: cols,
             unique: true,
+            gin_paths: None,
         });
         self
     }
 
     /// Adds a JSONB index for specific paths.
     #[wasm_bindgen(js_name = jsonbIndex)]
-    pub fn jsonb_index(mut self, column: &str, _paths: &JsValue) -> Self {
-        // JSONB indices are handled specially - for now just create a regular index
-        // The actual JSONB indexing is done at the storage layer
+    pub fn jsonb_index(mut self, column: &str, paths: &JsValue) -> Self {
+        let gin_paths = if paths.is_null() || paths.is_undefined() {
+            None
+        } else {
+            let normalized = Self::parse_jsonb_index_paths(paths);
+            if normalized.is_empty() {
+                return self;
+            }
+            Some(normalized)
+        };
         let name = alloc::format!("idx_jsonb_{}", column);
         self.indices.push(IndexDef {
             name,
             columns: alloc::vec![column.to_string()],
             unique: false,
+            gin_paths,
         });
         self
     }
@@ -274,9 +286,16 @@ impl JsTableBuilder {
         // Add indices
         for idx in &self.indices {
             let col_refs: Vec<&str> = idx.columns.iter().map(|s| s.as_str()).collect();
-            builder = builder
-                .add_index(&idx.name, &col_refs, idx.unique)
-                .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
+            builder = if let Some(paths) = &idx.gin_paths {
+                let path_refs: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
+                builder
+                    .add_jsonb_index(&idx.name, &idx.columns[0], &path_refs)
+                    .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?
+            } else {
+                builder
+                    .add_index(&idx.name, &col_refs, idx.unique)
+                    .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?
+            };
         }
 
         // Add foreign keys
@@ -302,6 +321,64 @@ impl JsTableBuilder {
     #[wasm_bindgen(getter)]
     pub fn name(&self) -> String {
         self.name.clone()
+    }
+}
+
+impl JsTableBuilder {
+    fn parse_jsonb_index_paths(paths: &JsValue) -> Vec<String> {
+        if let Some(arr) = paths.dyn_ref::<js_sys::Array>() {
+            arr.iter()
+                .filter_map(|value| value.as_string())
+                .filter_map(|path| Self::normalize_jsonb_index_path(&path))
+                .collect()
+        } else if let Some(path) = paths.as_string() {
+            Self::normalize_jsonb_index_path(&path)
+                .map(|normalized| alloc::vec![normalized])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn normalize_jsonb_index_path(path: &str) -> Option<String> {
+        let parsed = JsonPath::parse(path).ok()?;
+        let mut segments = Vec::new();
+        if !Self::collect_jsonb_index_segments(&parsed, &mut segments) || segments.is_empty() {
+            return None;
+        }
+
+        let mut normalized = String::new();
+        for segment in segments {
+            if !normalized.is_empty() {
+                normalized.push('.');
+            }
+            normalized.push_str(&segment);
+        }
+        Some(normalized)
+    }
+
+    fn collect_jsonb_index_segments(path: &JsonPath, segments: &mut Vec<String>) -> bool {
+        match path {
+            JsonPath::Root => true,
+            JsonPath::Field(parent, field) => {
+                if !Self::collect_jsonb_index_segments(parent, segments) {
+                    return false;
+                }
+                segments.push(field.clone());
+                true
+            }
+            JsonPath::Index(parent, index) => {
+                if !Self::collect_jsonb_index_segments(parent, segments) {
+                    return false;
+                }
+                segments.push(index.to_string());
+                true
+            }
+            JsonPath::Slice(_, _, _)
+            | JsonPath::RecursiveField(_, _)
+            | JsonPath::Wildcard(_)
+            | JsonPath::Filter(_, _) => false,
+        }
     }
 }
 

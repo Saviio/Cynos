@@ -28,6 +28,21 @@ struct RowSlot {
     row: Rc<Row>,
 }
 
+#[derive(Clone, Debug)]
+struct GinIndexConfig {
+    column_idx: usize,
+    indexed_paths: Option<Vec<String>>,
+}
+
+impl GinIndexConfig {
+    fn new(column_idx: usize, indexed_paths: Option<Vec<String>>) -> Self {
+        Self {
+            column_idx,
+            indexed_paths: indexed_paths.filter(|paths| !paths.is_empty()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum IndexKey {
     Scalar(Value),
@@ -574,8 +589,8 @@ pub struct RowStore {
     index_columns: BTreeMap<String, Vec<usize>>,
     /// GIN indexes for JSONB columns
     gin_indices: BTreeMap<String, GinIndex>,
-    /// Column indices for GIN indexes
-    gin_index_columns: BTreeMap<String, usize>,
+    /// Column index and path configuration for GIN indexes
+    gin_index_configs: BTreeMap<String, GinIndexConfig>,
 }
 
 impl RowStore {
@@ -592,7 +607,7 @@ impl RowStore {
             secondary_indices: BTreeMap::new(),
             index_columns: BTreeMap::new(),
             gin_indices: BTreeMap::new(),
-            gin_index_columns: BTreeMap::new(),
+            gin_index_configs: BTreeMap::new(),
         };
 
         if let Some(pk) = schema.primary_key() {
@@ -617,9 +632,10 @@ impl RowStore {
                     store
                         .gin_indices
                         .insert(idx.name().to_string(), GinIndex::new());
-                    store
-                        .gin_index_columns
-                        .insert(idx.name().to_string(), col_idx);
+                    store.gin_index_configs.insert(
+                        idx.name().to_string(),
+                        GinIndexConfig::new(col_idx, idx.gin_paths().map(|paths| paths.to_vec())),
+                    );
                 }
             } else {
                 store.secondary_indices.insert(
@@ -773,12 +789,19 @@ impl RowStore {
         }
 
         // Add to GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(col_idx) {
-                    Self::index_jsonb_value(gin_idx, value, row_id);
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::index_jsonb_value(
+                        gin_idx,
+                        value,
+                        row_id,
+                        config.indexed_paths.as_deref(),
+                    );
                 }
             }
         }
@@ -806,12 +829,19 @@ impl RowStore {
         }
 
         // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(col_idx) {
-                    Self::remove_jsonb_from_gin(gin_idx, value, row_id);
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::remove_jsonb_from_gin(
+                        gin_idx,
+                        value,
+                        row_id,
+                        config.indexed_paths.as_deref(),
+                    );
                 }
             }
         }
@@ -879,19 +909,31 @@ impl RowStore {
         }
 
         // Update GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                let old_value = old_row.get(col_idx);
-                let new_value = new_row.get(col_idx);
+                let old_value = old_row.get(config.column_idx);
+                let new_value = new_row.get(config.column_idx);
                 // Only update if the JSONB value changed
                 if old_value != new_value {
                     if let Some(old_val) = old_value {
-                        Self::remove_jsonb_from_gin(gin_idx, old_val, row_id);
+                        Self::remove_jsonb_from_gin(
+                            gin_idx,
+                            old_val,
+                            row_id,
+                            config.indexed_paths.as_deref(),
+                        );
                     }
                     if let Some(new_val) = new_value {
-                        Self::index_jsonb_value(gin_idx, new_val, row_id);
+                        Self::index_jsonb_value(
+                            gin_idx,
+                            new_val,
+                            row_id,
+                            config.indexed_paths.as_deref(),
+                        );
                     }
                 }
             }
@@ -927,12 +969,19 @@ impl RowStore {
         }
 
         // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(col_idx) {
-                    Self::remove_jsonb_from_gin(gin_idx, value, row_id);
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::remove_jsonb_from_gin(
+                        gin_idx,
+                        value,
+                        row_id,
+                        config.indexed_paths.as_deref(),
+                    );
                 }
             }
         }
@@ -992,13 +1041,20 @@ impl RowStore {
         }
 
         // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
                 for row in &deleted_rows {
-                    if let Some(value) = row.get(col_idx) {
-                        Self::remove_jsonb_from_gin(gin_idx, value, row.id());
+                    if let Some(value) = row.get(config.column_idx) {
+                        Self::remove_jsonb_from_gin(
+                            gin_idx,
+                            value,
+                            row.id(),
+                            config.indexed_paths.as_deref(),
+                        );
                     }
                 }
             }
@@ -1419,13 +1475,18 @@ impl RowStore {
     // ========== GIN Index Methods ==========
 
     /// Indexes a JSONB value into the GIN index.
-    fn index_jsonb_value(gin_idx: &mut GinIndex, value: &Value, row_id: RowId) {
+    fn index_jsonb_value(
+        gin_idx: &mut GinIndex,
+        value: &Value,
+        row_id: RowId,
+        indexed_paths: Option<&[String]>,
+    ) {
         let Some(parsed) = Self::parse_jsonb_value(value) else {
             return;
         };
 
         let mut current_path = String::new();
-        Self::index_jsonb_node(gin_idx, &parsed, row_id, &mut current_path);
+        Self::index_jsonb_node(gin_idx, &parsed, row_id, &mut current_path, indexed_paths);
     }
 
     fn index_jsonb_node(
@@ -1433,16 +1494,21 @@ impl RowStore {
         value: &ParsedJsonbValue,
         row_id: RowId,
         current_path: &mut String,
+        indexed_paths: Option<&[String]>,
     ) {
         match value {
             ParsedJsonbValue::Object(obj) => {
                 for (key, child) in obj.iter() {
                     let saved_len = current_path.len();
                     Self::append_gin_path_segment(current_path, key);
-                    gin_idx.add_key(current_path.clone(), row_id);
-                    Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
-                    Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
-                    Self::index_jsonb_node(gin_idx, child, row_id, current_path);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        gin_idx.add_key(current_path.clone(), row_id);
+                        Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
+                        Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::index_jsonb_node(gin_idx, child, row_id, current_path, indexed_paths);
+                    }
                     current_path.truncate(saved_len);
                 }
             }
@@ -1451,10 +1517,14 @@ impl RowStore {
                     let saved_len = current_path.len();
                     let segment = idx.to_string();
                     Self::append_gin_path_segment(current_path, &segment);
-                    gin_idx.add_key(current_path.clone(), row_id);
-                    Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
-                    Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
-                    Self::index_jsonb_node(gin_idx, child, row_id, current_path);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        gin_idx.add_key(current_path.clone(), row_id);
+                        Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
+                        Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::index_jsonb_node(gin_idx, child, row_id, current_path, indexed_paths);
+                    }
                     current_path.truncate(saved_len);
                 }
             }
@@ -1484,13 +1554,18 @@ impl RowStore {
     }
 
     /// Removes JSONB value from the GIN index.
-    fn remove_jsonb_from_gin(gin_idx: &mut GinIndex, value: &Value, row_id: RowId) {
+    fn remove_jsonb_from_gin(
+        gin_idx: &mut GinIndex,
+        value: &Value,
+        row_id: RowId,
+        indexed_paths: Option<&[String]>,
+    ) {
         let Some(parsed) = Self::parse_jsonb_value(value) else {
             return;
         };
 
         let mut current_path = String::new();
-        Self::remove_jsonb_node(gin_idx, &parsed, row_id, &mut current_path);
+        Self::remove_jsonb_node(gin_idx, &parsed, row_id, &mut current_path, indexed_paths);
     }
 
     fn remove_jsonb_node(
@@ -1498,16 +1573,27 @@ impl RowStore {
         value: &ParsedJsonbValue,
         row_id: RowId,
         current_path: &mut String,
+        indexed_paths: Option<&[String]>,
     ) {
         match value {
             ParsedJsonbValue::Object(obj) => {
                 for (key, child) in obj.iter() {
                     let saved_len = current_path.len();
                     Self::append_gin_path_segment(current_path, key);
-                    gin_idx.remove_key(current_path, row_id);
-                    Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
-                    Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
-                    Self::remove_jsonb_node(gin_idx, child, row_id, current_path);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        gin_idx.remove_key(current_path, row_id);
+                        Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
+                        Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::remove_jsonb_node(
+                            gin_idx,
+                            child,
+                            row_id,
+                            current_path,
+                            indexed_paths,
+                        );
+                    }
                     current_path.truncate(saved_len);
                 }
             }
@@ -1516,15 +1602,44 @@ impl RowStore {
                     let saved_len = current_path.len();
                     let segment = idx.to_string();
                     Self::append_gin_path_segment(current_path, &segment);
-                    gin_idx.remove_key(current_path, row_id);
-                    Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
-                    Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
-                    Self::remove_jsonb_node(gin_idx, child, row_id, current_path);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        gin_idx.remove_key(current_path, row_id);
+                        Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
+                        Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::remove_jsonb_node(
+                            gin_idx,
+                            child,
+                            row_id,
+                            current_path,
+                            indexed_paths,
+                        );
+                    }
                     current_path.truncate(saved_len);
                 }
             }
             _ => {}
         }
+    }
+
+    fn should_index_gin_path(indexed_paths: Option<&[String]>, current_path: &str) -> bool {
+        indexed_paths.map_or(true, |paths| {
+            paths
+                .iter()
+                .any(|indexed_path| indexed_path == current_path)
+        })
+    }
+
+    fn should_descend_gin_path(indexed_paths: Option<&[String]>, current_path: &str) -> bool {
+        indexed_paths.map_or(true, |paths| {
+            let mut prefix = String::with_capacity(current_path.len() + 1);
+            prefix.push_str(current_path);
+            prefix.push('.');
+            paths
+                .iter()
+                .any(|indexed_path| indexed_path.starts_with(&prefix))
+        })
     }
 
     fn remove_jsonb_scalar(
@@ -2807,6 +2922,21 @@ mod tests {
             .unwrap()
     }
 
+    fn test_schema_with_path_gin_index() -> Table {
+        TableBuilder::new("test_jsonb")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("data", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_jsonb_index("idx_data_gin", "data", &["address.city", "status"])
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
     fn make_jsonb(json_str: &str) -> Value {
         Value::Jsonb(cynos_core::JsonbValue(json_str.as_bytes().to_vec()))
     }
@@ -2918,6 +3048,50 @@ mod tests {
             array_value_rows.len(),
             1,
             "GIN index should expose indexed array element postings",
+        );
+    }
+
+    #[test]
+    fn test_gin_index_respects_configured_paths() {
+        let mut store = RowStore::new(test_schema_with_path_gin_index());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(
+                        r#"{"name":"Alice","status":"active","address":{"city":"Beijing","zip":"100000"},"tags":["vip","premium"]}"#,
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "address.city", "Beijing")
+                .len(),
+            1,
+            "configured nested path should be indexed",
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "status", "active")
+                .len(),
+            1,
+            "configured top-level path should be indexed",
+        );
+        assert_eq!(
+            store.gin_index_get_by_key("idx_data_gin", "name").len(),
+            0,
+            "unconfigured sibling path should not be indexed",
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "tags.1", "premium")
+                .len(),
+            0,
+            "unconfigured array path should not be indexed",
         );
     }
 

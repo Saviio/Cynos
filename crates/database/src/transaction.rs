@@ -13,7 +13,7 @@ use core::cell::RefCell;
 use cynos_core::{reserve_row_ids, Row};
 use cynos_reactive::TableId;
 use cynos_storage::{TableCache, Transaction, TransactionState};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
 
 /// JavaScript-friendly transaction wrapper.
@@ -23,8 +23,8 @@ pub struct JsTransaction {
     query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     inner: Option<Transaction>,
-    /// Pending changes: (table_id, changed_row_ids)
-    pending_changes: Vec<(TableId, HashSet<u64>)>,
+    /// Pending changes grouped by table so one commit triggers one live flush per table.
+    pending_changes: HashMap<TableId, HashSet<u64>>,
 }
 
 impl JsTransaction {
@@ -38,8 +38,19 @@ impl JsTransaction {
             query_registry,
             table_id_map,
             inner: Some(Transaction::begin()),
-            pending_changes: Vec::new(),
+            pending_changes: HashMap::new(),
         }
+    }
+
+    fn record_pending_change(&mut self, table_id: TableId, changed_ids: HashSet<u64>) {
+        if changed_ids.is_empty() {
+            return;
+        }
+
+        self.pending_changes
+            .entry(table_id)
+            .or_insert_with(HashSet::new)
+            .extend(changed_ids);
     }
 }
 
@@ -78,9 +89,12 @@ impl JsTransaction {
                 .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
         }
 
+        drop(cache);
+
         // Store pending changes
-        if let Some(table_id) = self.table_id_map.borrow().get(table).copied() {
-            self.pending_changes.push((table_id, inserted_ids));
+        let table_id = self.table_id_map.borrow().get(table).copied();
+        if let Some(table_id) = table_id {
+            self.record_pending_change(table_id, inserted_ids);
         }
 
         Ok(())
@@ -160,8 +174,11 @@ impl JsTransaction {
             update_count += 1;
         }
 
-        if let Some(table_id) = self.table_id_map.borrow().get(table).copied() {
-            self.pending_changes.push((table_id, updated_ids));
+        drop(cache);
+
+        let table_id = self.table_id_map.borrow().get(table).copied();
+        if let Some(table_id) = table_id {
+            self.record_pending_change(table_id, updated_ids);
         }
 
         Ok(update_count)
@@ -203,8 +220,11 @@ impl JsTransaction {
                 .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
         }
 
-        if let Some(table_id) = self.table_id_map.borrow().get(table).copied() {
-            self.pending_changes.push((table_id, deleted_ids));
+        drop(cache);
+
+        let table_id = self.table_id_map.borrow().get(table).copied();
+        if let Some(table_id) = table_id {
+            self.record_pending_change(table_id, deleted_ids);
         }
 
         Ok(delete_count)
@@ -221,7 +241,7 @@ impl JsTransaction {
             .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
 
         // Notify query registry of all changes
-        for (table_id, changed_ids) in self.pending_changes.drain(..) {
+        for (table_id, changed_ids) in self.pending_changes.drain() {
             self.query_registry
                 .borrow_mut()
                 .on_table_change(table_id, &changed_ids);
@@ -242,7 +262,7 @@ impl JsTransaction {
             .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
 
         // Notify Live Query of rollback changes (data was restored)
-        for (table_id, changed_ids) in self.pending_changes.drain(..) {
+        for (table_id, changed_ids) in self.pending_changes.drain() {
             self.query_registry
                 .borrow_mut()
                 .on_table_change(table_id, &changed_ids);

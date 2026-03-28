@@ -491,14 +491,16 @@ fn register_table_context(cache: &TableCache, ctx: &mut ExecutionContext, table_
                 cynos_core::schema::IndexType::BTree => QueryIndexType::BTree,
                 cynos_core::schema::IndexType::Gin => QueryIndexType::Gin,
             };
-            indexes.push(
-                IndexInfo::new(
-                    idx.name(),
-                    idx.columns().iter().map(|c| c.name.clone()).collect(),
-                    idx.is_unique(),
-                )
-                .with_type(index_type),
-            );
+            let mut index_info = IndexInfo::new(
+                idx.name(),
+                idx.columns().iter().map(|c| c.name.clone()).collect(),
+                idx.is_unique(),
+            )
+            .with_type(index_type);
+            if let Some(paths) = idx.gin_paths() {
+                index_info = index_info.with_gin_paths(paths.to_vec());
+            }
+            indexes.push(index_info);
         }
 
         ctx.register_table(

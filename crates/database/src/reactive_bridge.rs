@@ -12,7 +12,7 @@
 //! Otherwise, falls back to re-query.
 
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
-use crate::convert::{gql_response_to_js, row_to_js, value_to_js};
+use crate::convert::{gql_response_to_js, value_to_js};
 use crate::query_engine::{
     execute_compiled_physical_plan_with_summary, CompiledPhysicalPlan, QueryResultSummary,
 };
@@ -64,7 +64,7 @@ fn query_results_equal(
 
 #[derive(Default)]
 struct GraphqlSubscribers {
-    callbacks: Vec<(usize, Box<dyn Fn(&cynos_gql::GraphqlResponse) + 'static>)>,
+    callbacks: Vec<(usize, Box<dyn Fn(&JsValue) + 'static>)>,
     keepalive_ids: HashSet<usize>,
     next_sub_id: usize,
 }
@@ -79,7 +79,7 @@ impl GraphqlSubscribers {
 
     fn add_callback<F>(&mut self, callback: F) -> usize
     where
-        F: Fn(&cynos_gql::GraphqlResponse) + 'static,
+        F: Fn(&JsValue) + 'static,
     {
         let id = self.next_sub_id;
         self.next_sub_id += 1;
@@ -105,9 +105,9 @@ impl GraphqlSubscribers {
         self.callbacks.len()
     }
 
-    fn emit(&self, response: &cynos_gql::GraphqlResponse) {
+    fn emit(&self, payload: &JsValue) {
         for (_, callback) in &self.callbacks {
-            callback(response);
+            callback(payload);
         }
     }
 }
@@ -410,6 +410,7 @@ pub struct GraphqlSubscriptionObservable {
     root_rows: Vec<Rc<Row>>,
     root_summary: QueryResultSummary,
     response: Option<cynos_gql::GraphqlResponse>,
+    response_js: Option<JsValue>,
     response_dirty: bool,
     subscribers: GraphqlSubscribers,
 }
@@ -439,6 +440,7 @@ impl GraphqlSubscriptionObservable {
             root_rows: initial_rows,
             root_summary: initial_summary,
             response: None,
+            response_js: None,
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -450,23 +452,33 @@ impl GraphqlSubscriptionObservable {
 
     pub fn response_js_value(&mut self) -> JsValue {
         if self.response.is_some() && !self.response_dirty {
-            return graphql_response_to_js_value(self.response.as_ref().unwrap());
+            if let Some(payload) = &self.response_js {
+                return payload.clone();
+            }
+
+            let payload = graphql_response_to_js_value(self.response.as_ref().unwrap());
+            self.response_js = Some(payload.clone());
+            return payload;
         }
 
         if self.subscribers.callback_count() == 0 {
             return self.render_response_js_value();
         }
 
-        match self.current_response() {
-            Some(response) => graphql_response_to_js_value(response),
-            None => JsValue::NULL,
+        if self.current_response().is_none() {
+            return JsValue::NULL;
+        }
+
+        if let Some(payload) = &self.response_js {
+            payload.clone()
+        } else {
+            let payload = graphql_response_to_js_value(self.response.as_ref().unwrap());
+            self.response_js = Some(payload.clone());
+            payload
         }
     }
 
-    pub fn subscribe<F: Fn(&cynos_gql::GraphqlResponse) + 'static>(
-        &mut self,
-        callback: F,
-    ) -> usize {
+    pub fn subscribe<F: Fn(&JsValue) + 'static>(&mut self, callback: F) -> usize {
         self.subscribers.add_callback(callback)
     }
 
@@ -528,8 +540,9 @@ impl GraphqlSubscriptionObservable {
 
         if let Some(changed) = self.materialize_response_if_dirty() {
             if changed {
-                if let Some(response) = self.response.as_ref() {
-                    self.subscribers.emit(response);
+                if self.response.is_some() {
+                    let payload = self.response_js_value();
+                    self.subscribers.emit(&payload);
                 }
             }
         }
@@ -595,6 +608,7 @@ impl GraphqlSubscriptionObservable {
             .map_or(true, |current| *current != response);
         if changed {
             self.response = Some(response);
+            self.response_js = None;
         }
         self.response_dirty = false;
         Some(changed)
@@ -635,6 +649,7 @@ pub struct GraphqlDeltaObservable {
     dependency_table_names: HashMap<TableId, String>,
     has_nested_relations: bool,
     response: Option<cynos_gql::GraphqlResponse>,
+    response_js: Option<JsValue>,
     response_dirty: bool,
     subscribers: GraphqlSubscribers,
 }
@@ -660,6 +675,7 @@ impl GraphqlDeltaObservable {
             has_nested_relations: root_field_has_relations(&field),
             field,
             response: None,
+            response_js: None,
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -671,16 +687,29 @@ impl GraphqlDeltaObservable {
 
     pub fn response_js_value(&mut self) -> JsValue {
         if self.response.is_some() && !self.response_dirty {
-            return graphql_response_to_js_value(self.response.as_ref().unwrap());
+            if let Some(payload) = &self.response_js {
+                return payload.clone();
+            }
+
+            let payload = graphql_response_to_js_value(self.response.as_ref().unwrap());
+            self.response_js = Some(payload.clone());
+            return payload;
         }
 
         if self.subscribers.callback_count() == 0 {
             return self.render_response_js_value();
         }
 
-        match self.current_response() {
-            Some(response) => graphql_response_to_js_value(response),
-            None => JsValue::NULL,
+        if self.current_response().is_none() {
+            return JsValue::NULL;
+        }
+
+        if let Some(payload) = &self.response_js {
+            payload.clone()
+        } else {
+            let payload = graphql_response_to_js_value(self.response.as_ref().unwrap());
+            self.response_js = Some(payload.clone());
+            payload
         }
     }
 
@@ -688,10 +717,7 @@ impl GraphqlDeltaObservable {
         self.view.dependencies()
     }
 
-    pub fn subscribe<F: Fn(&cynos_gql::GraphqlResponse) + 'static>(
-        &mut self,
-        callback: F,
-    ) -> usize {
+    pub fn subscribe<F: Fn(&JsValue) + 'static>(&mut self, callback: F) -> usize {
         self.subscribers.add_callback(callback)
     }
 
@@ -745,8 +771,9 @@ impl GraphqlDeltaObservable {
 
         if let Some(changed) = self.materialize_response_if_dirty() {
             if changed {
-                if let Some(response) = self.response.as_ref() {
-                    self.subscribers.emit(response);
+                if self.response.is_some() {
+                    let payload = self.response_js_value();
+                    self.subscribers.emit(&payload);
                 }
             }
         }
@@ -780,6 +807,7 @@ impl GraphqlDeltaObservable {
             .map_or(true, |current| *current != response);
         if changed {
             self.response = Some(response);
+            self.response_js = None;
         }
         self.response_dirty = false;
         Some(changed)
@@ -834,7 +862,7 @@ impl GraphqlSubscriptionInner {
         }
     }
 
-    fn subscribe<F: Fn(&cynos_gql::GraphqlResponse) + 'static>(&self, callback: F) -> usize {
+    fn subscribe<F: Fn(&JsValue) + 'static>(&self, callback: F) -> usize {
         match self {
             Self::Snapshot(inner) => inner.borrow_mut().subscribe(callback),
             Self::Delta(inner) => inner.borrow_mut().subscribe(callback),
@@ -1236,9 +1264,8 @@ impl JsGraphqlSubscription {
     pub fn subscribe(&self, callback: js_sys::Function) -> js_sys::Function {
         let inner = self.inner.clone();
         let initial_callback = callback.clone();
-        let sub_id = inner.subscribe(move |response| {
-            let payload = graphql_response_to_js_value(response);
-            callback.call1(&JsValue::NULL, &payload).ok();
+        let sub_id = inner.subscribe(move |payload| {
+            callback.call1(&JsValue::NULL, payload).ok();
         });
         let initial = inner.response_js_value();
         initial_callback.call1(&JsValue::NULL, &initial).ok();
@@ -1366,8 +1393,12 @@ impl JsChangesStream {
 /// Converts rows to a JavaScript array.
 fn rows_to_js_array(rows: &[Rc<Row>], schema: &Table) -> JsValue {
     let arr = js_sys::Array::new_with_length(rows.len() as u32);
+    let mut jsonb_cache: HashMap<Vec<u8>, JsValue> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
-        arr.set(i as u32, row_to_js(row, schema));
+        arr.set(
+            i as u32,
+            row_to_js_cached(row.as_ref(), schema, &mut jsonb_cache),
+        );
     }
     arr.into()
 }
@@ -1376,17 +1407,50 @@ fn rows_to_js_array(rows: &[Rc<Row>], schema: &Table) -> JsValue {
 /// Only includes the specified columns in the output.
 fn projected_rows_to_js_array(rows: &[Rc<Row>], column_names: &[String]) -> JsValue {
     let arr = js_sys::Array::new_with_length(rows.len() as u32);
+    let mut jsonb_cache: HashMap<Vec<u8>, JsValue> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
         let obj = js_sys::Object::new();
         for (col_idx, col_name) in column_names.iter().enumerate() {
             if let Some(value) = row.get(col_idx) {
-                let js_val = value_to_js(value);
+                let js_val = value_to_js_cached(value, &mut jsonb_cache);
                 js_sys::Reflect::set(&obj, &JsValue::from_str(col_name), &js_val).ok();
             }
         }
         arr.set(i as u32, obj.into());
     }
     arr.into()
+}
+
+fn row_to_js_cached(
+    row: &Row,
+    schema: &Table,
+    jsonb_cache: &mut HashMap<Vec<u8>, JsValue>,
+) -> JsValue {
+    let obj = js_sys::Object::new();
+
+    for (i, col) in schema.columns().iter().enumerate() {
+        if let Some(value) = row.get(i) {
+            let js_val = value_to_js_cached(value, jsonb_cache);
+            js_sys::Reflect::set(&obj, &JsValue::from_str(col.name()), &js_val).ok();
+        }
+    }
+
+    obj.into()
+}
+
+fn value_to_js_cached(value: &Value, jsonb_cache: &mut HashMap<Vec<u8>, JsValue>) -> JsValue {
+    match value {
+        Value::Jsonb(jsonb) => {
+            if let Some(cached) = jsonb_cache.get(jsonb.0.as_slice()) {
+                return cached.clone();
+            }
+
+            let parsed = value_to_js(value);
+            jsonb_cache.insert(jsonb.0.clone(), parsed.clone());
+            parsed
+        }
+        _ => value_to_js(value),
+    }
 }
 
 #[cfg(test)]

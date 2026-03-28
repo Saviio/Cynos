@@ -1203,9 +1203,8 @@ impl IndexSelection {
                 if let Expr::Column(col) = &args[0] {
                     let column_name = &col.column;
                     let column_index = col.index;
-                    if let Some(index) = ctx.find_gin_index(table, column_name) {
-                        let path =
-                            self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    let path = self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    if let Some(index) = ctx.find_gin_index_for_path(table, column_name, &path) {
                         let value = self.extract_literal(&args[2])?;
                         return Some(GinPredicateInfo {
                             index: index.name.clone(),
@@ -1226,9 +1225,8 @@ impl IndexSelection {
                 if let Expr::Column(col) = &args[0] {
                     let column_name = &col.column;
                     let column_index = col.index;
-                    if let Some(index) = ctx.find_gin_index(table, column_name) {
-                        let path =
-                            self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    let path = self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    if let Some(index) = ctx.find_gin_index_for_path(table, column_name, &path) {
                         let prefilter_pairs =
                             self.extract_string_literal(&args[2]).and_then(|needle| {
                                 let pairs = contains_trigram_pairs(&path, &needle);
@@ -1262,9 +1260,8 @@ impl IndexSelection {
                 if let Expr::Column(col) = &args[0] {
                     let column_name = &col.column;
                     let column_index = col.index;
-                    if let Some(index) = ctx.find_gin_index(table, column_name) {
-                        let path =
-                            self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    let path = self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    if let Some(index) = ctx.find_gin_index_for_path(table, column_name, &path) {
                         return Some(GinPredicateInfo {
                             index: index.name.clone(),
                             column: column_name.clone(),

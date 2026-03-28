@@ -3,10 +3,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "engine:compare": "node ./engine_compare.mjs"
+    "engine:compare": "node ./engine_compare.mjs",
+    "live-query:compare": "node ./live_query_worker_compare.mjs",
+    "tanstack:worker-bench": "node ./tanstack_db_worker_benchmark.mjs"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.4.0",
+    "@tanstack/db": "^0.6.0",
+    "@tanstack/query-core": "^5.95.2",
+    "@tanstack/query-db-collection": "^1.0.31",
     "rxdb": "^16.21.1",
     "sql.js": "^1.14.1"
   }

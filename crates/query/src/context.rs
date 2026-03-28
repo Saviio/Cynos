@@ -37,6 +37,8 @@ pub struct IndexInfo {
     pub is_unique: bool,
     /// Index type (BTree or GIN).
     pub index_type: QueryIndexType,
+    /// Optional normalized JSON paths covered by a GIN index.
+    pub gin_paths: Option<Vec<String>>,
 }
 
 impl IndexInfo {
@@ -47,6 +49,7 @@ impl IndexInfo {
             columns,
             is_unique,
             index_type: QueryIndexType::BTree,
+            gin_paths: None,
         }
     }
 
@@ -57,12 +60,23 @@ impl IndexInfo {
             columns,
             is_unique: false, // GIN indexes are never unique
             index_type: QueryIndexType::Gin,
+            gin_paths: None,
         }
     }
 
     /// Sets the index type.
     pub fn with_type(mut self, index_type: QueryIndexType) -> Self {
         self.index_type = index_type;
+        self
+    }
+
+    /// Restricts a GIN index to a set of normalized JSON paths.
+    pub fn with_gin_paths(mut self, gin_paths: Vec<String>) -> Self {
+        self.gin_paths = if gin_paths.is_empty() {
+            None
+        } else {
+            Some(gin_paths)
+        };
         self
     }
 
@@ -89,6 +103,14 @@ impl IndexInfo {
     /// Returns true if this index preserves key order.
     pub fn supports_ordering(&self) -> bool {
         self.supports_range()
+    }
+
+    /// Returns whether this GIN index supports the given normalized path.
+    pub fn supports_gin_path(&self, path: &str) -> bool {
+        self.is_gin()
+            && self.gin_paths.as_ref().map_or(true, |paths| {
+                paths.iter().any(|candidate| candidate == path)
+            })
     }
 }
 
@@ -175,6 +197,35 @@ impl ExecutionContext {
         })
     }
 
+    /// Finds the most specific GIN index for the given column/path pair.
+    pub fn find_gin_index_for_path(
+        &self,
+        table: &str,
+        column: &str,
+        path: &str,
+    ) -> Option<&IndexInfo> {
+        let stats = self.table_stats.get(table)?;
+
+        stats
+            .indexes
+            .iter()
+            .find(|idx| {
+                idx.is_gin()
+                    && idx.columns.iter().any(|c| c == column)
+                    && idx
+                        .gin_paths
+                        .as_ref()
+                        .is_some_and(|paths| paths.iter().any(|candidate| candidate == path))
+            })
+            .or_else(|| {
+                stats.indexes.iter().find(|idx| {
+                    idx.is_gin()
+                        && idx.columns.iter().any(|c| c == column)
+                        && idx.gin_paths.is_none()
+                })
+            })
+    }
+
     /// Finds the primary key index (unique BTree index) for a table.
     /// Returns the first unique BTree index found, which is typically the primary key.
     pub fn find_primary_index(&self, table: &str) -> Option<&IndexInfo> {
@@ -239,5 +290,32 @@ mod tests {
 
         let idx = ctx.find_index("users", &["email"]);
         assert!(idx.is_none());
+    }
+
+    #[test]
+    fn test_find_gin_index_for_path() {
+        let mut ctx = ExecutionContext::new();
+
+        let stats = TableStats {
+            row_count: 100,
+            is_sorted: false,
+            indexes: alloc::vec![
+                IndexInfo::new_gin("idx_metadata_tier", alloc::vec!["metadata".into()])
+                    .with_gin_paths(alloc::vec!["customer.tier".into()]),
+                IndexInfo::new_gin("idx_metadata_full", alloc::vec!["metadata".into()]),
+            ],
+        };
+
+        ctx.register_table("issues", stats);
+
+        let idx = ctx
+            .find_gin_index_for_path("issues", "metadata", "customer.tier")
+            .unwrap();
+        assert_eq!(idx.name, "idx_metadata_tier");
+
+        let fallback = ctx
+            .find_gin_index_for_path("issues", "metadata", "risk.bucket")
+            .unwrap();
+        assert_eq!(fallback.name, "idx_metadata_full");
     }
 }

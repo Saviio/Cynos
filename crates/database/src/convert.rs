@@ -9,7 +9,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use cynos_core::schema::Table;
 use cynos_core::{DataType, Row, Value};
+use hashbrown::HashMap;
 use wasm_bindgen::prelude::*;
+
+type JsonbJsCache = HashMap<Vec<u8>, JsValue>;
 
 /// Converts a JavaScript value to an Cynos Value.
 ///
@@ -129,21 +132,41 @@ pub fn value_to_js(value: &Value) -> JsValue {
     }
 }
 
-/// Converts an Cynos Row to a JavaScript object.
-///
-/// The returned object has properties named after the table columns.
-pub fn row_to_js(row: &Row, schema: &Table) -> JsValue {
+fn value_to_js_with_cache(value: &Value, jsonb_cache: &mut JsonbJsCache) -> JsValue {
+    match value {
+        Value::Jsonb(j) => {
+            if let Some(cached) = jsonb_cache.get(j.0.as_slice()) {
+                return cached.clone();
+            }
+
+            let parsed = value_to_js(value);
+            jsonb_cache.insert(j.0.clone(), parsed.clone());
+            parsed
+        }
+        _ => value_to_js(value),
+    }
+}
+
+fn row_to_js_with_cache(row: &Row, schema: &Table, jsonb_cache: &mut JsonbJsCache) -> JsValue {
     let obj = js_sys::Object::new();
     let columns = schema.columns();
 
     for (i, col) in columns.iter().enumerate() {
         if let Some(value) = row.get(i) {
-            let js_val = value_to_js(value);
+            let js_val = value_to_js_with_cache(value, jsonb_cache);
             js_sys::Reflect::set(&obj, &JsValue::from_str(col.name()), &js_val).ok();
         }
     }
 
     obj.into()
+}
+
+/// Converts an Cynos Row to a JavaScript object.
+///
+/// The returned object has properties named after the table columns.
+pub fn row_to_js(row: &Row, schema: &Table) -> JsValue {
+    let mut jsonb_cache = JsonbJsCache::new();
+    row_to_js_with_cache(row, schema, &mut jsonb_cache)
 }
 
 /// Converts a JavaScript object to an Cynos Row.
@@ -204,9 +227,10 @@ pub fn js_array_to_rows(
 /// Converts a vector of Rows to a JavaScript array of objects.
 pub fn rows_to_js_array(rows: &[Rc<Row>], schema: &Table) -> JsValue {
     let arr = js_sys::Array::new_with_length(rows.len() as u32);
+    let mut jsonb_cache = JsonbJsCache::new();
 
     for (i, row) in rows.iter().enumerate() {
-        let obj = row_to_js(row, schema);
+        let obj = row_to_js_with_cache(row, schema, &mut jsonb_cache);
         arr.set(i as u32, obj);
     }
 
@@ -220,6 +244,7 @@ pub fn rows_to_js_array(rows: &[Rc<Row>], schema: &Table) -> JsValue {
 /// in the order they appear in the row.
 pub fn projected_rows_to_js_array(rows: &[Rc<Row>], column_names: &[String]) -> JsValue {
     let arr = js_sys::Array::new_with_length(rows.len() as u32);
+    let mut jsonb_cache = JsonbJsCache::new();
 
     // Extract just the column part from qualified names and count occurrences
     let mut name_counts: hashbrown::HashMap<&str, usize> = hashbrown::HashMap::new();
@@ -255,7 +280,7 @@ pub fn projected_rows_to_js_array(rows: &[Rc<Row>], column_names: &[String]) -> 
         let obj = js_sys::Object::new();
         for (col_idx, col_name) in final_names.iter().enumerate() {
             if let Some(value) = row.get(col_idx) {
-                let js_val = value_to_js(value);
+                let js_val = value_to_js_with_cache(value, &mut jsonb_cache);
                 js_sys::Reflect::set(&obj, &JsValue::from_str(col_name), &js_val).ok();
             }
         }
@@ -272,6 +297,7 @@ pub fn projected_rows_to_js_array(rows: &[Rc<Row>], column_names: &[String]) -> 
 /// For duplicate column names across tables, we use `table.column` format to distinguish them.
 pub fn joined_rows_to_js_array(rows: &[Rc<Row>], schemas: &[&Table]) -> JsValue {
     let arr = js_sys::Array::new_with_length(rows.len() as u32);
+    let mut jsonb_cache = JsonbJsCache::new();
 
     // First pass: count occurrences of each column name
     let mut name_counts: hashbrown::HashMap<&str, usize> = hashbrown::HashMap::new();
@@ -301,7 +327,7 @@ pub fn joined_rows_to_js_array(rows: &[Rc<Row>], schemas: &[&Table]) -> JsValue 
         let obj = js_sys::Object::new();
         for (col_idx, col_name) in column_names.iter().enumerate() {
             if let Some(value) = row.get(col_idx) {
-                let js_val = value_to_js(value);
+                let js_val = value_to_js_with_cache(value, &mut jsonb_cache);
                 js_sys::Reflect::set(&obj, &JsValue::from_str(col_name), &js_val).ok();
             }
         }
