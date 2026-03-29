@@ -8,10 +8,11 @@ mod posting;
 pub use posting::PostingList;
 
 use crate::stats::IndexStats;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 use cynos_core::RowId;
+use hashbrown::HashMap;
 
 /// Synthetic key namespace used for JSONB_CONTAINS trigram prefilters.
 pub const CONTAINS_TRIGRAM_KEY_PREFIX: &str = "__cynos_contains3__:";
@@ -48,6 +49,88 @@ pub fn contains_trigram_pairs(path: &str, needle: &str) -> Vec<(String, String)>
         .collect()
 }
 
+fn push_sorted_unique_row(rows: &mut Vec<RowId>, row_id: RowId) {
+    match rows.last().copied() {
+        None => rows.push(row_id),
+        Some(last) if row_id > last => rows.push(row_id),
+        Some(last) if row_id == last => {}
+        Some(_) => match rows.binary_search(&row_id) {
+            Ok(_) => {}
+            Err(index) => rows.insert(index, row_id),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GinBulkBuilder {
+    key_index: HashMap<String, Vec<RowId>>,
+    key_value_index: HashMap<(String, String), Vec<RowId>>,
+    key_add_count: usize,
+}
+
+impl GinBulkBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_key(&mut self, key: String, row_id: RowId) {
+        self.key_add_count += 1;
+        push_sorted_unique_row(self.key_index.entry(key).or_insert_with(Vec::new), row_id);
+    }
+
+    pub fn add_key_value(&mut self, key: String, value: String, row_id: RowId) {
+        push_sorted_unique_row(
+            self.key_value_index
+                .entry((key, value))
+                .or_insert_with(Vec::new),
+            row_id,
+        );
+    }
+
+    pub fn add_key_values(
+        &mut self,
+        pairs: impl IntoIterator<Item = (String, String)>,
+        row_id: RowId,
+    ) {
+        for (key, value) in pairs {
+            self.add_key_value(key, value, row_id);
+        }
+    }
+
+    pub fn add_contains_trigrams(&mut self, path: &str, needle: &str, row_id: RowId) -> usize {
+        let key = contains_trigram_key(path);
+        let grams = contains_trigrams(needle);
+        let count = grams.len();
+        for gram in grams {
+            self.add_key_value(key.clone(), gram, row_id);
+        }
+        count
+    }
+
+    fn finish(self) -> GinBulkDelta {
+        GinBulkDelta {
+            key_index: self
+                .key_index
+                .into_iter()
+                .map(|(key, rows)| (key, PostingList::from_sorted_unique(rows)))
+                .collect(),
+            key_value_index: self
+                .key_value_index
+                .into_iter()
+                .map(|((key, value), rows)| ((key, value), PostingList::from_sorted_unique(rows)))
+                .collect(),
+            key_add_count: self.key_add_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct GinBulkDelta {
+    key_index: HashMap<String, PostingList>,
+    key_value_index: HashMap<(String, String), PostingList>,
+    key_add_count: usize,
+}
+
 /// A GIN index for JSONB and other composite types.
 ///
 /// This index maintains two inverted indexes:
@@ -56,9 +139,9 @@ pub fn contains_trigram_pairs(path: &str, needle: &str) -> Vec<(String, String)>
 #[derive(Debug, Clone)]
 pub struct GinIndex {
     /// Key → Row IDs (for key existence queries)
-    key_index: BTreeMap<String, PostingList>,
+    key_index: HashMap<String, PostingList>,
     /// (Key, Value) → Row IDs (for containment queries)
-    key_value_index: BTreeMap<(String, String), PostingList>,
+    key_value_index: HashMap<(String, String), PostingList>,
     /// Statistics
     stats: IndexStats,
 }
@@ -67,8 +150,8 @@ impl GinIndex {
     /// Creates a new empty GIN index.
     pub fn new() -> Self {
         Self {
-            key_index: BTreeMap::new(),
-            key_value_index: BTreeMap::new(),
+            key_index: HashMap::new(),
+            key_value_index: HashMap::new(),
             stats: IndexStats::new(),
         }
     }
@@ -110,6 +193,38 @@ impl GinIndex {
     ) {
         for (key, value) in pairs {
             self.add_key_value(key, value, row_id);
+        }
+    }
+
+    pub fn add_contains_trigrams(&mut self, path: &str, needle: &str, row_id: RowId) -> usize {
+        let key = contains_trigram_key(path);
+        let grams = contains_trigrams(needle);
+        let count = grams.len();
+        for gram in grams {
+            self.add_key_value(key.clone(), gram, row_id);
+        }
+        count
+    }
+
+    pub fn apply_bulk_builder(&mut self, builder: GinBulkBuilder) {
+        self.apply_bulk_delta(builder.finish());
+    }
+
+    fn apply_bulk_delta(&mut self, delta: GinBulkDelta) {
+        self.stats.add_rows(delta.key_add_count);
+
+        for (key, posting) in delta.key_index {
+            self.key_index
+                .entry(key)
+                .and_modify(|existing| existing.merge(&posting))
+                .or_insert(posting);
+        }
+
+        for (pair, posting) in delta.key_value_index {
+            self.key_value_index
+                .entry(pair)
+                .and_modify(|existing| existing.merge(&posting))
+                .or_insert(posting);
         }
     }
 
@@ -629,5 +744,23 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn test_gin_bulk_builder_merges_into_existing_index() {
+        let mut gin = GinIndex::new();
+        gin.add_key("status".into(), 1);
+        gin.add_key_value("status".into(), "active".into(), 1);
+
+        let mut builder = GinBulkBuilder::new();
+        builder.add_key("status".into(), 2);
+        builder.add_key("status".into(), 3);
+        builder.add_key_value("status".into(), "active".into(), 2);
+        builder.add_key_value("status".into(), "active".into(), 3);
+
+        gin.apply_bulk_builder(builder);
+
+        assert_eq!(gin.get_by_key("status"), vec![1, 2, 3]);
+        assert_eq!(gin.get_by_key_value("status", "active"), vec![1, 2, 3]);
     }
 }

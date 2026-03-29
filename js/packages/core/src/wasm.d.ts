@@ -172,36 +172,6 @@ export class Database {
     free(): void;
     [Symbol.dispose](): void;
     /**
-     * Benchmarks pure Rust insert performance without JS serialization overhead.
-     *
-     * This method generates and inserts `count` rows directly in Rust,
-     * measuring only the storage layer performance.
-     *
-     * Returns an object with:
-     * - `duration_ms`: Total time in milliseconds
-     * - `rows_per_sec`: Throughput in rows per second
-     */
-    benchmarkInsert(table: string, count: number): any;
-    /**
-     * Benchmarks pure Rust range query performance without JS serialization overhead.
-     *
-     * This method executes a range query (column > threshold) directly in Rust,
-     * measuring only the query execution time without serialization to JS.
-     *
-     * Parameters:
-     * - `table`: Table name to query
-     * - `column`: Column name for the range condition
-     * - `threshold`: The threshold value (column > threshold)
-     *
-     * Returns an object with:
-     * - `query_ms`: Time for query execution only (no serialization)
-     * - `serialize_ms`: Time for serialization to JS
-     * - `total_ms`: Total time including serialization
-     * - `row_count`: Number of rows returned
-     * - `serialization_overhead_pct`: Percentage of time spent on serialization
-     */
-    benchmarkRangeQuery(table: string, column: string, threshold: number): any;
-    /**
      * Clears all data from all tables.
      */
     clear(): void;
@@ -282,7 +252,6 @@ export class Database {
     takeLastDeltaFlushProfile(): any;
     takeLastIvmBridgeProfile(): any;
     takeLastSnapshotFlushProfile(): any;
-    takeLastSnapshotInitProfile(): any;
     takeLastTraceInitProfile(): any;
     /**
      * Returns the total row count across all tables.
@@ -1000,8 +969,6 @@ export interface InitOutput {
     readonly columnoptions_setAutoIncrement: (a: number, b: number) => number;
     readonly columnoptions_setNullable: (a: number, b: number) => number;
     readonly columnoptions_setUnique: (a: number, b: number) => number;
-    readonly database_benchmarkInsert: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly database_benchmarkRangeQuery: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly database_clear: (a: number) => void;
     readonly database_clearTable: (a: number, b: number, c: number, d: number) => void;
     readonly database_create: (a: number, b: number) => number;
@@ -1025,7 +992,6 @@ export interface InitOutput {
     readonly database_takeLastDeltaFlushProfile: (a: number) => number;
     readonly database_takeLastIvmBridgeProfile: (a: number) => number;
     readonly database_takeLastSnapshotFlushProfile: (a: number) => number;
-    readonly database_takeLastSnapshotInitProfile: (a: number) => number;
     readonly database_takeLastTraceInitProfile: (a: number) => number;
     readonly database_totalRowCount: (a: number) => number;
     readonly database_transaction: (a: number) => number;
@@ -1144,10 +1110,10 @@ export interface InitOutput {
     readonly schemalayout_nullMaskSize: (a: number) => number;
     readonly schemalayout_rowStride: (a: number) => number;
     readonly __wasm_bindgen_func_elem_84: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_3515: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_8358: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_3522: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_1538: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_3523: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_8461: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_3530: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1536: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

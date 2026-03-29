@@ -2,51 +2,107 @@
 //!
 //! A posting list is a sorted list of row IDs that contain a particular key.
 
-use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use cynos_core::RowId;
 
 /// A posting list storing row IDs in sorted order.
 ///
-/// Uses `BTreeSet` for `no_std` compatibility instead of `RoaringBitmap`.
-/// For production use with large datasets, consider evolving this into a
-/// hybrid representation while keeping the current API stable:
-/// - `Small(Vec<RowId>)` for short postings, which improves cache locality and
-///   makes two-pointer intersections cheap.
-/// - `Large(CompressedBitmap)` for wide postings, which can make AND/OR/DIFF
-///   operations much faster on hot terms.
-///
-/// Because `RowId` is a global `u64`, avoid dense bitmaps unless there is a
-/// table-local ID remapping layer; sparse or compressed bitmaps are the safer
-/// direction here.
+/// The packed representation keeps append-heavy insert workloads and batch
+/// intersections cache-friendly while preserving deterministic sorted scans.
 #[derive(Debug, Clone, Default)]
 pub struct PostingList {
-    /// Sorted set of row IDs.
-    rows: BTreeSet<RowId>,
+    rows: Vec<RowId>,
 }
 
 impl PostingList {
     /// Creates a new empty posting list.
     pub fn new() -> Self {
-        Self {
-            rows: BTreeSet::new(),
-        }
+        Self { rows: Vec::new() }
+    }
+
+    /// Creates a posting list from a pre-sorted, unique row-id vector.
+    pub fn from_sorted_unique(rows: Vec<RowId>) -> Self {
+        debug_assert!(rows.windows(2).all(|window| window[0] < window[1]));
+        Self { rows }
     }
 
     /// Adds a row ID to the posting list.
     pub fn add(&mut self, row_id: RowId) {
-        self.rows.insert(row_id);
+        match self.rows.last().copied() {
+            None => self.rows.push(row_id),
+            Some(last) if row_id > last => self.rows.push(row_id),
+            Some(last) if row_id == last => {}
+            Some(_) => match self.rows.binary_search(&row_id) {
+                Ok(_) => {}
+                Err(index) => self.rows.insert(index, row_id),
+            },
+        }
+    }
+
+    /// Merges another sorted, unique posting list into this posting list.
+    pub fn merge(&mut self, other: &PostingList) {
+        self.merge_sorted_unique(other.rows.as_slice());
+    }
+
+    /// Merges a sorted, unique slice of row IDs into this posting list.
+    pub fn merge_sorted_unique(&mut self, other: &[RowId]) {
+        if other.is_empty() {
+            return;
+        }
+        if self.rows.is_empty() {
+            self.rows.extend_from_slice(other);
+            return;
+        }
+        if self.rows.last().copied().unwrap_or(0) < other[0] {
+            self.rows.extend_from_slice(other);
+            return;
+        }
+
+        let mut merged = Vec::with_capacity(self.rows.len() + other.len());
+        let mut left = 0usize;
+        let mut right = 0usize;
+
+        while left < self.rows.len() && right < other.len() {
+            let lhs = self.rows[left];
+            let rhs = other[right];
+            if lhs < rhs {
+                merged.push(lhs);
+                left += 1;
+            } else if lhs > rhs {
+                merged.push(rhs);
+                right += 1;
+            } else {
+                merged.push(lhs);
+                left += 1;
+                right += 1;
+            }
+        }
+
+        if left < self.rows.len() {
+            merged.extend_from_slice(&self.rows[left..]);
+        }
+        if right < other.len() {
+            merged.extend_from_slice(&other[right..]);
+        }
+
+        self.rows = merged;
     }
 
     /// Removes a row ID from the posting list.
     /// Returns true if the row was present.
     pub fn remove(&mut self, row_id: RowId) -> bool {
-        self.rows.remove(&row_id)
+        match self.rows.binary_search(&row_id) {
+            Ok(index) => {
+                self.rows.remove(index);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Checks if the posting list contains a row ID.
     pub fn contains(&self, row_id: RowId) -> bool {
-        self.rows.contains(&row_id)
+        self.rows.binary_search(&row_id).is_ok()
     }
 
     /// Returns the number of row IDs in the posting list.
@@ -61,7 +117,7 @@ impl PostingList {
 
     /// Converts the posting list to a vector.
     pub fn to_vec(&self) -> Vec<RowId> {
-        self.rows.iter().copied().collect()
+        self.rows.clone()
     }
 
     /// Returns an iterator over the row IDs.
@@ -71,9 +127,25 @@ impl PostingList {
 
     /// Computes the intersection of two posting lists.
     pub fn intersect(&self, other: &PostingList) -> PostingList {
-        PostingList {
-            rows: self.rows.intersection(&other.rows).copied().collect(),
+        let mut result = Vec::with_capacity(core::cmp::min(self.len(), other.len()));
+        let mut left = 0usize;
+        let mut right = 0usize;
+
+        while left < self.rows.len() && right < other.rows.len() {
+            let lhs = self.rows[left];
+            let rhs = other.rows[right];
+            if lhs < rhs {
+                left += 1;
+            } else if lhs > rhs {
+                right += 1;
+            } else {
+                result.push(lhs);
+                left += 1;
+                right += 1;
+            }
         }
+
+        PostingList::from_sorted_unique(result)
     }
 
     /// Intersects this posting list with a sorted list of candidate row IDs.
@@ -87,25 +159,20 @@ impl PostingList {
 
         let mut result = Vec::with_capacity(core::cmp::min(candidates.len(), self.len()));
         let mut candidate_idx = 0usize;
-        let mut posting_iter = self.rows.iter().copied();
-        let mut posting_row = posting_iter.next();
+        let mut posting_idx = 0usize;
 
-        while candidate_idx < candidates.len() {
+        while candidate_idx < candidates.len() && posting_idx < self.rows.len() {
             let candidate = candidates[candidate_idx];
+            let posting_row = self.rows[posting_idx];
 
-            match posting_row {
-                Some(current) if current < candidate => {
-                    posting_row = posting_iter.next();
-                }
-                Some(current) if current == candidate => {
-                    result.push(candidate);
-                    candidate_idx += 1;
-                    posting_row = posting_iter.next();
-                }
-                Some(_) => {
-                    candidate_idx += 1;
-                }
-                None => break,
+            if posting_row < candidate {
+                posting_idx += 1;
+            } else if posting_row > candidate {
+                candidate_idx += 1;
+            } else {
+                result.push(candidate);
+                candidate_idx += 1;
+                posting_idx += 1;
             }
         }
 
@@ -114,16 +181,62 @@ impl PostingList {
 
     /// Computes the union of two posting lists.
     pub fn union(&self, other: &PostingList) -> PostingList {
-        PostingList {
-            rows: self.rows.union(&other.rows).copied().collect(),
+        let mut result = Vec::with_capacity(self.len() + other.len());
+        let mut left = 0usize;
+        let mut right = 0usize;
+
+        while left < self.rows.len() && right < other.rows.len() {
+            let lhs = self.rows[left];
+            let rhs = other.rows[right];
+            if lhs < rhs {
+                result.push(lhs);
+                left += 1;
+            } else if lhs > rhs {
+                result.push(rhs);
+                right += 1;
+            } else {
+                result.push(lhs);
+                left += 1;
+                right += 1;
+            }
         }
+
+        if left < self.rows.len() {
+            result.extend_from_slice(&self.rows[left..]);
+        }
+        if right < other.rows.len() {
+            result.extend_from_slice(&other.rows[right..]);
+        }
+
+        PostingList::from_sorted_unique(result)
     }
 
     /// Computes the difference of two posting lists (self - other).
     pub fn difference(&self, other: &PostingList) -> PostingList {
-        PostingList {
-            rows: self.rows.difference(&other.rows).copied().collect(),
+        let mut result = Vec::with_capacity(self.len());
+        let mut left = 0usize;
+        let mut right = 0usize;
+
+        while left < self.rows.len() {
+            if right >= other.rows.len() {
+                result.extend_from_slice(&self.rows[left..]);
+                break;
+            }
+
+            let lhs = self.rows[left];
+            let rhs = other.rows[right];
+            if lhs < rhs {
+                result.push(lhs);
+                left += 1;
+            } else if lhs > rhs {
+                right += 1;
+            } else {
+                left += 1;
+                right += 1;
+            }
         }
+
+        PostingList::from_sorted_unique(result)
     }
 }
 
@@ -252,5 +365,12 @@ mod tests {
 
         let result = pl.intersect_sorted_candidates(&[1, 2, 3, 4, 8, 9]);
         assert_eq!(result, vec![2, 4, 8]);
+    }
+
+    #[test]
+    fn test_posting_list_merge_sorted_unique() {
+        let mut pl = PostingList::from_sorted_unique(vec![1, 3, 5]);
+        pl.merge_sorted_unique(&[2, 3, 4, 6]);
+        assert_eq!(pl.to_vec(), vec![1, 2, 3, 4, 5, 6]);
     }
 }

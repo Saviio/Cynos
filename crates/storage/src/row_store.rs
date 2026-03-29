@@ -3,7 +3,7 @@
 //! This module provides the `RowStore` struct which manages rows for a single table,
 //! including primary key and secondary index maintenance.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -12,7 +12,8 @@ use cynos_core::schema::{IndexType, Table};
 use cynos_core::{Error, Result, Row, RowId, Value};
 use cynos_incremental::Delta;
 use cynos_index::{
-    contains_trigram_pairs, BTreeIndex, GinIndex, HashIndex, Index, KeyRange, RangeIndex,
+    contains_trigram_pairs, BTreeIndex, GinBulkBuilder, GinIndex, HashIndex, Index, KeyRange,
+    RangeIndex,
 };
 use cynos_jsonb::{JsonbObject, JsonbValue as ParsedJsonbValue};
 
@@ -41,6 +42,13 @@ impl GinIndexConfig {
             indexed_paths: indexed_paths.filter(|paths| !paths.is_empty()),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct BatchSecondaryDef {
+    name: String,
+    cols: Vec<usize>,
+    unique: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -744,6 +752,16 @@ impl RowStore {
         self.row_slots.push(RowSlot { row_id, row });
         self.rows.insert(row_id, slot_idx);
 
+        let append_only = self
+            .scan_order
+            .last()
+            .map(|&last_slot_idx| self.row_slots[last_slot_idx].row_id < row_id)
+            .unwrap_or(true);
+        if append_only {
+            self.scan_order.push(slot_idx);
+            return;
+        }
+
         let scan_pos = self.scan_position(row_id).unwrap_or_else(|pos| pos);
         self.scan_order.insert(scan_pos, slot_idx);
     }
@@ -874,16 +892,18 @@ impl RowStore {
             let Some(gin_idx) = self.gin_indices.get_mut(idx_name) else {
                 continue;
             };
+            let mut builder = GinBulkBuilder::new();
             for row in &rows {
                 if let Some(value) = row.get(config.column_idx) {
-                    Self::index_jsonb_value(
-                        gin_idx,
+                    Self::collect_jsonb_value_into_builder(
+                        &mut builder,
                         value,
                         row.id(),
                         config.indexed_paths.as_deref(),
                     );
                 }
             }
+            gin_idx.apply_bulk_builder(builder);
         }
 
         self.row_slots.reserve(rows.len());
@@ -900,6 +920,191 @@ impl RowStore {
         }
 
         Ok(self.row_slots.len())
+    }
+
+    /// Inserts multiple rows while batching GIN index maintenance per insert call.
+    ///
+    /// The visible semantics remain aligned with sequential inserts: rows accepted
+    /// before a later validation failure remain committed.
+    pub fn insert_batch(&mut self, rows: Vec<Row>) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let secondary_defs: Vec<BatchSecondaryDef> = self
+            .index_columns
+            .iter()
+            .map(|(name, cols)| BatchSecondaryDef {
+                name: name.clone(),
+                cols: cols.clone(),
+                unique: self
+                    .secondary_indices
+                    .get(name)
+                    .map(|idx| idx.is_unique())
+                    .unwrap_or(false),
+            })
+            .collect();
+        if self.is_empty() && self.can_use_bulk_insert_fast_path(&rows, &secondary_defs) {
+            return self.bulk_load(rows);
+        }
+        let gin_defs: Vec<(String, GinIndexConfig)> = self
+            .gin_index_configs
+            .iter()
+            .map(|(name, config)| (name.clone(), config.clone()))
+            .collect();
+
+        self.row_slots.reserve(rows.len());
+        self.scan_order.reserve(rows.len());
+
+        let mut inserted = 0usize;
+
+        for row in rows {
+            let row_id = row.id();
+
+            if self.rows.contains_key(&row_id) {
+                return Err(Error::invalid_operation("Row ID already exists"));
+            }
+
+            let pk_value = if !self.pk_columns.is_empty() {
+                let pk = extract_key(&row, &self.pk_columns);
+                if let Some(ref pk_index) = self.primary_index {
+                    if pk_index.contains_index_key(&pk) {
+                        return Err(Error::UniqueConstraint {
+                            column: "primary_key".into(),
+                            value: pk.to_error_value(),
+                        });
+                    }
+                }
+                Some(pk)
+            } else {
+                None
+            };
+
+            let mut secondary_keys = Vec::with_capacity(secondary_defs.len());
+            for def in &secondary_defs {
+                let key = extract_key(&row, &def.cols);
+                if def.unique {
+                    if let Some(idx) = self.secondary_indices.get(&def.name) {
+                        if idx.contains_index_key(&key) {
+                            return Err(Error::UniqueConstraint {
+                                column: def.name.clone(),
+                                value: key.to_error_value(),
+                            });
+                        }
+                    }
+                }
+                secondary_keys.push(key);
+            }
+
+            self.row_id_index
+                .add(Value::Int64(row_id as i64), row_id)
+                .map_err(|_| Error::invalid_operation("Failed to add to row ID index"))?;
+
+            if let (Some(ref mut pk_index), Some(pk)) = (&mut self.primary_index, pk_value.clone())
+            {
+                if pk_index.add_index_key(pk.clone(), row_id).is_err() {
+                    self.row_id_index
+                        .remove(&Value::Int64(row_id as i64), Some(row_id));
+                    return Err(Error::UniqueConstraint {
+                        column: "primary_key".into(),
+                        value: pk.to_error_value(),
+                    });
+                }
+            }
+
+            for (secondary_offset, key) in secondary_keys.iter().enumerate() {
+                let def = &secondary_defs[secondary_offset];
+                if let Some(idx) = self.secondary_indices.get_mut(&def.name) {
+                    if idx.add_index_key(key.clone(), row_id).is_err() {
+                        for (rollback_offset, rollback_key) in
+                            secondary_keys.iter().take(secondary_offset).enumerate()
+                        {
+                            let rollback_def = &secondary_defs[rollback_offset];
+                            if let Some(rollback_idx) =
+                                self.secondary_indices.get_mut(&rollback_def.name)
+                            {
+                                rollback_idx.remove_index_key(rollback_key, Some(row_id));
+                            }
+                        }
+                        if let (Some(ref mut pk_index), Some(pk)) =
+                            (&mut self.primary_index, pk_value.as_ref())
+                        {
+                            pk_index.remove_index_key(pk, Some(row_id));
+                        }
+                        self.row_id_index
+                            .remove(&Value::Int64(row_id as i64), Some(row_id));
+                        return Err(Error::UniqueConstraint {
+                            column: def.name.clone(),
+                            value: key.to_error_value(),
+                        });
+                    }
+                }
+            }
+
+            for (idx_name, config) in &gin_defs {
+                let Some(gin_idx) = self.gin_indices.get_mut(idx_name) else {
+                    continue;
+                };
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::index_jsonb_value(
+                        gin_idx,
+                        value,
+                        row_id,
+                        config.indexed_paths.as_deref(),
+                    );
+                }
+            }
+
+            self.insert_row_slot(row_id, Rc::new(row));
+            inserted += 1;
+        }
+
+        Ok(inserted)
+    }
+
+    fn can_use_bulk_insert_fast_path(
+        &self,
+        rows: &[Row],
+        secondary_defs: &[BatchSecondaryDef],
+    ) -> bool {
+        if !rows
+            .windows(2)
+            .all(|window| window[0].id() <= window[1].id())
+        {
+            return false;
+        }
+
+        let mut seen_row_ids = BTreeSet::new();
+        let mut seen_primary_keys = BTreeSet::new();
+        let mut seen_secondary_keys: Vec<Option<BTreeSet<IndexKey>>> = secondary_defs
+            .iter()
+            .map(|def| def.unique.then(BTreeSet::new))
+            .collect();
+
+        for row in rows {
+            if !seen_row_ids.insert(row.id()) {
+                return false;
+            }
+
+            if !self.pk_columns.is_empty() {
+                let pk = extract_key(row, &self.pk_columns);
+                if !seen_primary_keys.insert(pk) {
+                    return false;
+                }
+            }
+
+            for (def, maybe_seen) in secondary_defs.iter().zip(seen_secondary_keys.iter_mut()) {
+                let Some(seen) = maybe_seen.as_mut() else {
+                    continue;
+                };
+                let key = extract_key(row, &def.cols);
+                if !seen.insert(key) {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 
     /// Inserts a row into the store.
@@ -1928,8 +2133,32 @@ impl RowStore {
             return;
         };
 
+        if let Some(paths) = indexed_paths {
+            Self::index_jsonb_selected_paths(gin_idx, &parsed, row_id, paths);
+            return;
+        }
+
         let mut current_path = String::new();
-        Self::index_jsonb_node(gin_idx, &parsed, row_id, &mut current_path, indexed_paths);
+        Self::index_jsonb_node(gin_idx, &parsed, row_id, &mut current_path, None);
+    }
+
+    fn collect_jsonb_value_into_builder(
+        builder: &mut GinBulkBuilder,
+        value: &Value,
+        row_id: RowId,
+        indexed_paths: Option<&[String]>,
+    ) {
+        let Some(parsed) = Self::parse_jsonb_value(value) else {
+            return;
+        };
+
+        if let Some(paths) = indexed_paths {
+            Self::collect_jsonb_selected_paths_into_builder(builder, &parsed, row_id, paths);
+            return;
+        }
+
+        let mut current_path = String::new();
+        Self::collect_jsonb_node_into_builder(builder, &parsed, row_id, &mut current_path, None);
     }
 
     fn index_jsonb_node(
@@ -1993,7 +2222,135 @@ impl RowStore {
         row_id: RowId,
     ) {
         let value_str = value.stringify_for_contains();
-        gin_idx.add_key_values(contains_trigram_pairs(current_path, &value_str), row_id);
+        gin_idx.add_contains_trigrams(current_path, &value_str, row_id);
+    }
+
+    fn collect_jsonb_node_into_builder(
+        builder: &mut GinBulkBuilder,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        current_path: &mut String,
+        indexed_paths: Option<&[String]>,
+    ) {
+        match value {
+            ParsedJsonbValue::Object(obj) => {
+                for (key, child) in obj.iter() {
+                    let saved_len = current_path.len();
+                    Self::append_gin_path_segment(current_path, key);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        builder.add_key(current_path.clone(), row_id);
+                        Self::collect_jsonb_scalar_into_builder(
+                            builder,
+                            current_path,
+                            child,
+                            row_id,
+                        );
+                        Self::collect_jsonb_contains_prefilter_into_builder(
+                            builder,
+                            current_path,
+                            child,
+                            row_id,
+                        );
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::collect_jsonb_node_into_builder(
+                            builder,
+                            child,
+                            row_id,
+                            current_path,
+                            indexed_paths,
+                        );
+                    }
+                    current_path.truncate(saved_len);
+                }
+            }
+            ParsedJsonbValue::Array(items) => {
+                for (idx, child) in items.iter().enumerate() {
+                    let saved_len = current_path.len();
+                    let segment = idx.to_string();
+                    Self::append_gin_path_segment(current_path, &segment);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        builder.add_key(current_path.clone(), row_id);
+                        Self::collect_jsonb_scalar_into_builder(
+                            builder,
+                            current_path,
+                            child,
+                            row_id,
+                        );
+                        Self::collect_jsonb_contains_prefilter_into_builder(
+                            builder,
+                            current_path,
+                            child,
+                            row_id,
+                        );
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::collect_jsonb_node_into_builder(
+                            builder,
+                            child,
+                            row_id,
+                            current_path,
+                            indexed_paths,
+                        );
+                    }
+                    current_path.truncate(saved_len);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_jsonb_scalar_into_builder(
+        builder: &mut GinBulkBuilder,
+        current_path: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        if let Some(value_str) = Self::jsonb_scalar_to_index_value(value) {
+            builder.add_key_value(current_path.into(), value_str, row_id);
+        }
+    }
+
+    fn collect_jsonb_contains_prefilter_into_builder(
+        builder: &mut GinBulkBuilder,
+        current_path: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        let value_str = value.stringify_for_contains();
+        builder.add_contains_trigrams(current_path, &value_str, row_id);
+    }
+
+    fn index_jsonb_selected_paths(
+        gin_idx: &mut GinIndex,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        indexed_paths: &[String],
+    ) {
+        for path in indexed_paths {
+            let Some(selected) = Self::jsonb_value_at_encoded_gin_path(value, path) else {
+                continue;
+            };
+            gin_idx.add_key(path.clone(), row_id);
+            Self::index_jsonb_scalar(gin_idx, path, selected, row_id);
+            Self::index_jsonb_contains_prefilter(gin_idx, path, selected, row_id);
+        }
+    }
+
+    fn collect_jsonb_selected_paths_into_builder(
+        builder: &mut GinBulkBuilder,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        indexed_paths: &[String],
+    ) {
+        for path in indexed_paths {
+            let Some(selected) = Self::jsonb_value_at_encoded_gin_path(value, path) else {
+                continue;
+            };
+            builder.add_key(path.clone(), row_id);
+            Self::collect_jsonb_scalar_into_builder(builder, path, selected, row_id);
+            Self::collect_jsonb_contains_prefilter_into_builder(builder, path, selected, row_id);
+        }
     }
 
     /// Removes JSONB value from the GIN index.
@@ -2007,8 +2364,13 @@ impl RowStore {
             return;
         };
 
+        if let Some(paths) = indexed_paths {
+            Self::remove_jsonb_selected_paths(gin_idx, &parsed, row_id, paths);
+            return;
+        }
+
         let mut current_path = String::new();
-        Self::remove_jsonb_node(gin_idx, &parsed, row_id, &mut current_path, indexed_paths);
+        Self::remove_jsonb_node(gin_idx, &parsed, row_id, &mut current_path, None);
     }
 
     fn remove_jsonb_node(
@@ -2105,6 +2467,22 @@ impl RowStore {
         let value_str = value.stringify_for_contains();
         for (key, gram) in contains_trigram_pairs(current_path, &value_str) {
             gin_idx.remove_key_value(&key, &gram, row_id);
+        }
+    }
+
+    fn remove_jsonb_selected_paths(
+        gin_idx: &mut GinIndex,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        indexed_paths: &[String],
+    ) {
+        for path in indexed_paths {
+            let Some(selected) = Self::jsonb_value_at_encoded_gin_path(value, path) else {
+                continue;
+            };
+            gin_idx.remove_key(path, row_id);
+            Self::remove_jsonb_scalar(gin_idx, path, selected, row_id);
+            Self::remove_jsonb_contains_prefilter(gin_idx, path, selected, row_id);
         }
     }
 
@@ -3873,6 +4251,102 @@ mod tests {
         assert_eq!(
             store
                 .gin_index_get_by_key_value("idx_data_gin", "status", "active")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn test_gin_index_insert_batch_updates_non_empty_store() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"name":"Alice","status":"active"}"#),
+                ],
+            ))
+            .unwrap();
+
+        store
+            .insert_batch(vec![
+                Row::new(
+                    2,
+                    vec![
+                        Value::Int64(2),
+                        make_jsonb(r#"{"name":"Bob","status":"inactive"}"#),
+                    ],
+                ),
+                Row::new(
+                    3,
+                    vec![
+                        Value::Int64(3),
+                        make_jsonb(r#"{"name":"Cara","status":"active"}"#),
+                    ],
+                ),
+            ])
+            .unwrap();
+
+        assert_eq!(store.gin_index_get_by_key("idx_data_gin", "name").len(), 3);
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "status", "active")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn test_insert_batch_preserves_prefix_rows_and_gin_on_unique_violation() {
+        let schema = TableBuilder::new("test_batch_insert_unique_gin")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("email", DataType::String)
+            .unwrap()
+            .add_column("data", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_email", &["email"], true)
+            .unwrap()
+            .add_index("idx_data_gin", &["data"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut store = RowStore::new(schema);
+        let result = store.insert_batch(vec![
+            Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    Value::String("alice@test.com".into()),
+                    make_jsonb(r#"{"role":"admin"}"#),
+                ],
+            ),
+            Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    Value::String("alice@test.com".into()),
+                    make_jsonb(r#"{"role":"user"}"#),
+                ],
+            ),
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(store.len(), 1);
+        assert!(store.get(1).is_some());
+        assert!(store.get(2).is_none());
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "role", "admin")
                 .iter()
                 .map(|row| row.id())
                 .collect::<Vec<_>>(),

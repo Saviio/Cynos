@@ -48,7 +48,8 @@ pub use comparator::{
     Comparator, MultiKeyComparator, MultiKeyComparatorWithNull, Order, SimpleComparator,
 };
 pub use gin::{
-    contains_trigram_key, contains_trigram_pairs, contains_trigrams, GinIndex, PostingList,
+    contains_trigram_key, contains_trigram_pairs, contains_trigrams, GinBulkBuilder, GinIndex,
+    PostingList,
 };
 pub use hash::HashIndex;
 pub use nullable::NullableIndex;

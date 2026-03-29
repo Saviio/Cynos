@@ -2377,8 +2377,7 @@ impl SelectBuilder {
         trace_init_profile.compile_ivm_plan_ms =
             compile_ivm_finished_at - compile_trace_program_started_at;
         let compiled_bootstrap_plan = CompiledBootstrapPlan::compile(&compile_result.dataflow);
-        trace_init_profile.compile_trace_program_ms =
-            now_ms() - compile_trace_program_started_at;
+        trace_init_profile.compile_trace_program_ms = now_ms() - compile_trace_program_started_at;
 
         // Get initial result using the compiled physical plan
         let initial_query_started_at = now_ms();
@@ -2541,6 +2540,71 @@ impl InsertBuilder {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InsertExecutionStats {
+    row_count: usize,
+}
+
+fn execute_insert_values(
+    cache: &Rc<RefCell<TableCache>>,
+    query_registry: &Rc<RefCell<LiveRegistry>>,
+    table_id_map: &Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    table_name: &str,
+    values: &JsValue,
+) -> Result<InsertExecutionStats, JsValue> {
+    let schema = cache
+        .borrow()
+        .get_table(table_name)
+        .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?
+        .schema()
+        .clone();
+
+    let arr = js_sys::Array::from(values);
+    let start_row_id = reserve_row_ids(arr.length() as u64);
+    let rows = js_array_to_rows(values, &schema, start_row_id)?;
+
+    execute_insert_rows(cache, query_registry, table_id_map, table_name, rows)
+        .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))
+}
+
+fn execute_insert_rows(
+    cache: &Rc<RefCell<TableCache>>,
+    query_registry: &Rc<RefCell<LiveRegistry>>,
+    table_id_map: &Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    table_name: &str,
+    rows: Vec<Row>,
+) -> cynos_core::Result<InsertExecutionStats> {
+    let table_id = table_id_map.borrow().get(table_name).copied();
+    let should_notify = table_id.is_some() && query_registry.borrow().query_count() > 0;
+    let row_count = rows.len();
+
+    let inserted_ids = should_notify.then(|| {
+        rows.iter()
+            .map(|row| row.id())
+            .collect::<hashbrown::HashSet<_>>()
+    });
+    let deltas = should_notify.then(|| {
+        rows.iter()
+            .map(|row| Delta::insert(row.clone()))
+            .collect::<Vec<_>>()
+    });
+
+    let mut cache = cache.borrow_mut();
+    let store = cache
+        .get_table_mut(table_name)
+        .ok_or_else(|| cynos_core::Error::table_not_found(table_name))?;
+    store.insert_batch(rows)?;
+    drop(cache);
+
+    if let (Some(table_id), Some(inserted_ids), Some(deltas)) = (table_id, inserted_ids, deltas) {
+        query_registry
+            .borrow_mut()
+            .on_table_change_delta(table_id, deltas, &inserted_ids);
+    }
+
+    Ok(InsertExecutionStats { row_count })
+}
+
 #[wasm_bindgen]
 impl InsertBuilder {
     /// Sets the values to insert.
@@ -2555,46 +2619,14 @@ impl InsertBuilder {
             .values_data
             .as_ref()
             .ok_or_else(|| JsValue::from_str("No values specified"))?;
-
-        let mut cache = self.cache.borrow_mut();
-        let store = cache.get_table_mut(&self.table_name).ok_or_else(|| {
-            JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
-        })?;
-
-        let schema = store.schema().clone();
-
-        // Get the count of rows to insert first
-        let arr = js_sys::Array::from(values);
-        let row_count = arr.length() as u64;
-
-        // Reserve row IDs for all rows at once to avoid ID conflicts
-        let start_row_id = reserve_row_ids(row_count);
-
-        // Convert JS values to rows
-        let rows = js_array_to_rows(values, &schema, start_row_id)?;
-        let row_count = rows.len();
-
-        // Build deltas for IVM notification
-        let deltas: Vec<Delta<Row>> = rows.iter().map(|r| Delta::insert(r.clone())).collect();
-
-        // Insert rows and collect their IDs
-        let mut inserted_ids = hashbrown::HashSet::new();
-        for row in rows {
-            inserted_ids.insert(row.id());
-            store
-                .insert(row)
-                .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
-        }
-
-        // Notify query registry with changed IDs and deltas
-        if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
-            drop(cache); // Release borrow before notifying
-            self.query_registry
-                .borrow_mut()
-                .on_table_change_delta(table_id, deltas, &inserted_ids);
-        }
-
-        Ok(JsValue::from_f64(row_count as f64))
+        let stats = execute_insert_values(
+            &self.cache,
+            &self.query_registry,
+            &self.table_id_map,
+            &self.table_name,
+            values,
+        )?;
+        Ok(JsValue::from_f64(stats.row_count as f64))
     }
 }
 
