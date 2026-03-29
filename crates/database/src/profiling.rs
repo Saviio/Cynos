@@ -10,6 +10,11 @@ pub(crate) struct DeltaFlushProfile {
     pub delta_row_count: usize,
     pub clone_ms: f64,
     pub query_on_table_change_ms: f64,
+    pub source_dispatch_ms: f64,
+    pub unary_execute_ms: f64,
+    pub join_execute_ms: f64,
+    pub aggregate_execute_ms: f64,
+    pub result_apply_ms: f64,
     pub total_ms: f64,
 }
 

@@ -2526,6 +2526,7 @@ impl JsSnapshotRowsMaterializer {
             }
         }
     }
+
 }
 
 impl JsSnapshotRowsCache {

@@ -19,6 +19,8 @@ use cynos_core::schema::Table;
 use cynos_core::{Row, Value};
 use cynos_gql::{bind::BoundRootField, GraphqlCatalog};
 use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta, TableId};
+#[cfg(feature = "benchmark")]
+use cynos_incremental::TraceUpdateProfile;
 use cynos_index::KeyRange;
 use cynos_query::ast::SortOrder;
 use cynos_query::planner::{IndexBounds, PhysicalPlan};
@@ -1130,10 +1132,28 @@ impl DeltaSubscription {
         }
     }
 
+    #[allow(dead_code)]
     fn on_table_change(&self, table_id: TableId, deltas: Vec<Delta<Row>>) {
         match self {
             Self::Rows(query) => query.borrow_mut().on_table_change(table_id, deltas),
             Self::Graphql(query) => query.borrow_mut().on_table_change(table_id, deltas),
+        }
+    }
+
+    #[cfg(feature = "benchmark")]
+    fn on_table_change_profiled(
+        &self,
+        table_id: TableId,
+        deltas: Vec<Delta<Row>>,
+    ) -> TraceUpdateProfile {
+        match self {
+            Self::Rows(query) => query
+                .borrow_mut()
+                .on_table_change_profiled(table_id, deltas, Some(now_ms)),
+            Self::Graphql(query) => {
+                query.borrow_mut().on_table_change(table_id, deltas);
+                TraceUpdateProfile::default()
+            }
         }
     }
 }
@@ -1335,8 +1355,19 @@ impl LiveRegistry {
                     profile.clone_ms += now_ms() - clone_started_at;
 
                     let query_started_at = now_ms();
+                    #[cfg(feature = "benchmark")]
+                    let update_profile = query.on_table_change_profiled(*table_id, deltas_clone);
+                    #[cfg(not(feature = "benchmark"))]
                     query.on_table_change(*table_id, deltas_clone);
                     profile.query_on_table_change_ms += now_ms() - query_started_at;
+                    #[cfg(feature = "benchmark")]
+                    {
+                        profile.source_dispatch_ms += update_profile.source_dispatch_ms;
+                        profile.unary_execute_ms += update_profile.unary_execute_ms;
+                        profile.join_execute_ms += update_profile.join_execute_ms;
+                        profile.aggregate_execute_ms += update_profile.aggregate_execute_ms;
+                        profile.result_apply_ms += update_profile.result_apply_ms;
+                    }
                 }
             }
         }

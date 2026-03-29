@@ -743,6 +743,36 @@ fn delta_flush_profile_to_js_value(profile: DeltaFlushProfile) -> JsValue {
     .ok();
     js_sys::Reflect::set(
         &object,
+        &JsValue::from_str("sourceDispatchMs"),
+        &JsValue::from_f64(profile.source_dispatch_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("unaryExecuteMs"),
+        &JsValue::from_f64(profile.unary_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("joinExecuteMs"),
+        &JsValue::from_f64(profile.join_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("aggregateExecuteMs"),
+        &JsValue::from_f64(profile.aggregate_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("resultApplyMs"),
+        &JsValue::from_f64(profile.result_apply_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
         &JsValue::from_str("totalMs"),
         &JsValue::from_f64(profile.total_ms),
     )

@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use cynos_core::{Row, Value};
 use cynos_incremental::{
     BootstrapExecutionProfile, CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta,
-    MaterializedView, TableId, TraceDeltaBatch,
+    MaterializedView, TableId, TraceDeltaBatch, TraceUpdateProfile,
 };
 use hashbrown::HashMap;
 
@@ -313,6 +313,16 @@ impl ObservableQuery {
     /// `self.view.result()`. Subscribers receive only added/removed rows.
     /// If a subscriber needs the full result, it can call `result()` explicitly.
     pub fn on_table_change(&mut self, table_id: TableId, deltas: Vec<Delta<Row>>) {
+        let _ = self.on_table_change_profiled(table_id, deltas, None);
+    }
+
+    #[doc(hidden)]
+    pub fn on_table_change_profiled(
+        &mut self,
+        table_id: TableId,
+        deltas: Vec<Delta<Row>>,
+        now_fn: Option<fn() -> f64>,
+    ) -> TraceUpdateProfile {
         // Skip dataflow propagation entirely when no one is listening.
         // The result_map will be stale, but getResult() is only called
         // right after subscribe, at which point we re-initialize anyway.
@@ -320,10 +330,10 @@ impl ObservableQuery {
             && self.raw_delta_subscriptions.is_empty()
             && self.trace_batch_subscriptions.is_empty()
         {
-            return;
+            return TraceUpdateProfile::default();
         }
 
-        let output_batch = self.view.on_table_change_batch(table_id, deltas);
+        let (output_batch, profile) = self.view.on_table_change_batch_profiled(table_id, deltas, now_fn);
 
         if !output_batch.is_empty() {
             if !self.trace_batch_subscriptions.is_empty() {
@@ -349,6 +359,8 @@ impl ObservableQuery {
                 }
             }
         }
+
+        profile
     }
 
     /// Initializes the query with the given rows and notifies subscribers.

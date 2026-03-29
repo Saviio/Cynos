@@ -1070,15 +1070,103 @@ fn extract_join_key_handle(
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct CompiledIvmNode {
     sources: Box<[TableId]>,
     kind: CompiledIvmNodeKind,
 }
 
-#[derive(Clone)]
 pub struct CompiledIvmPlan {
     node: CompiledIvmNode,
+    program: CompiledTraceProgram,
+}
+
+type TraceSlotId = usize;
+
+struct CompiledTraceProgram {
+    instructions: Box<[TraceInstruction]>,
+    slot_count: usize,
+    root_slot: TraceSlotId,
+    scratch_slots: Vec<Vec<Delta<TraceTupleHandle>>>,
+}
+
+#[derive(Clone)]
+enum TraceInstruction {
+    Source {
+        table_id: TableId,
+        output_slot: TraceSlotId,
+    },
+    Unary {
+        input_slot: TraceSlotId,
+        output_slot: TraceSlotId,
+        block: UnaryFusionBlock,
+    },
+    Join {
+        node_index: usize,
+        state_id: usize,
+        left_width: usize,
+        right_width: usize,
+        left_slot: TraceSlotId,
+        right_slot: TraceSlotId,
+        output_slot: TraceSlotId,
+    },
+    Aggregate {
+        state_id: usize,
+        input_slot: TraceSlotId,
+        output_slot: TraceSlotId,
+        group_by: Vec<ColumnId>,
+        functions: Vec<(ColumnId, AggregateType)>,
+    },
+}
+
+#[derive(Clone)]
+struct UnaryFusionBlock {
+    ops: Vec<TraceUnaryOp>,
+    accepts_append: bool,
+}
+
+#[derive(Clone)]
+enum TraceUnaryOp {
+    Filter {
+        node_index: usize,
+        tuple_native: bool,
+    },
+    Project {
+        columns: Rc<[usize]>,
+    },
+    Map {
+        node_index: usize,
+        tuple_native: bool,
+    },
+}
+
+enum TraceRuntimeNode<'a> {
+    Filter {
+        predicate: &'a (dyn Fn(&Row) -> bool + Send + Sync),
+        trace_predicate:
+            Option<&'a (dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> bool + Send + Sync)>,
+    },
+    Map {
+        mapper: &'a (dyn Fn(&Row) -> Row + Send + Sync),
+        trace_mapper:
+            Option<&'a (dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> Row + Send + Sync)>,
+    },
+    Join {
+        left_key: &'a JoinKeySpec,
+        right_key: &'a JoinKeySpec,
+        join_type: JoinType,
+    },
+    Marker,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TraceUpdateProfile {
+    pub source_dispatch_ms: f64,
+    pub unary_execute_ms: f64,
+    pub join_execute_ms: f64,
+    pub aggregate_execute_ms: f64,
+    pub result_apply_ms: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1091,6 +1179,7 @@ pub struct BootstrapExecutionProfile {
     pub root_sink_ms: f64,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct CompiledBootstrapPlan {
     legacy_node: CompiledBootstrapNode,
@@ -1172,11 +1261,13 @@ enum BootstrapRuntimeNode<'a> {
     },
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct CompiledBootstrapNode {
     kind: CompiledBootstrapNodeKind,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 enum CompiledBootstrapNodeKind {
     Source {
@@ -1205,6 +1296,7 @@ enum CompiledBootstrapNodeKind {
     },
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 enum CompiledIvmNodeKind {
     Source,
@@ -1231,8 +1323,24 @@ enum CompiledIvmNodeKind {
 
 impl CompiledIvmPlan {
     pub fn compile(node: &DataflowNode) -> Self {
+        let mut next_trace_node_index = 0usize;
+        let mut next_trace_slot = 0usize;
+        let mut trace_instructions = Vec::new();
+        let root_slot = compile_trace_program_node(
+            node,
+            0,
+            &mut next_trace_node_index,
+            &mut next_trace_slot,
+            &mut trace_instructions,
+        );
         Self {
             node: compile_ivm_node(node, 0),
+            program: CompiledTraceProgram {
+                instructions: trace_instructions.into_boxed_slice(),
+                slot_count: next_trace_slot,
+                root_slot,
+                scratch_slots: vec![Vec::new(); next_trace_slot],
+            },
         }
     }
 
@@ -1244,6 +1352,31 @@ impl CompiledIvmPlan {
     #[inline]
     pub fn depends_on(&self, table_id: TableId) -> bool {
         self.node.sources.binary_search(&table_id).is_ok()
+    }
+}
+
+impl UnaryFusionBlock {
+    fn new(op: TraceUnaryOp) -> Self {
+        let accepts_append = op.can_append();
+        Self {
+            ops: vec![op],
+            accepts_append,
+        }
+    }
+
+    fn push(&mut self, op: TraceUnaryOp) {
+        self.accepts_append = op.can_append();
+        self.ops.push(op);
+    }
+}
+
+impl TraceUnaryOp {
+    #[inline]
+    fn can_append(&self) -> bool {
+        match self {
+            Self::Project { .. } => true,
+            Self::Filter { tuple_native, .. } | Self::Map { tuple_native, .. } => *tuple_native,
+        }
     }
 }
 
@@ -1274,6 +1407,7 @@ impl CompiledBootstrapPlan {
     }
 }
 
+#[allow(dead_code)]
 impl CompiledIvmNode {
     #[inline]
     fn sources(&self) -> &[TableId] {
@@ -1341,6 +1475,177 @@ fn compile_ivm_node(node: &DataflowNode, state_id: usize) -> CompiledIvmNode {
                     input: Box::new(input),
                 },
             }
+        }
+    }
+}
+
+fn alloc_trace_slot(next_slot: &mut usize) -> TraceSlotId {
+    let slot = *next_slot;
+    *next_slot = next_slot.saturating_add(1);
+    slot
+}
+
+fn append_trace_unary_op(
+    input_slot: TraceSlotId,
+    next_slot: &mut usize,
+    instructions: &mut Vec<TraceInstruction>,
+    op: TraceUnaryOp,
+) -> TraceSlotId {
+    if let Some(TraceInstruction::Unary {
+        output_slot,
+        block,
+        ..
+    }) = instructions.last_mut()
+    {
+        if *output_slot == input_slot && block.accepts_append {
+            block.push(op);
+            return *output_slot;
+        }
+    }
+
+    let output_slot = alloc_trace_slot(next_slot);
+    instructions.push(TraceInstruction::Unary {
+        input_slot,
+        output_slot,
+        block: UnaryFusionBlock::new(op),
+    });
+    output_slot
+}
+
+fn compile_trace_program_node(
+    node: &DataflowNode,
+    state_id: usize,
+    next_node_index: &mut usize,
+    next_slot: &mut usize,
+    instructions: &mut Vec<TraceInstruction>,
+) -> TraceSlotId {
+    let node_index = *next_node_index;
+    *next_node_index = next_node_index.saturating_add(1);
+
+    match node {
+        DataflowNode::Source { table_id } => {
+            let output_slot = alloc_trace_slot(next_slot);
+            instructions.push(TraceInstruction::Source {
+                table_id: *table_id,
+                output_slot,
+            });
+            output_slot
+        }
+        DataflowNode::Filter {
+            input,
+            trace_predicate,
+            ..
+        } => {
+            let input_slot = compile_trace_program_node(
+                input,
+                state_id,
+                next_node_index,
+                next_slot,
+                instructions,
+            );
+            append_trace_unary_op(
+                input_slot,
+                next_slot,
+                instructions,
+                TraceUnaryOp::Filter {
+                    node_index,
+                    tuple_native: trace_predicate.is_some(),
+                },
+            )
+        }
+        DataflowNode::Project { input, columns } => {
+            let input_slot = compile_trace_program_node(
+                input,
+                state_id,
+                next_node_index,
+                next_slot,
+                instructions,
+            );
+            append_trace_unary_op(
+                input_slot,
+                next_slot,
+                instructions,
+                TraceUnaryOp::Project {
+                    columns: Rc::<[usize]>::from(columns.clone().into_boxed_slice()),
+                },
+            )
+        }
+        DataflowNode::Map {
+            input,
+            trace_mapper,
+            ..
+        } => {
+            let input_slot = compile_trace_program_node(
+                input,
+                state_id,
+                next_node_index,
+                next_slot,
+                instructions,
+            );
+            append_trace_unary_op(
+                input_slot,
+                next_slot,
+                instructions,
+                TraceUnaryOp::Map {
+                    node_index,
+                    tuple_native: trace_mapper.is_some(),
+                },
+            )
+        }
+        DataflowNode::Join {
+            left,
+            right,
+            left_width,
+            right_width,
+            ..
+        } => {
+            let left_slot = compile_trace_program_node(
+                left,
+                left_child_state_id(state_id),
+                next_node_index,
+                next_slot,
+                instructions,
+            );
+            let right_slot = compile_trace_program_node(
+                right,
+                right_child_state_id(state_id),
+                next_node_index,
+                next_slot,
+                instructions,
+            );
+            let output_slot = alloc_trace_slot(next_slot);
+            instructions.push(TraceInstruction::Join {
+                node_index,
+                state_id,
+                left_width: *left_width,
+                right_width: *right_width,
+                left_slot,
+                right_slot,
+                output_slot,
+            });
+            output_slot
+        }
+        DataflowNode::Aggregate {
+            input,
+            group_by,
+            functions,
+        } => {
+            let input_slot = compile_trace_program_node(
+                input,
+                left_child_state_id(state_id),
+                next_node_index,
+                next_slot,
+                instructions,
+            );
+            let output_slot = alloc_trace_slot(next_slot);
+            instructions.push(TraceInstruction::Aggregate {
+                state_id,
+                input_slot,
+                output_slot,
+                group_by: group_by.clone(),
+                functions: functions.clone(),
+            });
+            output_slot
         }
     }
 }
@@ -1748,6 +2053,496 @@ fn merge_compiled_sources(left: &[TableId], right: &[TableId]) -> Box<[TableId]>
     merged.into_boxed_slice()
 }
 
+fn collect_trace_runtime_nodes<'a>(
+    node: &'a DataflowNode,
+    runtime_nodes: &mut Vec<TraceRuntimeNode<'a>>,
+) {
+    match node {
+        DataflowNode::Source { .. } => runtime_nodes.push(TraceRuntimeNode::Marker),
+        DataflowNode::Filter {
+            input,
+            predicate,
+            trace_predicate,
+        } => {
+            runtime_nodes.push(TraceRuntimeNode::Filter {
+                predicate: predicate.as_ref(),
+                trace_predicate: trace_predicate.as_deref(),
+            });
+            collect_trace_runtime_nodes(input, runtime_nodes);
+        }
+        DataflowNode::Project { input, .. } => {
+            runtime_nodes.push(TraceRuntimeNode::Marker);
+            collect_trace_runtime_nodes(input, runtime_nodes);
+        }
+        DataflowNode::Map {
+            input,
+            mapper,
+            trace_mapper,
+        } => {
+            runtime_nodes.push(TraceRuntimeNode::Map {
+                mapper: mapper.as_ref(),
+                trace_mapper: trace_mapper.as_deref(),
+            });
+            collect_trace_runtime_nodes(input, runtime_nodes);
+        }
+        DataflowNode::Join {
+            left,
+            right,
+            left_key,
+            right_key,
+            join_type,
+            ..
+        } => {
+            runtime_nodes.push(TraceRuntimeNode::Join {
+                left_key,
+                right_key,
+                join_type: *join_type,
+            });
+            collect_trace_runtime_nodes(left, runtime_nodes);
+            collect_trace_runtime_nodes(right, runtime_nodes);
+        }
+        DataflowNode::Aggregate { input, .. } => {
+            runtime_nodes.push(TraceRuntimeNode::Marker);
+            collect_trace_runtime_nodes(input, runtime_nodes);
+        }
+    }
+}
+
+fn keep_trace_handle(
+    arena: &TraceTupleArena,
+    handle: &TraceTupleHandle,
+    predicate: &(dyn Fn(&Row) -> bool + Send + Sync),
+    trace_predicate: Option<&(dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> bool + Send + Sync)>,
+) -> bool {
+    if let Some(trace_predicate) = trace_predicate.filter(|_| !arena.has_materialized_row(handle)) {
+        trace_predicate(arena, handle)
+    } else {
+        let row = arena.materialize_rc(handle);
+        predicate(&row)
+    }
+}
+
+fn map_trace_handle(
+    arena: &TraceTupleArena,
+    handle: &TraceTupleHandle,
+    mapper: &(dyn Fn(&Row) -> Row + Send + Sync),
+    trace_mapper: Option<&(dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> Row + Send + Sync)>,
+) -> Row {
+    if let Some(trace_mapper) = trace_mapper.filter(|_| !arena.has_materialized_row(handle)) {
+        trace_mapper(arena, handle)
+    } else {
+        let row = arena.materialize_rc(handle);
+        mapper(&row)
+    }
+}
+
+fn execute_unary_fusion_block(
+    block: &UnaryFusionBlock,
+    runtime_nodes: &[TraceRuntimeNode<'_>],
+    arena: &TraceTupleArena,
+    input: &mut Vec<Delta<TraceTupleHandle>>,
+    output: &mut Vec<Delta<TraceTupleHandle>>,
+) {
+    output.clear();
+    output.reserve(input.len());
+
+    for delta in input.drain(..) {
+        let mut handle = delta.data;
+        let diff = delta.diff;
+        let mut keep = true;
+
+        for op in block.ops.iter() {
+            match op {
+                TraceUnaryOp::Filter { node_index, .. } => {
+                    let (predicate, trace_predicate) = match runtime_nodes.get(*node_index) {
+                        Some(TraceRuntimeNode::Filter {
+                            predicate,
+                            trace_predicate,
+                        }) => (*predicate, *trace_predicate),
+                        _ => unreachable!("trace filter op must map to filter runtime node"),
+                    };
+                    if !keep_trace_handle(arena, &handle, predicate, trace_predicate) {
+                        keep = false;
+                        break;
+                    }
+                }
+                TraceUnaryOp::Project { columns } => {
+                    handle = arena.project(handle, columns.clone());
+                }
+                TraceUnaryOp::Map { node_index, .. } => {
+                    let (mapper, trace_mapper) = match runtime_nodes.get(*node_index) {
+                        Some(TraceRuntimeNode::Map {
+                            mapper,
+                            trace_mapper,
+                        }) => (*mapper, *trace_mapper),
+                        _ => unreachable!("trace map op must map to map runtime node"),
+                    };
+                    let row_id = handle.row_id();
+                    let version = handle.version();
+                    let mut mapped = map_trace_handle(arena, &handle, mapper, trace_mapper);
+                    mapped.set_id(row_id);
+                    mapped.set_version(version);
+                    handle = arena.owned(mapped);
+                }
+            }
+        }
+
+        if keep {
+            output.push(Delta::new(handle, diff));
+        }
+    }
+}
+
+fn recycle_slot_buffer(
+    slots: &mut [Vec<Delta<TraceTupleHandle>>],
+    slot_id: TraceSlotId,
+    mut buffer: Vec<Delta<TraceTupleHandle>>,
+) {
+    buffer.clear();
+    mem::swap(&mut slots[slot_id], &mut buffer);
+}
+
+fn execute_compiled_trace_program(
+    dataflow: &DataflowNode,
+    program: &mut CompiledTraceProgram,
+    join_states: &mut HashMap<usize, JoinState>,
+    aggregate_states: &mut HashMap<usize, GroupAggregateState>,
+    source_table: TableId,
+    deltas: &TraceDeltaBatch,
+    now_fn: Option<fn() -> f64>,
+) -> (TraceDeltaBatch, TraceUpdateProfile) {
+    let arena = deltas.arena().clone();
+    let mut runtime_nodes = Vec::new();
+    collect_trace_runtime_nodes(dataflow, &mut runtime_nodes);
+    let slots = &mut program.scratch_slots;
+    debug_assert_eq!(slots.len(), program.slot_count);
+    let mut profile = TraceUpdateProfile::default();
+
+    for instruction in program.instructions.iter() {
+        match instruction {
+            TraceInstruction::Source {
+                table_id,
+                output_slot,
+            } => {
+                let output = &mut slots[*output_slot];
+                output.clear();
+                if *table_id != source_table {
+                    continue;
+                }
+                output.reserve(deltas.deltas().len());
+                timed_block(now_fn, &mut profile.source_dispatch_ms, || {
+                    output.extend(deltas.deltas().iter().cloned());
+                });
+            }
+            TraceInstruction::Unary {
+                input_slot,
+                output_slot,
+                block,
+            } => {
+                let mut input = Vec::new();
+                mem::swap(&mut slots[*input_slot], &mut input);
+                timed_block(now_fn, &mut profile.unary_execute_ms, || {
+                    execute_unary_fusion_block(
+                        block,
+                        &runtime_nodes,
+                        &arena,
+                        &mut input,
+                        &mut slots[*output_slot],
+                    );
+                });
+                recycle_slot_buffer(slots, *input_slot, input);
+            }
+            TraceInstruction::Join {
+                node_index,
+                state_id,
+                left_width,
+                right_width,
+                left_slot,
+                right_slot,
+                output_slot,
+            } => {
+                let (left_key, right_key, join_type) = match runtime_nodes.get(*node_index) {
+                    Some(TraceRuntimeNode::Join {
+                        left_key,
+                        right_key,
+                        join_type,
+                    }) => (*left_key, *right_key, *join_type),
+                    _ => unreachable!("trace join instruction must map to join runtime node"),
+                };
+                let mut left_input = Vec::new();
+                let mut right_input = Vec::new();
+                mem::swap(&mut slots[*left_slot], &mut left_input);
+                mem::swap(&mut slots[*right_slot], &mut right_input);
+                let output = &mut slots[*output_slot];
+                output.clear();
+                timed_block(now_fn, &mut profile.join_execute_ms, || {
+                    process_join_trace_deltas(
+                        join_states,
+                        *state_id,
+                        *left_width,
+                        *right_width,
+                        left_key,
+                        right_key,
+                        join_type,
+                        &arena,
+                        &left_input,
+                        &right_input,
+                        output,
+                    );
+                });
+                recycle_slot_buffer(slots, *left_slot, left_input);
+                recycle_slot_buffer(slots, *right_slot, right_input);
+            }
+            TraceInstruction::Aggregate {
+                state_id,
+                input_slot,
+                output_slot,
+                group_by,
+                functions,
+            } => {
+                let mut input = Vec::new();
+                mem::swap(&mut slots[*input_slot], &mut input);
+                let output = &mut slots[*output_slot];
+                output.clear();
+                timed_block(now_fn, &mut profile.aggregate_execute_ms, || {
+                    process_aggregate_trace_deltas(
+                        aggregate_states,
+                        *state_id,
+                        group_by,
+                        functions,
+                        &arena,
+                        &input,
+                        output,
+                    );
+                });
+                recycle_slot_buffer(slots, *input_slot, input);
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    mem::swap(&mut slots[program.root_slot], &mut output);
+    (
+        TraceDeltaBatch::new(arena, output),
+        profile,
+    )
+}
+
+fn process_left_join_trace_deltas(
+    join_state: &mut JoinState,
+    left_key: &JoinKeySpec,
+    join_type: JoinType,
+    arena: &TraceTupleArena,
+    deltas: &[Delta<TraceTupleHandle>],
+    output: &mut Vec<Delta<TraceTupleHandle>>,
+) {
+    for action in normalize_join_side_deltas(deltas, left_key, arena) {
+        match action {
+            NormalizedJoinSideAction::SameKeyUpdate(update) => {
+                let SameKeyTraceUpdate { old_row, new_row, key } = update;
+                join_state.process_left_update_same_key(
+                    &old_row,
+                    new_row,
+                    key,
+                    join_type,
+                    arena,
+                    output,
+                );
+            }
+            NormalizedJoinSideAction::Delta(delta) => {
+                let key = extract_join_key_handle(left_key, arena, &delta.data);
+                if join_type == JoinType::Inner {
+                    if delta.is_insert() {
+                        join_state.process_left_insert(
+                            delta.data,
+                            key,
+                            JoinType::Inner,
+                            arena,
+                            output,
+                        );
+                    } else if delta.is_delete() {
+                        join_state.process_left_delete(
+                            delta.data.row_id(),
+                            JoinType::Inner,
+                            arena,
+                            output,
+                        );
+                    }
+                } else if delta.is_insert() {
+                    join_state.on_left_insert_outer(delta.data, key, join_type, arena, output);
+                } else if delta.is_delete() {
+                    join_state.on_left_delete_outer(&delta.data, key, join_type, arena, output);
+                }
+            }
+        }
+    }
+}
+
+struct SameKeyTraceUpdate {
+    old_row: TraceTupleHandle,
+    new_row: TraceTupleHandle,
+    key: JoinKey,
+}
+
+enum NormalizedJoinSideAction {
+    SameKeyUpdate(SameKeyTraceUpdate),
+    Delta(Delta<TraceTupleHandle>),
+}
+
+fn normalize_join_side_deltas(
+    deltas: &[Delta<TraceTupleHandle>],
+    key_spec: &JoinKeySpec,
+    arena: &TraceTupleArena,
+) -> Vec<NormalizedJoinSideAction> {
+    let mut pending_deletes = HashMap::<RowId, usize>::new();
+    let mut updates_by_delete = HashMap::<usize, SameKeyTraceUpdate>::new();
+    let mut skip_indices = HashMap::<usize, ()>::new();
+
+    for (index, delta) in deltas.iter().enumerate() {
+        if delta.is_delete() {
+            pending_deletes.insert(delta.data.row_id(), index);
+            continue;
+        }
+        if !delta.is_insert() {
+            continue;
+        }
+
+        let Some(delete_index) = pending_deletes.remove(&delta.data.row_id()) else {
+            continue;
+        };
+        let old_delta = &deltas[delete_index];
+        let old_key = extract_join_key_handle(key_spec, arena, &old_delta.data);
+        let new_key = extract_join_key_handle(key_spec, arena, &delta.data);
+        if old_key != new_key {
+            continue;
+        }
+        updates_by_delete.insert(
+            delete_index,
+            SameKeyTraceUpdate {
+                old_row: old_delta.data.clone(),
+                new_row: delta.data.clone(),
+                key: old_key,
+            },
+        );
+        skip_indices.insert(index, ());
+    }
+
+    let mut normalized = Vec::with_capacity(deltas.len());
+    for (index, delta) in deltas.iter().enumerate() {
+        if let Some(update) = updates_by_delete.remove(&index) {
+            normalized.push(NormalizedJoinSideAction::SameKeyUpdate(update));
+            continue;
+        }
+        if skip_indices.contains_key(&index) {
+            continue;
+        }
+        normalized.push(NormalizedJoinSideAction::Delta(delta.clone()));
+    }
+    normalized
+}
+
+fn process_right_join_trace_deltas(
+    join_state: &mut JoinState,
+    right_key: &JoinKeySpec,
+    join_type: JoinType,
+    arena: &TraceTupleArena,
+    deltas: &[Delta<TraceTupleHandle>],
+    output: &mut Vec<Delta<TraceTupleHandle>>,
+) {
+    for action in normalize_join_side_deltas(deltas, right_key, arena) {
+        match action {
+            NormalizedJoinSideAction::SameKeyUpdate(update) => {
+                let SameKeyTraceUpdate { old_row, new_row, key } = update;
+                join_state.process_right_update_same_key(
+                    &old_row,
+                    new_row,
+                    key,
+                    join_type,
+                    arena,
+                    output,
+                );
+            }
+            NormalizedJoinSideAction::Delta(delta) => {
+                let key = extract_join_key_handle(right_key, arena, &delta.data);
+                if join_type == JoinType::Inner {
+                    if delta.is_insert() {
+                        join_state.process_right_insert(
+                            delta.data,
+                            key,
+                            JoinType::Inner,
+                            arena,
+                            output,
+                        );
+                    } else if delta.is_delete() {
+                        join_state.process_right_delete(
+                            delta.data.row_id(),
+                            JoinType::Inner,
+                            arena,
+                            output,
+                        );
+                    }
+                } else if delta.is_insert() {
+                    join_state.on_right_insert_outer(delta.data, key, join_type, arena, output);
+                } else if delta.is_delete() {
+                    join_state.on_right_delete_outer(&delta.data, key, join_type, arena, output);
+                }
+            }
+        }
+    }
+}
+
+fn process_join_trace_deltas(
+    join_states: &mut HashMap<usize, JoinState>,
+    state_id: usize,
+    left_width: usize,
+    right_width: usize,
+    left_key: &JoinKeySpec,
+    right_key: &JoinKeySpec,
+    join_type: JoinType,
+    arena: &TraceTupleArena,
+    left_deltas: &[Delta<TraceTupleHandle>],
+    right_deltas: &[Delta<TraceTupleHandle>],
+    output: &mut Vec<Delta<TraceTupleHandle>>,
+) {
+    if left_deltas.is_empty() && right_deltas.is_empty() {
+        output.clear();
+        return;
+    }
+
+    let join_state = join_states
+        .entry(state_id)
+        .or_insert_with(|| JoinState::with_col_counts(left_width, right_width));
+    output.clear();
+
+    if !left_deltas.is_empty() {
+        process_left_join_trace_deltas(join_state, left_key, join_type, arena, left_deltas, output);
+    }
+    if !right_deltas.is_empty() {
+        process_right_join_trace_deltas(join_state, right_key, join_type, arena, right_deltas, output);
+    }
+}
+
+fn process_aggregate_trace_deltas(
+    aggregate_states: &mut HashMap<usize, GroupAggregateState>,
+    state_id: usize,
+    group_by: &[ColumnId],
+    functions: &[(ColumnId, AggregateType)],
+    arena: &TraceTupleArena,
+    input_deltas: &[Delta<TraceTupleHandle>],
+    output: &mut Vec<Delta<TraceTupleHandle>>,
+) {
+    if input_deltas.is_empty() {
+        output.clear();
+        return;
+    }
+
+    let agg_state = aggregate_states
+        .entry(state_id)
+        .or_insert_with(|| GroupAggregateState::new(group_by.to_vec(), functions.to_vec()));
+    *output = agg_state.process_trace_deltas(arena, input_deltas);
+}
+
+#[allow(dead_code)]
 fn bootstrap_node_stream_with_source_visitor<F>(
     node: &DataflowNode,
     meta: &CompiledBootstrapNode,
@@ -2502,23 +3297,35 @@ impl MaterializedView {
         table_id: TableId,
         deltas: Vec<Delta<Row>>,
     ) -> TraceDeltaBatch {
+        self.on_table_change_batch_profiled(table_id, deltas, None).0
+    }
+
+    pub fn on_table_change_batch_profiled(
+        &mut self,
+        table_id: TableId,
+        deltas: Vec<Delta<Row>>,
+        now_fn: Option<fn() -> f64>,
+    ) -> (TraceDeltaBatch, TraceUpdateProfile) {
         if !self.depends_on(table_id) {
-            return TraceDeltaBatch::empty();
+            return (TraceDeltaBatch::empty(), TraceUpdateProfile::default());
         }
 
         let input_batch = TraceDeltaBatch::from_row_deltas(deltas);
-        let output_deltas = propagate_trace_deltas(
+        let (output_deltas, mut profile) = execute_compiled_trace_program(
             &self.dataflow,
-            &self.compiled_plan.node,
+            &mut self.compiled_plan.program,
             &mut self.join_states,
             &mut self.aggregate_states,
             table_id,
             &input_batch,
+            now_fn,
         );
 
-        self.visible_rows.apply(&output_deltas);
+        timed_block(now_fn, &mut profile.result_apply_ms, || {
+            self.visible_rows.apply(&output_deltas);
+        });
 
-        output_deltas
+        (output_deltas, profile)
     }
 
     pub fn clear(&mut self) {
@@ -2535,6 +3342,7 @@ impl MaterializedView {
 }
 
 /// Propagates trace deltas through a dataflow node without eagerly materializing rows.
+#[allow(dead_code)]
 fn propagate_trace_deltas(
     node: &DataflowNode,
     meta: &CompiledIvmNode,
@@ -2574,15 +3382,12 @@ fn propagate_trace_deltas(
             }
             let mut filtered = Vec::with_capacity(input_deltas.deltas().len());
             for delta in input_deltas.deltas() {
-                let keep = if let Some(trace_predicate) = trace_predicate.as_ref().filter(|_| {
-                    !arena.has_materialized_row(&delta.data)
-                }) {
-                    trace_predicate(&arena, &delta.data)
-                } else {
-                    let row = arena.materialize_rc(&delta.data);
-                    predicate(&row)
-                };
-                if keep {
+                if keep_trace_handle(
+                    &arena,
+                    &delta.data,
+                    predicate.as_ref(),
+                    trace_predicate.as_deref(),
+                ) {
                     filtered.push(delta.clone());
                 }
             }
@@ -2638,14 +3443,12 @@ fn propagate_trace_deltas(
                 .deltas()
                 .iter()
                 .map(|delta| {
-                    let mut mapped = if let Some(trace_mapper) = trace_mapper.as_ref().filter(|_| {
-                        !arena.has_materialized_row(&delta.data)
-                    }) {
-                        trace_mapper(&arena, &delta.data)
-                    } else {
-                        let row = arena.materialize_rc(&delta.data);
-                        mapper(&row)
-                    };
+                    let mut mapped = map_trace_handle(
+                        &arena,
+                        &delta.data,
+                        mapper.as_ref(),
+                        trace_mapper.as_deref(),
+                    );
                     mapped.set_id(delta.data.row_id());
                     mapped.set_version(delta.data.version());
                     Delta::new(arena.owned(mapped), delta.diff)
@@ -2682,162 +3485,43 @@ fn propagate_trace_deltas(
             let jt = *join_type;
 
             let mut output_deltas = Vec::new();
-
-            if is_left_side {
-                let left_deltas = propagate_trace_deltas(
+            let left_deltas = if is_left_side {
+                propagate_trace_deltas(
                     left,
                     left_meta,
                     join_states,
                     aggregate_states,
                     source_table,
                     deltas,
-                );
-
-                let join_state = join_states.get_mut(current_join_id).unwrap();
-                let mut deltas_iter = left_deltas.deltas().iter().cloned().peekable();
-                while let Some(delta) = deltas_iter.next() {
-                    if delta.is_delete() {
-                        let maybe_new_key = deltas_iter.peek().and_then(|next_delta| {
-                            if next_delta.is_insert()
-                                && next_delta.data.row_id() == delta.data.row_id()
-                            {
-                                Some(extract_join_key_handle(left_key, &arena, &next_delta.data))
-                            } else {
-                                None
-                            }
-                        });
-                        let old_key = extract_join_key_handle(left_key, &arena, &delta.data);
-                        if let Some(new_key) = maybe_new_key {
-                            if old_key == new_key {
-                                let new_delta = deltas_iter.next().unwrap();
-                                join_state.process_left_update_same_key(
-                                    &delta.data,
-                                    new_delta.data,
-                                    old_key,
-                                    jt,
-                                    &arena,
-                                    &mut output_deltas,
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    let key = extract_join_key_handle(left_key, &arena, &delta.data);
-                    if jt == JoinType::Inner {
-                        if delta.is_insert() {
-                            join_state.process_left_insert(
-                                delta.data,
-                                key,
-                                JoinType::Inner,
-                                &arena,
-                                &mut output_deltas,
-                            );
-                        } else if delta.is_delete() {
-                            join_state.process_left_delete(
-                                delta.data.row_id(),
-                                JoinType::Inner,
-                                &arena,
-                                &mut output_deltas,
-                            );
-                        }
-                    } else if delta.is_insert() {
-                        join_state.on_left_insert_outer(
-                            delta.data,
-                            key,
-                            jt,
-                            &arena,
-                            &mut output_deltas,
-                        );
-                    } else if delta.is_delete() {
-                        join_state.on_left_delete_outer(
-                            &delta.data,
-                            key,
-                            jt,
-                            &arena,
-                            &mut output_deltas,
-                        );
-                    }
-                }
-            }
-
-            if is_right_side {
-                let right_deltas = propagate_trace_deltas(
+                )
+            } else {
+                TraceDeltaBatch::empty()
+            };
+            let right_deltas = if is_right_side {
+                propagate_trace_deltas(
                     right,
                     right_meta,
                     join_states,
                     aggregate_states,
                     source_table,
                     deltas,
-                );
-
-                let join_state = join_states.get_mut(current_join_id).unwrap();
-                let mut deltas_iter = right_deltas.deltas().iter().cloned().peekable();
-                while let Some(delta) = deltas_iter.next() {
-                    if delta.is_delete() {
-                        let maybe_new_key = deltas_iter.peek().and_then(|next_delta| {
-                            if next_delta.is_insert()
-                                && next_delta.data.row_id() == delta.data.row_id()
-                            {
-                                Some(extract_join_key_handle(right_key, &arena, &next_delta.data))
-                            } else {
-                                None
-                            }
-                        });
-                        let old_key = extract_join_key_handle(right_key, &arena, &delta.data);
-                        if let Some(new_key) = maybe_new_key {
-                            if old_key == new_key {
-                                let new_delta = deltas_iter.next().unwrap();
-                                join_state.process_right_update_same_key(
-                                    &delta.data,
-                                    new_delta.data,
-                                    old_key,
-                                    jt,
-                                    &arena,
-                                    &mut output_deltas,
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    let key = extract_join_key_handle(right_key, &arena, &delta.data);
-                    if jt == JoinType::Inner {
-                        if delta.is_insert() {
-                            join_state.process_right_insert(
-                                delta.data,
-                                key,
-                                JoinType::Inner,
-                                &arena,
-                                &mut output_deltas,
-                            );
-                        } else if delta.is_delete() {
-                            join_state.process_right_delete(
-                                delta.data.row_id(),
-                                JoinType::Inner,
-                                &arena,
-                                &mut output_deltas,
-                            );
-                        }
-                    } else if delta.is_insert() {
-                        join_state.on_right_insert_outer(
-                            delta.data,
-                            key,
-                            jt,
-                            &arena,
-                            &mut output_deltas,
-                        );
-                    } else if delta.is_delete() {
-                        join_state.on_right_delete_outer(
-                            &delta.data,
-                            key,
-                            jt,
-                            &arena,
-                            &mut output_deltas,
-                        );
-                    }
-                }
-            }
+                )
+            } else {
+                TraceDeltaBatch::empty()
+            };
+            process_join_trace_deltas(
+                join_states,
+                *current_join_id,
+                *left_width,
+                *right_width,
+                left_key,
+                right_key,
+                jt,
+                &arena,
+                left_deltas.deltas(),
+                right_deltas.deltas(),
+                &mut output_deltas,
+            );
 
             TraceDeltaBatch::new(arena, output_deltas)
         }
@@ -2866,19 +3550,17 @@ fn propagate_trace_deltas(
                 return input_deltas;
             }
 
-            // Get or create aggregate state
-            if !aggregate_states.contains_key(current_agg_id) {
-                aggregate_states.insert(
-                    *current_agg_id,
-                    GroupAggregateState::new(group_by.clone(), functions.clone()),
-                );
-            }
-
-            let agg_state = aggregate_states.get_mut(current_agg_id).unwrap();
-            TraceDeltaBatch::new(
-                arena.clone(),
-                agg_state.process_trace_deltas(&arena, input_deltas.deltas()),
-            )
+            let mut output = Vec::new();
+            process_aggregate_trace_deltas(
+                aggregate_states,
+                *current_agg_id,
+                group_by,
+                functions,
+                &arena,
+                input_deltas.deltas(),
+                &mut output,
+            );
+            TraceDeltaBatch::new(arena.clone(), output)
         }
 
         _ => unreachable!("compiled IVM metadata must mirror the dataflow shape"),
@@ -3164,6 +3846,134 @@ mod tests {
             None,
         )
         .0
+    }
+
+    fn unary_block_op_counts(plan: &CompiledIvmPlan) -> Vec<usize> {
+        plan.program
+            .instructions
+            .iter()
+            .filter_map(|instruction| match instruction {
+                TraceInstruction::Unary { block, .. } => Some(block.ops.len()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn apply_legacy_update(
+        view: &mut MaterializedView,
+        table_id: TableId,
+        deltas: Vec<Delta<Row>>,
+    ) -> Vec<Delta<Row>> {
+        if !view.depends_on(table_id) {
+            return Vec::new();
+        }
+        let input_batch = TraceDeltaBatch::from_row_deltas(deltas);
+        let output = propagate_trace_deltas(
+            &view.dataflow,
+            &view.compiled_plan.node,
+            &mut view.join_states,
+            &mut view.aggregate_states,
+            table_id,
+            &input_batch,
+        );
+        view.visible_rows.apply(&output);
+        output.materialize_rows()
+    }
+
+    fn make_trace_unary_fusion_dataflow() -> DataflowNode {
+        DataflowNode::Map {
+            input: Box::new(DataflowNode::Project {
+                input: Box::new(DataflowNode::Filter {
+                    input: Box::new(DataflowNode::source(1)),
+                    predicate: Box::new(|row| {
+                        row.get(1)
+                            .and_then(Value::as_i64)
+                            .map(|value| value >= 18)
+                            .unwrap_or(false)
+                    }),
+                    trace_predicate: Some(Box::new(|arena, handle| {
+                        arena
+                            .value_at(handle, 1)
+                            .and_then(|value| value.as_i64())
+                            .map(|value| value >= 18)
+                            .unwrap_or(false)
+                    })),
+                }),
+                columns: vec![0, 1],
+            }),
+            mapper: Box::new(|row| {
+                Row::new(row.id(), vec![row.get(0).cloned().unwrap_or(Value::Null)])
+            }),
+            trace_mapper: Some(Box::new(|arena, handle| {
+                Row::new(
+                    arena.row_id(handle),
+                    vec![arena.value_at(handle, 0).unwrap_or(Value::Null)],
+                )
+            })),
+        }
+    }
+
+    fn make_trace_filter_project_chain() -> DataflowNode {
+        DataflowNode::Project {
+            input: Box::new(DataflowNode::Project {
+                input: Box::new(DataflowNode::Filter {
+                    input: Box::new(DataflowNode::Filter {
+                        input: Box::new(DataflowNode::source(1)),
+                        predicate: Box::new(|row| {
+                            row.get(1)
+                                .and_then(Value::as_i64)
+                                .map(|value| value >= 18)
+                                .unwrap_or(false)
+                        }),
+                        trace_predicate: Some(Box::new(|arena, handle| {
+                            arena
+                                .value_at(handle, 1)
+                                .and_then(|value| value.as_i64())
+                                .map(|value| value >= 18)
+                                .unwrap_or(false)
+                        })),
+                    }),
+                    predicate: Box::new(|row| {
+                        row.get(1)
+                            .and_then(Value::as_i64)
+                            .map(|value| value % 2 == 0)
+                            .unwrap_or(false)
+                    }),
+                    trace_predicate: Some(Box::new(|arena, handle| {
+                        arena
+                            .value_at(handle, 1)
+                            .and_then(|value| value.as_i64())
+                            .map(|value| value % 2 == 0)
+                            .unwrap_or(false)
+                    })),
+                }),
+                columns: vec![0, 1],
+            }),
+            columns: vec![1],
+        }
+    }
+
+    fn make_dynamic_map_barrier_chain() -> DataflowNode {
+        DataflowNode::Project {
+            input: Box::new(DataflowNode::Map {
+                input: Box::new(DataflowNode::Project {
+                    input: Box::new(DataflowNode::source(1)),
+                    columns: vec![0, 1],
+                }),
+                mapper: Box::new(|row| {
+                    Row::new(
+                        row.id(),
+                        vec![
+                            row.get(0).cloned().unwrap_or(Value::Null),
+                            row.get(1).cloned().unwrap_or(Value::Null),
+                            Value::Int64(row.len() as i64),
+                        ],
+                    )
+                }),
+                trace_mapper: None,
+            }),
+            columns: vec![2],
+        }
     }
 
     #[test]
@@ -3685,6 +4495,133 @@ mod tests {
         assert_eq!(compiled_state.left.len(), 1);
         assert_eq!(compiled_state.right.len(), 1);
         assert_eq!(legacy_view.len(), compiled_view.len());
+    }
+
+    #[test]
+    fn test_compiled_trace_program_fuses_filter_project_trace_map_chain() {
+        let plan = CompiledIvmPlan::compile(&make_trace_unary_fusion_dataflow());
+        assert_eq!(unary_block_op_counts(&plan), vec![3]);
+    }
+
+    #[test]
+    fn test_compiled_trace_program_fuses_consecutive_filters_and_projects() {
+        let plan = CompiledIvmPlan::compile(&make_trace_filter_project_chain());
+        assert_eq!(unary_block_op_counts(&plan), vec![4]);
+    }
+
+    #[test]
+    fn test_compiled_trace_program_keeps_dynamic_map_barrier_split() {
+        let plan = CompiledIvmPlan::compile(&make_dynamic_map_barrier_chain());
+        assert_eq!(unary_block_op_counts(&plan), vec![2, 1]);
+    }
+
+    #[test]
+    fn test_compiled_unary_block_matches_legacy_recursive_path() {
+        let mut compiled_view = MaterializedView::new(make_trace_unary_fusion_dataflow());
+        let mut legacy_view = MaterializedView::new(make_trace_unary_fusion_dataflow());
+        let deltas = vec![
+            Delta::insert(make_row(1, 18)),
+            Delta::insert(make_row(2, 17)),
+            Delta::insert(make_row(3, 26)),
+        ];
+
+        let compiled_output = compiled_view.on_table_change(1, deltas.clone());
+        let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
+
+        assert_eq!(normalize_deltas(&compiled_output), normalize_deltas(&legacy_output));
+        assert_eq!(
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&legacy_view.result())
+        );
+    }
+
+    #[test]
+    fn test_compiled_unary_filter_project_chain_matches_legacy_recursive_path() {
+        let mut compiled_view = MaterializedView::new(make_trace_filter_project_chain());
+        let mut legacy_view = MaterializedView::new(make_trace_filter_project_chain());
+        let deltas = vec![
+            Delta::insert(make_row(1, 18)),
+            Delta::insert(make_row(2, 21)),
+            Delta::insert(make_row(3, 26)),
+        ];
+
+        let compiled_output = compiled_view.on_table_change(1, deltas.clone());
+        let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
+
+        assert_eq!(normalize_deltas(&compiled_output), normalize_deltas(&legacy_output));
+        assert_eq!(
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&legacy_view.result())
+        );
+    }
+
+    #[test]
+    fn test_dynamic_map_barrier_matches_legacy_recursive_path() {
+        let mut compiled_view = MaterializedView::new(make_dynamic_map_barrier_chain());
+        let mut legacy_view = MaterializedView::new(make_dynamic_map_barrier_chain());
+        let deltas = vec![
+            Delta::insert(make_row(1, 18)),
+            Delta::insert(make_row(2, 21)),
+        ];
+
+        let compiled_output = compiled_view.on_table_change(1, deltas.clone());
+        let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
+
+        assert_eq!(normalize_deltas(&compiled_output), normalize_deltas(&legacy_output));
+        assert_eq!(
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&legacy_view.result())
+        );
+    }
+
+    #[test]
+    fn test_join_same_key_update_normalizes_non_adjacent_pair() {
+        let dataflow = make_employee_department_left_outer_join();
+        let mut view = MaterializedView::new(dataflow);
+
+        let employee = make_employee(1, 200, 10);
+        let department_v1 = make_department(10, 100);
+        let department_v2 = Row::new_with_version(10, 1, vec![Value::Int64(10), Value::Int64(101)]);
+        let unrelated = make_department(20, 999);
+
+        view.on_table_change(2, vec![Delta::insert(department_v1.clone())]);
+        view.on_table_change(1, vec![Delta::insert(employee.clone())]);
+
+        let output = view.on_table_change(
+            2,
+            vec![
+                Delta::delete(department_v1),
+                Delta::insert(unrelated),
+                Delta::insert(department_v2),
+            ],
+        );
+
+        let inserts: Vec<_> = output.iter().filter(|delta| delta.is_insert()).collect();
+        let deletes: Vec<_> = output.iter().filter(|delta| delta.is_delete()).collect();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].data.get(4), Some(&Value::Int64(100)));
+        assert_eq!(inserts[0].data.get(4), Some(&Value::Int64(101)));
+        assert_eq!(view.len(), 1);
+    }
+
+    #[test]
+    fn test_self_join_update_matches_legacy_recursive_path() {
+        let mut compiled_view = MaterializedView::new(make_self_join());
+        let mut legacy_view = MaterializedView::new(make_self_join());
+        let deltas = vec![
+            Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(10)])),
+            Delta::insert(Row::new(2, vec![Value::Int64(10), Value::Int64(99)])),
+        ];
+
+        let compiled_output = compiled_view.on_table_change(1, deltas.clone());
+        let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
+
+        assert_eq!(normalize_deltas(&compiled_output), normalize_deltas(&legacy_output));
+        assert_eq!(
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&legacy_view.result())
+        );
     }
 
     // ==================== Bug 2 Test: Sum is_empty() incorrect logic ====================
