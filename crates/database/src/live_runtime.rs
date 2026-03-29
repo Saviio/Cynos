@@ -18,9 +18,9 @@ use core::cell::RefCell;
 use cynos_core::schema::Table;
 use cynos_core::{Row, Value};
 use cynos_gql::{bind::BoundRootField, GraphqlCatalog};
-use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta, TableId};
 #[cfg(feature = "benchmark")]
 use cynos_incremental::TraceUpdateProfile;
+use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta, TableId};
 use cynos_index::KeyRange;
 use cynos_query::ast::SortOrder;
 use cynos_query::planner::{IndexBounds, PhysicalPlan};
@@ -1147,9 +1147,11 @@ impl DeltaSubscription {
         deltas: Vec<Delta<Row>>,
     ) -> TraceUpdateProfile {
         match self {
-            Self::Rows(query) => query
-                .borrow_mut()
-                .on_table_change_profiled(table_id, deltas, Some(now_ms)),
+            Self::Rows(query) => {
+                query
+                    .borrow_mut()
+                    .on_table_change_profiled(table_id, deltas, Some(now_ms))
+            }
             Self::Graphql(query) => {
                 query.borrow_mut().on_table_change(table_id, deltas);
                 TraceUpdateProfile::default()
@@ -1617,8 +1619,7 @@ mod tests {
             output_tables: alloc::vec!["users".into(), "issues".into()],
         };
 
-        let bindings =
-            collect_trace_bootstrap_source_bindings(&plan, &table_ids, &table_schemas);
+        let bindings = collect_trace_bootstrap_source_bindings(&plan, &table_ids, &table_schemas);
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[0].source_index, 0);
         assert_eq!(bindings[0].table_id, 1);
@@ -1668,8 +1669,7 @@ mod tests {
             output_tables: alloc::vec!["users".into(), "users".into()],
         };
 
-        let bindings =
-            collect_trace_bootstrap_source_bindings(&plan, &table_ids, &table_schemas);
+        let bindings = collect_trace_bootstrap_source_bindings(&plan, &table_ids, &table_schemas);
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[0].table_id, 1);
         assert_eq!(bindings[1].table_id, 1);
@@ -1688,7 +1688,8 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_trace_bootstrap_source_bindings_does_not_mark_index_join_fallback_scan_as_covered() {
+    fn test_collect_trace_bootstrap_source_bindings_does_not_mark_index_join_fallback_scan_as_covered(
+    ) {
         let table_schemas = build_trace_source_test_schemas();
         let mut table_ids = HashMap::new();
         table_ids.insert("users".into(), 1u32);
@@ -1717,8 +1718,7 @@ mod tests {
             output_tables: alloc::vec!["users".into(), "users".into()],
         };
 
-        let bindings =
-            collect_trace_bootstrap_source_bindings(&plan, &table_ids, &table_schemas);
+        let bindings = collect_trace_bootstrap_source_bindings(&plan, &table_ids, &table_schemas);
         assert_eq!(bindings.len(), 2);
         assert!(matches!(
             bindings[0].access_path,

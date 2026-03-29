@@ -225,7 +225,11 @@ impl RootSubsetRefreshRuntime {
         })
     }
 
-    fn select_variant(&self, cache: &TableCache, affected_root_ids: &HashSet<u64>) -> RootSubsetPlanVariant {
+    fn select_variant(
+        &self,
+        cache: &TableCache,
+        affected_root_ids: &HashSet<u64>,
+    ) -> RootSubsetPlanVariant {
         let table_row_count = cache
             .get_table(&self.metadata.root_table)
             .map(|store| store.len())
@@ -2086,36 +2090,39 @@ impl JsIvmObservableQuery {
         let removed_key = JsValue::from_str("removed");
         let materialization_cache = self.materialization_cache.clone();
 
-        let sub_id = self.inner.borrow_mut().subscribe_trace_batches(move |batch| {
-            let total_started_at = now_ms();
-            let (delta_obj, serialize_added_ms, serialize_removed_ms, assemble_delta_ms) =
-                trace_delta_batch_to_js_delta(
-                    batch,
-                    &materializer,
-                    &mut materialization_cache.borrow_mut(),
-                    &added_key,
-                    &removed_key,
-                );
-            let added_row_count = batch.insert_count();
-            let removed_row_count = batch.delete_count();
+        let sub_id = self
+            .inner
+            .borrow_mut()
+            .subscribe_trace_batches(move |batch| {
+                let total_started_at = now_ms();
+                let (delta_obj, serialize_added_ms, serialize_removed_ms, assemble_delta_ms) =
+                    trace_delta_batch_to_js_delta(
+                        batch,
+                        &materializer,
+                        &mut materialization_cache.borrow_mut(),
+                        &added_key,
+                        &removed_key,
+                    );
+                let added_row_count = batch.insert_count();
+                let removed_row_count = batch.delete_count();
 
-            let callback_started_at = now_ms();
-            callback.call1(&JsValue::NULL, &delta_obj).ok();
-            let callback_call_ms = now_ms() - callback_started_at;
+                let callback_started_at = now_ms();
+                callback.call1(&JsValue::NULL, &delta_obj).ok();
+                let callback_call_ms = now_ms() - callback_started_at;
 
-            bridge_profiler
-                .borrow_mut()
-                .record_sample(&IvmBridgeProfile {
-                    callback_count: 1,
-                    added_row_count,
-                    removed_row_count,
-                    serialize_added_ms,
-                    serialize_removed_ms,
-                    assemble_delta_ms,
-                    callback_call_ms,
-                    total_ms: now_ms() - total_started_at,
-                });
-        });
+                bridge_profiler
+                    .borrow_mut()
+                    .record_sample(&IvmBridgeProfile {
+                        callback_count: 1,
+                        added_row_count,
+                        removed_row_count,
+                        serialize_added_ms,
+                        serialize_removed_ms,
+                        assemble_delta_ms,
+                        callback_call_ms,
+                        total_ms: now_ms() - total_started_at,
+                    });
+            });
 
         let inner_unsub = self.inner.clone();
         let called = Rc::new(RefCell::new(false));
@@ -2526,7 +2533,6 @@ impl JsSnapshotRowsMaterializer {
             }
         }
     }
-
 }
 
 impl JsSnapshotRowsCache {

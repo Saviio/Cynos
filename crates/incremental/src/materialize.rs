@@ -300,10 +300,9 @@ impl JoinState {
         if match_count == 0 {
             if emits_unmatched_left(join_type) {
                 let left_row = &self.left.slot(slot_id).row;
-                output.push(Delta::insert(arena.null_pad_right(
-                    left_row.clone(),
-                    self.right.col_count,
-                )));
+                output.push(Delta::insert(
+                    arena.null_pad_right(left_row.clone(), self.right.col_count),
+                ));
             }
             return;
         }
@@ -322,10 +321,9 @@ impl JoinState {
 
             if emit_unmatched_delete {
                 let right_row = &self.right.slot(right_id).row;
-                output.push(Delta::delete(arena.null_pad_left(
-                    right_row.clone(),
-                    self.left.col_count,
-                )));
+                output.push(Delta::delete(
+                    arena.null_pad_left(right_row.clone(), self.left.col_count),
+                ));
             }
 
             self.right.slot_mut(right_id).match_count += 1;
@@ -345,10 +343,9 @@ impl JoinState {
 
         if slot.match_count == 0 {
             if emits_unmatched_left(join_type) {
-                output.push(Delta::delete(arena.null_pad_right(
-                    slot.row.clone(),
-                    self.right.col_count,
-                )));
+                output.push(Delta::delete(
+                    arena.null_pad_right(slot.row.clone(), self.right.col_count),
+                ));
             }
             return;
         }
@@ -373,10 +370,9 @@ impl JoinState {
 
             if emit_unmatched_insert {
                 let right_row = &self.right.slot(right_id).row;
-                output.push(Delta::insert(arena.null_pad_left(
-                    right_row.clone(),
-                    self.left.col_count,
-                )));
+                output.push(Delta::insert(
+                    arena.null_pad_left(right_row.clone(), self.left.col_count),
+                ));
             }
         }
     }
@@ -398,14 +394,12 @@ impl JoinState {
         let match_count = self.left.slot(slot_id).match_count;
         if match_count == 0 {
             if emits_unmatched_left(join_type) {
-                output.push(Delta::delete(arena.null_pad_right(
-                    old_row.clone(),
-                    self.right.col_count,
-                )));
-                output.push(Delta::insert(arena.null_pad_right(
-                    new_row.clone(),
-                    self.right.col_count,
-                )));
+                output.push(Delta::delete(
+                    arena.null_pad_right(old_row.clone(), self.right.col_count),
+                ));
+                output.push(Delta::insert(
+                    arena.null_pad_right(new_row.clone(), self.right.col_count),
+                ));
             }
             self.left.slot_mut(slot_id).row = new_row;
             return;
@@ -444,10 +438,9 @@ impl JoinState {
         if match_count == 0 {
             if emits_unmatched_right(join_type) {
                 let right_row = &self.right.slot(slot_id).row;
-                output.push(Delta::insert(arena.null_pad_left(
-                    right_row.clone(),
-                    self.left.col_count,
-                )));
+                output.push(Delta::insert(
+                    arena.null_pad_left(right_row.clone(), self.left.col_count),
+                ));
             }
             return;
         }
@@ -466,10 +459,9 @@ impl JoinState {
 
             if emit_unmatched_delete {
                 let left_row = &self.left.slot(left_id).row;
-                output.push(Delta::delete(arena.null_pad_right(
-                    left_row.clone(),
-                    self.right.col_count,
-                )));
+                output.push(Delta::delete(
+                    arena.null_pad_right(left_row.clone(), self.right.col_count),
+                ));
             }
 
             self.left.slot_mut(left_id).match_count += 1;
@@ -489,10 +481,9 @@ impl JoinState {
 
         if slot.match_count == 0 {
             if emits_unmatched_right(join_type) {
-                output.push(Delta::delete(arena.null_pad_left(
-                    slot.row.clone(),
-                    self.left.col_count,
-                )));
+                output.push(Delta::delete(
+                    arena.null_pad_left(slot.row.clone(), self.left.col_count),
+                ));
             }
             return;
         }
@@ -517,10 +508,9 @@ impl JoinState {
 
             if emit_unmatched_insert {
                 let left_row = &self.left.slot(left_id).row;
-                output.push(Delta::insert(arena.null_pad_right(
-                    left_row.clone(),
-                    self.right.col_count,
-                )));
+                output.push(Delta::insert(
+                    arena.null_pad_right(left_row.clone(), self.right.col_count),
+                ));
             }
         }
     }
@@ -542,14 +532,12 @@ impl JoinState {
         let match_count = self.right.slot(slot_id).match_count;
         if match_count == 0 {
             if emits_unmatched_right(join_type) {
-                output.push(Delta::delete(arena.null_pad_left(
-                    old_row.clone(),
-                    self.left.col_count,
-                )));
-                output.push(Delta::insert(arena.null_pad_left(
-                    new_row.clone(),
-                    self.left.col_count,
-                )));
+                output.push(Delta::delete(
+                    arena.null_pad_left(old_row.clone(), self.left.col_count),
+                ));
+                output.push(Delta::insert(
+                    arena.null_pad_left(new_row.clone(), self.left.col_count),
+                ));
             }
             self.right.slot_mut(slot_id).row = new_row;
             return;
@@ -650,12 +638,8 @@ impl JoinState {
         }
     }
 
-    fn emit_bootstrap_rows<F>(
-        &self,
-        join_type: JoinType,
-        arena: &TraceTupleArena,
-        emit: &mut F,
-    ) where
+    fn emit_bootstrap_rows<F>(&self, join_type: JoinType, arena: &TraceTupleArena, emit: &mut F)
+    where
         F: FnMut(TraceTupleHandle) + ?Sized,
     {
         for left_slot in self.left.slots.iter().filter_map(Option::as_ref) {
@@ -669,20 +653,14 @@ impl JoinState {
                     ));
                 }
             } else if emits_unmatched_left(join_type) {
-                emit(arena.null_pad_right(
-                    left_slot.row.clone(),
-                    self.right.col_count,
-                ));
+                emit(arena.null_pad_right(left_slot.row.clone(), self.right.col_count));
             }
         }
 
         if emits_unmatched_right(join_type) {
             for right_slot in self.right.slots.iter().filter_map(Option::as_ref) {
                 if right_slot.match_count == 0 {
-                    emit(arena.null_pad_left(
-                        right_slot.row.clone(),
-                        self.left.col_count,
-                    ));
+                    emit(arena.null_pad_left(right_slot.row.clone(), self.left.col_count));
                 }
             }
         }
@@ -714,7 +692,11 @@ fn merge_rows_null_right(left: &Row, right_col_count: usize) -> Row {
     let mut values = Vec::with_capacity(left.len().saturating_add(right_col_count));
     values.extend(left.values().iter().cloned());
     values.resize(values.len().saturating_add(right_col_count), Value::Null);
-    Row::new_with_version(cynos_core::left_join_null_row_id(left.id()), left.version(), values)
+    Row::new_with_version(
+        cynos_core::left_join_null_row_id(left.id()),
+        left.version(),
+        values,
+    )
 }
 
 #[allow(dead_code)]
@@ -723,7 +705,11 @@ fn merge_rows_null_left(right: &Row, left_col_count: usize) -> Row {
     let mut values = Vec::with_capacity(left_col_count.saturating_add(right.len()));
     values.resize(left_col_count, Value::Null);
     values.extend(right.values().iter().cloned());
-    Row::new_with_version(cynos_core::right_join_null_row_id(right.id()), right.version(), values)
+    Row::new_with_version(
+        cynos_core::right_join_null_row_id(right.id()),
+        right.version(),
+        values,
+    )
 }
 
 #[inline]
@@ -941,7 +927,10 @@ impl GroupAggregateState {
                 .iter()
                 .map(|&col| arena.value_at(&delta.data, col).unwrap_or(Value::Null))
                 .collect::<Vec<_>>();
-            grouped.entry(key).or_default().push((&delta.data, delta.diff));
+            grouped
+                .entry(key)
+                .or_default()
+                .push((&delta.data, delta.diff));
         }
 
         let mut output = Vec::new();
@@ -990,11 +979,7 @@ impl GroupAggregateState {
         output
     }
 
-    fn apply_trace_bootstrap_handle(
-        &mut self,
-        arena: &TraceTupleArena,
-        handle: &TraceTupleHandle,
-    ) {
+    fn apply_trace_bootstrap_handle(&mut self, arena: &TraceTupleArena, handle: &TraceTupleHandle) {
         let key = self
             .group_by
             .iter()
@@ -1492,9 +1477,7 @@ fn append_trace_unary_op(
     op: TraceUnaryOp,
 ) -> TraceSlotId {
     if let Some(TraceInstruction::Unary {
-        output_slot,
-        block,
-        ..
+        output_slot, block, ..
     }) = instructions.last_mut()
     {
         if *output_slot == input_slot && block.accepts_append {
@@ -1984,9 +1967,7 @@ fn collect_bootstrap_runtime_nodes<'a>(
             collect_bootstrap_runtime_nodes(input, runtime_nodes);
         }
         DataflowNode::Project { input, .. } => {
-            runtime_nodes.push(BootstrapRuntimeNode::Source {
-                table_id: u32::MAX,
-            });
+            runtime_nodes.push(BootstrapRuntimeNode::Source { table_id: u32::MAX });
             collect_bootstrap_runtime_nodes(input, runtime_nodes);
         }
         DataflowNode::Map {
@@ -2017,9 +1998,7 @@ fn collect_bootstrap_runtime_nodes<'a>(
             collect_bootstrap_runtime_nodes(right, runtime_nodes);
         }
         DataflowNode::Aggregate { input, .. } => {
-            runtime_nodes.push(BootstrapRuntimeNode::Source {
-                table_id: u32::MAX,
-            });
+            runtime_nodes.push(BootstrapRuntimeNode::Source { table_id: u32::MAX });
             collect_bootstrap_runtime_nodes(input, runtime_nodes);
         }
     }
@@ -2322,10 +2301,7 @@ fn execute_compiled_trace_program(
 
     let mut output = Vec::new();
     mem::swap(&mut slots[program.root_slot], &mut output);
-    (
-        TraceDeltaBatch::new(arena, output),
-        profile,
-    )
+    (TraceDeltaBatch::new(arena, output), profile)
 }
 
 fn process_left_join_trace_deltas(
@@ -2339,15 +2315,13 @@ fn process_left_join_trace_deltas(
     for action in normalize_join_side_deltas(deltas, left_key, arena) {
         match action {
             NormalizedJoinSideAction::SameKeyUpdate(update) => {
-                let SameKeyTraceUpdate { old_row, new_row, key } = update;
-                join_state.process_left_update_same_key(
-                    &old_row,
+                let SameKeyTraceUpdate {
+                    old_row,
                     new_row,
                     key,
-                    join_type,
-                    arena,
-                    output,
-                );
+                } = update;
+                join_state
+                    .process_left_update_same_key(&old_row, new_row, key, join_type, arena, output);
             }
             NormalizedJoinSideAction::Delta(delta) => {
                 let key = extract_join_key_handle(left_key, arena, &delta.data);
@@ -2452,14 +2426,13 @@ fn process_right_join_trace_deltas(
     for action in normalize_join_side_deltas(deltas, right_key, arena) {
         match action {
             NormalizedJoinSideAction::SameKeyUpdate(update) => {
-                let SameKeyTraceUpdate { old_row, new_row, key } = update;
-                join_state.process_right_update_same_key(
-                    &old_row,
+                let SameKeyTraceUpdate {
+                    old_row,
                     new_row,
                     key,
-                    join_type,
-                    arena,
-                    output,
+                } = update;
+                join_state.process_right_update_same_key(
+                    &old_row, new_row, key, join_type, arena, output,
                 );
             }
             NormalizedJoinSideAction::Delta(delta) => {
@@ -2518,7 +2491,14 @@ fn process_join_trace_deltas(
         process_left_join_trace_deltas(join_state, left_key, join_type, arena, left_deltas, output);
     }
     if !right_deltas.is_empty() {
-        process_right_join_trace_deltas(join_state, right_key, join_type, arena, right_deltas, output);
+        process_right_join_trace_deltas(
+            join_state,
+            right_key,
+            join_type,
+            arena,
+            right_deltas,
+            output,
+        );
     }
 }
 
@@ -2556,10 +2536,7 @@ fn bootstrap_node_stream_with_source_visitor<F>(
 {
     let arena = TraceTupleArena;
     match (node, &meta.kind) {
-        (
-            DataflowNode::Source { table_id },
-            CompiledBootstrapNodeKind::Source { source_index },
-        ) => {
+        (DataflowNode::Source { table_id }, CompiledBootstrapNodeKind::Source { source_index }) => {
             if !emit_to_parent {
                 return;
             }
@@ -2582,9 +2559,10 @@ fn bootstrap_node_stream_with_source_visitor<F>(
             join_states,
             aggregate_states,
             &mut |handle| {
-                let keep = if let Some(trace_predicate) = trace_predicate.as_ref().filter(|_| {
-                    !arena.has_materialized_row(&handle)
-                }) {
+                let keep = if let Some(trace_predicate) = trace_predicate
+                    .as_ref()
+                    .filter(|_| !arena.has_materialized_row(&handle))
+                {
                     trace_predicate(&arena, &handle)
                 } else {
                     let row = arena.materialize_rc(&handle);
@@ -2629,9 +2607,10 @@ fn bootstrap_node_stream_with_source_visitor<F>(
             join_states,
             aggregate_states,
             &mut |handle| {
-                let mut mapped = if let Some(trace_mapper) = trace_mapper.as_ref().filter(|_| {
-                    !arena.has_materialized_row(&handle)
-                }) {
+                let mut mapped = if let Some(trace_mapper) = trace_mapper
+                    .as_ref()
+                    .filter(|_| !arena.has_materialized_row(&handle))
+                {
                     trace_mapper(&arena, &handle)
                 } else {
                     let row = arena.materialize_rc(&handle);
@@ -2726,11 +2705,7 @@ fn bootstrap_node_stream_with_source_visitor<F>(
     }
 }
 
-fn timed_block(
-    now_fn: Option<fn() -> f64>,
-    total_ms: &mut f64,
-    run: impl FnOnce(),
-) {
+fn timed_block(now_fn: Option<fn() -> f64>, total_ms: &mut f64, run: impl FnOnce()) {
     if let Some(now_fn) = now_fn {
         let started_at = now_fn();
         run();
@@ -2767,7 +2742,9 @@ where
             } => {
                 let table_id = match runtime_nodes.get(*node_index) {
                     Some(BootstrapRuntimeNode::Source { table_id }) => *table_id,
-                    _ => unreachable!("bootstrap source instruction must map to source runtime node"),
+                    _ => {
+                        unreachable!("bootstrap source instruction must map to source runtime node")
+                    }
                 };
                 let slot = &mut slots[*output_slot];
                 slot.clear();
@@ -2785,7 +2762,9 @@ where
                         predicate,
                         trace_predicate,
                     }) => (*predicate, *trace_predicate),
-                    _ => unreachable!("bootstrap filter instruction must map to filter runtime node"),
+                    _ => {
+                        unreachable!("bootstrap filter instruction must map to filter runtime node")
+                    }
                 };
                 let input: Vec<TraceTupleHandle> = mem::take(&mut slots[*input_slot]);
                 let output = &mut slots[*output_slot];
@@ -2920,7 +2899,8 @@ where
                 functions,
             } => {
                 let input = mem::take(&mut slots[*input_slot]);
-                let mut aggregate_state = GroupAggregateState::new(group_by.clone(), functions.clone());
+                let mut aggregate_state =
+                    GroupAggregateState::new(group_by.clone(), functions.clone());
                 timed_block(now_fn, &mut profile.aggregate_bootstrap_ms, || {
                     for handle in &input {
                         aggregate_state.apply_trace_bootstrap_handle(&arena, handle);
@@ -3237,14 +3217,18 @@ impl MaterializedView {
         let join_state = self.join_states.entry(0).or_insert_with(JoinState::new);
         let arena = TraceTupleArena;
         for row in left_rows {
-            join_state
-                .left
-                .insert(arena.owned(row.clone()), JoinKey::from_vec(left_key_fn(row)), 0);
+            join_state.left.insert(
+                arena.owned(row.clone()),
+                JoinKey::from_vec(left_key_fn(row)),
+                0,
+            );
         }
         for row in right_rows {
-            join_state
-                .right
-                .insert(arena.owned(row.clone()), JoinKey::from_vec(right_key_fn(row)), 0);
+            join_state.right.insert(
+                arena.owned(row.clone()),
+                JoinKey::from_vec(right_key_fn(row)),
+                0,
+            );
         }
     }
 
@@ -3289,7 +3273,8 @@ impl MaterializedView {
         table_id: TableId,
         deltas: Vec<Delta<Row>>,
     ) -> Vec<Delta<Row>> {
-        self.on_table_change_batch(table_id, deltas).materialize_rows()
+        self.on_table_change_batch(table_id, deltas)
+            .materialize_rows()
     }
 
     pub fn on_table_change_batch(
@@ -3297,7 +3282,8 @@ impl MaterializedView {
         table_id: TableId,
         deltas: Vec<Delta<Row>>,
     ) -> TraceDeltaBatch {
-        self.on_table_change_batch_profiled(table_id, deltas, None).0
+        self.on_table_change_batch_profiled(table_id, deltas, None)
+            .0
     }
 
     pub fn on_table_change_batch_profiled(
@@ -3415,7 +3401,12 @@ fn propagate_trace_deltas(
             let projected = input_deltas
                 .deltas()
                 .iter()
-                .map(|delta| Delta::new(arena.project(delta.data.clone(), columns.clone()), delta.diff))
+                .map(|delta| {
+                    Delta::new(
+                        arena.project(delta.data.clone(), columns.clone()),
+                        delta.diff,
+                    )
+                })
                 .collect();
             TraceDeltaBatch::new(arena, projected)
         }
@@ -3742,14 +3733,7 @@ mod tests {
     fn normalize_rows(rows: &[Row]) -> Vec<alloc::string::String> {
         let mut normalized: Vec<_> = rows
             .iter()
-            .map(|row| {
-                alloc::format!(
-                    "{:?}:{}:{}",
-                    row.values(),
-                    row.id(),
-                    row.version()
-                )
-            })
+            .map(|row| alloc::format!("{:?}:{}:{}", row.values(), row.id(), row.version()))
             .collect();
         normalized.sort();
         normalized
@@ -3761,7 +3745,11 @@ mod tests {
             .map(|delta| {
                 alloc::format!(
                     "{}:{:?}:{}:{}",
-                    if delta.is_insert() { "insert" } else { "delete" },
+                    if delta.is_insert() {
+                        "insert"
+                    } else {
+                        "delete"
+                    },
                     delta.data.values(),
                     delta.data.id(),
                     delta.data.version()
@@ -4321,7 +4309,10 @@ mod tests {
         let reference_output = reference_view.on_table_change(1, follow_up.clone());
         let skip_output = skip_view.on_table_change(1, follow_up);
 
-        assert_eq!(normalize_deltas(&reference_output), normalize_deltas(&skip_output));
+        assert_eq!(
+            normalize_deltas(&reference_output),
+            normalize_deltas(&skip_output)
+        );
         assert_eq!(
             normalize_rows(&reference_view.result()),
             normalize_rows(&skip_view.result())
@@ -4369,7 +4360,10 @@ mod tests {
         let reference_output = reference_view.on_table_change(1, follow_up.clone());
         let skip_output = skip_view.on_table_change(1, follow_up);
 
-        assert_eq!(normalize_deltas(&reference_output), normalize_deltas(&skip_output));
+        assert_eq!(
+            normalize_deltas(&reference_output),
+            normalize_deltas(&skip_output)
+        );
         assert_eq!(
             normalize_rows(&reference_view.result()),
             normalize_rows(&skip_view.result())
@@ -4401,7 +4395,10 @@ mod tests {
         let legacy_output = legacy_view.on_table_change(1, follow_up.clone());
         let compiled_output = compiled_view.on_table_change(1, follow_up);
 
-        assert_eq!(normalize_deltas(&legacy_output), normalize_deltas(&compiled_output));
+        assert_eq!(
+            normalize_deltas(&legacy_output),
+            normalize_deltas(&compiled_output)
+        );
         assert_eq!(
             normalize_rows(&legacy_view.result()),
             normalize_rows(&compiled_view.result())
@@ -4432,7 +4429,10 @@ mod tests {
         let legacy_output = legacy_view.on_table_change(2, follow_up.clone());
         let compiled_output = compiled_view.on_table_change(2, follow_up);
 
-        assert_eq!(normalize_deltas(&legacy_output), normalize_deltas(&compiled_output));
+        assert_eq!(
+            normalize_deltas(&legacy_output),
+            normalize_deltas(&compiled_output)
+        );
         assert_eq!(
             normalize_rows(&legacy_view.result()),
             normalize_rows(&compiled_view.result())
@@ -4454,8 +4454,11 @@ mod tests {
             ],
         );
 
-        let mut legacy_view =
-            bootstrap_view_with_legacy_executor(make_sum_aggregate(), initial.clone(), &source_rows);
+        let mut legacy_view = bootstrap_view_with_legacy_executor(
+            make_sum_aggregate(),
+            initial.clone(),
+            &source_rows,
+        );
         let mut compiled_view =
             bootstrap_view_with_compiled_executor(make_sum_aggregate(), initial, &source_rows);
 
@@ -4466,7 +4469,10 @@ mod tests {
         let legacy_output = legacy_view.on_table_change(1, follow_up.clone());
         let compiled_output = compiled_view.on_table_change(1, follow_up);
 
-        assert_eq!(normalize_deltas(&legacy_output), normalize_deltas(&compiled_output));
+        assert_eq!(
+            normalize_deltas(&legacy_output),
+            normalize_deltas(&compiled_output)
+        );
         assert_eq!(
             normalize_rows(&legacy_view.result()),
             normalize_rows(&compiled_view.result())
@@ -4528,7 +4534,10 @@ mod tests {
         let compiled_output = compiled_view.on_table_change(1, deltas.clone());
         let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
 
-        assert_eq!(normalize_deltas(&compiled_output), normalize_deltas(&legacy_output));
+        assert_eq!(
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&legacy_output)
+        );
         assert_eq!(
             normalize_rows(&compiled_view.result()),
             normalize_rows(&legacy_view.result())
@@ -4548,7 +4557,10 @@ mod tests {
         let compiled_output = compiled_view.on_table_change(1, deltas.clone());
         let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
 
-        assert_eq!(normalize_deltas(&compiled_output), normalize_deltas(&legacy_output));
+        assert_eq!(
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&legacy_output)
+        );
         assert_eq!(
             normalize_rows(&compiled_view.result()),
             normalize_rows(&legacy_view.result())
@@ -4567,7 +4579,10 @@ mod tests {
         let compiled_output = compiled_view.on_table_change(1, deltas.clone());
         let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
 
-        assert_eq!(normalize_deltas(&compiled_output), normalize_deltas(&legacy_output));
+        assert_eq!(
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&legacy_output)
+        );
         assert_eq!(
             normalize_rows(&compiled_view.result()),
             normalize_rows(&legacy_view.result())
@@ -4617,7 +4632,10 @@ mod tests {
         let compiled_output = compiled_view.on_table_change(1, deltas.clone());
         let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
 
-        assert_eq!(normalize_deltas(&compiled_output), normalize_deltas(&legacy_output));
+        assert_eq!(
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&legacy_output)
+        );
         assert_eq!(
             normalize_rows(&compiled_view.result()),
             normalize_rows(&legacy_view.result())

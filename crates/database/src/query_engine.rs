@@ -10,15 +10,15 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use cynos_core::{Row, Value, DUMMY_ROW_ID};
 use cynos_index::{contains_trigram_pairs, KeyRange};
+use cynos_jsonb::JsonPath;
 use cynos_query::ast::{BinaryOp, Expr as AstExpr};
 use cynos_query::context::{
-    ExecutionContext, IndexInfo, PlannerFeatureFlags, PlanningIntent, PlanningMode,
-    QueryIndexType, RestrictedAccessMode, TableStats,
+    ExecutionContext, IndexInfo, PlannerFeatureFlags, PlanningIntent, PlanningMode, QueryIndexType,
+    RestrictedAccessMode, TableStats,
 };
 use cynos_query::executor::{DataSource, ExecutionError, ExecutionResult, PhysicalPlanRunner};
 pub use cynos_query::plan_cache::CompiledPhysicalPlan;
 use cynos_query::planner::{LogicalPlan, PhysicalPlan, PlannerProfile, QueryPlanner};
-use cynos_jsonb::JsonPath;
 use cynos_storage::TableCache;
 use hashbrown::HashSet;
 
@@ -220,8 +220,7 @@ impl<'a> TableSubsetDataSource<'a> {
             .ok_or_else(|| ExecutionError::TableNotFound(subset_table.into()))?;
         let mut sorted_allowed_row_ids: Vec<u64> = allowed_row_ids.iter().copied().collect();
         sorted_allowed_row_ids.sort_unstable();
-        let subset_execution_mode =
-            SubsetExecutionMode::choose(allowed_row_ids.len(), store.len());
+        let subset_execution_mode = SubsetExecutionMode::choose(allowed_row_ids.len(), store.len());
 
         Ok(Self {
             cache,
@@ -1265,7 +1264,11 @@ fn register_plan_gin_costs(cache: &TableCache, ctx: &mut ExecutionContext, plan:
     }
 }
 
-fn register_predicate_gin_costs(cache: &TableCache, ctx: &mut ExecutionContext, predicate: &AstExpr) {
+fn register_predicate_gin_costs(
+    cache: &TableCache,
+    ctx: &mut ExecutionContext,
+    predicate: &AstExpr,
+) {
     match predicate {
         AstExpr::BinaryOp {
             left,
@@ -1392,7 +1395,9 @@ fn extract_literal_string(expr: &AstExpr) -> Option<String> {
         AstExpr::Literal(Value::String(value)) => Some(value.clone()),
         AstExpr::Literal(Value::Int32(value)) => Some(value.to_string()),
         AstExpr::Literal(Value::Int64(value)) => Some(value.to_string()),
-        AstExpr::Literal(Value::Boolean(value)) => Some(if *value { "true" } else { "false" }.into()),
+        AstExpr::Literal(Value::Boolean(value)) => {
+            Some(if *value { "true" } else { "false" }.into())
+        }
         AstExpr::Literal(Value::Float64(value)) => Some(value.to_string()),
         _ => None,
     }
@@ -1455,7 +1460,12 @@ pub fn build_execution_context_for_plan(
     table_name: &str,
     plan: &LogicalPlan,
 ) -> ExecutionContext {
-    build_execution_context_for_plan_with_profile(cache, table_name, plan, CompilePlanProfile::Default)
+    build_execution_context_for_plan_with_profile(
+        cache,
+        table_name,
+        plan,
+        CompilePlanProfile::Default,
+    )
 }
 
 pub(crate) fn build_execution_context_for_plan_with_profile(

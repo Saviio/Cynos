@@ -4,9 +4,7 @@ use crate::delta::Delta;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use cynos_core::{
-    join_row_id, left_join_null_row_id, right_join_null_row_id, Row, RowId, Value,
-};
+use cynos_core::{join_row_id, left_join_null_row_id, right_join_null_row_id, Row, RowId, Value};
 use hashbrown::HashMap;
 
 #[derive(Clone, Debug)]
@@ -53,9 +51,7 @@ impl TraceTupleHandle {
         match &self.0.kind {
             TraceTupleKind::Base(row) | TraceTupleKind::Owned(row) => row.len(),
             TraceTupleKind::Concat {
-                left_width,
-                right,
-                ..
+                left_width, right, ..
             } => left_width.saturating_add(right.len()),
             TraceTupleKind::NullPadLeft { left_width, right } => {
                 left_width.saturating_add(right.len())
@@ -70,7 +66,9 @@ impl TraceTupleHandle {
     pub fn row_id(&self) -> RowId {
         match &self.0.kind {
             TraceTupleKind::Base(row) | TraceTupleKind::Owned(row) => row.id(),
-            TraceTupleKind::Concat { left, right, .. } => join_row_id(left.row_id(), right.row_id()),
+            TraceTupleKind::Concat { left, right, .. } => {
+                join_row_id(left.row_id(), right.row_id())
+            }
             TraceTupleKind::NullPadLeft { right, .. } => right_join_null_row_id(right.row_id()),
             TraceTupleKind::NullPadRight { left, .. } => left_join_null_row_id(left.row_id()),
             TraceTupleKind::Project { input, .. } => input.row_id(),
@@ -135,37 +133,24 @@ impl TraceTupleHandle {
             TraceTupleKind::Concat { left, right, .. } => {
                 let left_row = left.materialize_rc();
                 let right_row = right.materialize_rc();
-                let mut values =
-                    Vec::with_capacity(left_row.len().saturating_add(right_row.len()));
+                let mut values = Vec::with_capacity(left_row.len().saturating_add(right_row.len()));
                 values.extend(left_row.values().iter().cloned());
                 values.extend(right_row.values().iter().cloned());
-                Rc::new(Row::new_with_version(
-                    self.row_id(),
-                    self.version(),
-                    values,
-                ))
+                Rc::new(Row::new_with_version(self.row_id(), self.version(), values))
             }
             TraceTupleKind::NullPadLeft { right, left_width } => {
                 let right_row = right.materialize_rc();
                 let mut values = Vec::with_capacity(left_width.saturating_add(right_row.len()));
                 values.resize(*left_width, Value::Null);
                 values.extend(right_row.values().iter().cloned());
-                Rc::new(Row::new_with_version(
-                    self.row_id(),
-                    self.version(),
-                    values,
-                ))
+                Rc::new(Row::new_with_version(self.row_id(), self.version(), values))
             }
             TraceTupleKind::NullPadRight { left, right_width } => {
                 let left_row = left.materialize_rc();
                 let mut values = Vec::with_capacity(left_row.len().saturating_add(*right_width));
                 values.extend(left_row.values().iter().cloned());
                 values.resize(values.len().saturating_add(*right_width), Value::Null);
-                Rc::new(Row::new_with_version(
-                    self.row_id(),
-                    self.version(),
-                    values,
-                ))
+                Rc::new(Row::new_with_version(self.row_id(), self.version(), values))
             }
             TraceTupleKind::Project { input, columns } => {
                 let input_row = input.materialize_rc();
@@ -173,11 +158,7 @@ impl TraceTupleHandle {
                     .iter()
                     .filter_map(|index| input_row.get(*index).cloned())
                     .collect();
-                Rc::new(Row::new_with_version(
-                    self.row_id(),
-                    self.version(),
-                    values,
-                ))
+                Rc::new(Row::new_with_version(self.row_id(), self.version(), values))
             }
         };
 
@@ -227,37 +208,16 @@ impl TraceTupleArena {
         )
     }
 
-    pub fn null_pad_left(
-        &self,
-        right: TraceTupleHandle,
-        left_width: usize,
-    ) -> TraceTupleHandle {
-        TraceTupleHandle::new(
-            TraceTupleKind::NullPadLeft { right, left_width },
-            None,
-        )
+    pub fn null_pad_left(&self, right: TraceTupleHandle, left_width: usize) -> TraceTupleHandle {
+        TraceTupleHandle::new(TraceTupleKind::NullPadLeft { right, left_width }, None)
     }
 
-    pub fn null_pad_right(
-        &self,
-        left: TraceTupleHandle,
-        right_width: usize,
-    ) -> TraceTupleHandle {
-        TraceTupleHandle::new(
-            TraceTupleKind::NullPadRight { left, right_width },
-            None,
-        )
+    pub fn null_pad_right(&self, left: TraceTupleHandle, right_width: usize) -> TraceTupleHandle {
+        TraceTupleHandle::new(TraceTupleKind::NullPadRight { left, right_width }, None)
     }
 
-    pub fn project(
-        &self,
-        input: TraceTupleHandle,
-        columns: Rc<[usize]>,
-    ) -> TraceTupleHandle {
-        TraceTupleHandle::new(
-            TraceTupleKind::Project { input, columns },
-            None,
-        )
+    pub fn project(&self, input: TraceTupleHandle, columns: Rc<[usize]>) -> TraceTupleHandle {
+        TraceTupleHandle::new(TraceTupleKind::Project { input, columns }, None)
     }
 
     #[inline]

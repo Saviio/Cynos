@@ -346,7 +346,12 @@ impl ExecutionContext {
     }
 
     /// Returns an estimated row count for a point lookup on the given index.
-    pub fn estimate_point_lookup_rows(&self, table: &str, index_name: &str, is_unique: bool) -> usize {
+    pub fn estimate_point_lookup_rows(
+        &self,
+        table: &str,
+        index_name: &str,
+        is_unique: bool,
+    ) -> usize {
         if is_unique {
             return 1;
         }

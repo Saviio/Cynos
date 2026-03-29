@@ -3,9 +3,9 @@
 //! Based on DBSP (Database Stream Processing) theory, each node represents
 //! a lifted relational operator that processes Z-set deltas incrementally.
 
+use crate::trace::{TraceTupleArena, TraceTupleHandle};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use crate::trace::{TraceTupleArena, TraceTupleHandle};
 use cynos_core::{Row, Value};
 
 /// Type alias for table identifier.
@@ -18,15 +18,13 @@ pub type ColumnId = usize;
 pub type PredicateFn = Box<dyn Fn(&Row) -> bool + Send + Sync>;
 
 /// Handle-aware predicate for trace tuple fast paths.
-pub type TracePredicateFn =
-    Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> bool + Send + Sync>;
+pub type TracePredicateFn = Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> bool + Send + Sync>;
 
 /// Mapper function for transforming rows.
 pub type MapperFn = Box<dyn Fn(&Row) -> Row + Send + Sync>;
 
 /// Handle-aware mapper for trace tuple fast paths.
-pub type TraceMapperFn =
-    Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> Row + Send + Sync>;
+pub type TraceMapperFn = Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> Row + Send + Sync>;
 
 /// Key extractor function for joins.
 pub type KeyExtractorFn = Box<dyn Fn(&Row) -> Vec<Value> + Send + Sync>;

@@ -27,6 +27,8 @@ use cynos_gql::{PreparedQuery as GqlPreparedQuery, SchemaCache as GraphqlSchemaC
 use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, Delta};
 use cynos_query::plan_cache::PlanCache;
 use cynos_reactive::TableId;
+#[cfg(feature = "benchmark")]
+use cynos_storage::StorageInsertProfile;
 use cynos_storage::TableCache;
 use wasm_bindgen::prelude::*;
 
@@ -49,6 +51,8 @@ pub struct Database {
     graphql_schema_cache: Rc<RefCell<GraphqlSchemaCache>>,
     schema_epoch: Rc<RefCell<u64>>,
     last_commit_profile: Rc<RefCell<Option<CommitProfile>>>,
+    #[cfg(feature = "benchmark")]
+    last_insert_profile: Rc<RefCell<Option<StorageInsertProfile>>>,
 }
 
 /// A prepared GraphQL query that reuses the parsed document across executions.
@@ -84,6 +88,8 @@ impl Database {
             graphql_schema_cache: Rc::new(RefCell::new(GraphqlSchemaCache::new())),
             schema_epoch: Rc::new(RefCell::new(0)),
             last_commit_profile: Rc::new(RefCell::new(None)),
+            #[cfg(feature = "benchmark")]
+            last_insert_profile: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -186,6 +192,8 @@ impl Database {
             self.cache.clone(),
             self.query_registry.clone(),
             self.table_id_map.clone(),
+            #[cfg(feature = "benchmark")]
+            self.last_insert_profile.clone(),
             table,
         )
     }
@@ -268,6 +276,16 @@ impl Database {
         };
 
         snapshot_init_profile_to_js_value(profile)
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[wasm_bindgen(js_name = takeLastInsertProfile)]
+    pub fn take_last_insert_profile(&self) -> JsValue {
+        let Some(profile) = self.last_insert_profile.borrow_mut().take() else {
+            return JsValue::NULL;
+        };
+
+        storage_insert_profile_to_js_value(profile)
     }
 
     #[wasm_bindgen(js_name = takeLastSnapshotFlushProfile)]
@@ -1212,6 +1230,155 @@ fn ivm_bridge_profile_to_js_value(profile: IvmBridgeProfile) -> JsValue {
         &JsValue::from_f64(profile.total_ms),
     )
     .ok();
+    object.into()
+}
+
+#[cfg(feature = "benchmark")]
+fn storage_insert_profile_to_js_value(profile: StorageInsertProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    let gin = js_sys::Object::new();
+
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowCount"),
+        &JsValue::from_f64(profile.row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("secondaryIndexCount"),
+        &JsValue::from_f64(profile.secondary_index_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("ginIndexCount"),
+        &JsValue::from_f64(profile.gin_index_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("validationMs"),
+        &JsValue::from_f64(profile.validation_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowIdIndexMs"),
+        &JsValue::from_f64(profile.row_id_index_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("primaryIndexMs"),
+        &JsValue::from_f64(profile.primary_index_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("secondaryIndexMs"),
+        &JsValue::from_f64(profile.secondary_index_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("ginCollectMs"),
+        &JsValue::from_f64(profile.gin_collect_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("ginFlushMs"),
+        &JsValue::from_f64(profile.gin_flush_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowSlotMs"),
+        &JsValue::from_f64(profile.row_slot_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("parseJsonMs"),
+        &JsValue::from_f64(profile.gin.parse_json_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("pathLookupMs"),
+        &JsValue::from_f64(profile.gin.path_lookup_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("scalarEmitMs"),
+        &JsValue::from_f64(profile.gin.scalar_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("containsStringifyMs"),
+        &JsValue::from_f64(profile.gin.contains_stringify_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("containsTrigramEmitMs"),
+        &JsValue::from_f64(profile.gin.contains_trigram_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("parseCallCount"),
+        &JsValue::from_f64(profile.gin.parse_call_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("selectedPathEvalCount"),
+        &JsValue::from_f64(profile.gin.selected_path_eval_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("selectedPathHitCount"),
+        &JsValue::from_f64(profile.gin.selected_path_hit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("pathKeyEmitCount"),
+        &JsValue::from_f64(profile.gin.path_key_emit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("scalarValueCount"),
+        &JsValue::from_f64(profile.gin.scalar_value_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("containsValueCount"),
+        &JsValue::from_f64(profile.gin.contains_value_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("containsTrigramCount"),
+        &JsValue::from_f64(profile.gin.contains_trigram_count as f64),
+    )
+    .ok();
+
+    js_sys::Reflect::set(&object, &JsValue::from_str("gin"), &gin).ok();
     object.into()
 }
 

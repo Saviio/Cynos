@@ -37,6 +37,8 @@ use cynos_query::ast::{AggregateFunc, SortOrder};
 use cynos_query::plan_cache::{compute_plan_fingerprint, PlanCache};
 use cynos_query::planner::{LogicalPlan, PhysicalPlan};
 use cynos_reactive::TableId;
+#[cfg(feature = "benchmark")]
+use cynos_storage::StorageInsertProfile;
 use cynos_storage::TableCache;
 use wasm_bindgen::prelude::*;
 
@@ -2519,6 +2521,8 @@ pub struct InsertBuilder {
     cache: Rc<RefCell<TableCache>>,
     query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    #[cfg(feature = "benchmark")]
+    last_insert_profile: Rc<RefCell<Option<StorageInsertProfile>>>,
     table_name: String,
     values_data: Option<JsValue>,
 }
@@ -2528,12 +2532,17 @@ impl InsertBuilder {
         cache: Rc<RefCell<TableCache>>,
         query_registry: Rc<RefCell<LiveRegistry>>,
         table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+        #[cfg(feature = "benchmark")] last_insert_profile: Rc<
+            RefCell<Option<StorageInsertProfile>>,
+        >,
         table: &str,
     ) -> Self {
         Self {
             cache,
             query_registry,
             table_id_map,
+            #[cfg(feature = "benchmark")]
+            last_insert_profile,
             table_name: table.to_string(),
             values_data: None,
         }
@@ -2549,6 +2558,7 @@ fn execute_insert_values(
     cache: &Rc<RefCell<TableCache>>,
     query_registry: &Rc<RefCell<LiveRegistry>>,
     table_id_map: &Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    #[cfg(feature = "benchmark")] last_insert_profile: &Rc<RefCell<Option<StorageInsertProfile>>>,
     table_name: &str,
     values: &JsValue,
 ) -> Result<InsertExecutionStats, JsValue> {
@@ -2563,14 +2573,23 @@ fn execute_insert_values(
     let start_row_id = reserve_row_ids(arr.length() as u64);
     let rows = js_array_to_rows(values, &schema, start_row_id)?;
 
-    execute_insert_rows(cache, query_registry, table_id_map, table_name, rows)
-        .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))
+    execute_insert_rows(
+        cache,
+        query_registry,
+        table_id_map,
+        #[cfg(feature = "benchmark")]
+        last_insert_profile,
+        table_name,
+        rows,
+    )
+    .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))
 }
 
 fn execute_insert_rows(
     cache: &Rc<RefCell<TableCache>>,
     query_registry: &Rc<RefCell<LiveRegistry>>,
     table_id_map: &Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    #[cfg(feature = "benchmark")] last_insert_profile: &Rc<RefCell<Option<StorageInsertProfile>>>,
     table_name: &str,
     rows: Vec<Row>,
 ) -> cynos_core::Result<InsertExecutionStats> {
@@ -2593,7 +2612,16 @@ fn execute_insert_rows(
     let store = cache
         .get_table_mut(table_name)
         .ok_or_else(|| cynos_core::Error::table_not_found(table_name))?;
-    store.insert_batch(rows)?;
+    #[cfg(feature = "benchmark")]
+    {
+        let (inserted, profile) = store.insert_batch_profiled(rows, now_ms)?;
+        debug_assert_eq!(inserted, row_count);
+        *last_insert_profile.borrow_mut() = Some(profile);
+    }
+    #[cfg(not(feature = "benchmark"))]
+    {
+        store.insert_batch(rows)?;
+    }
     drop(cache);
 
     if let (Some(table_id), Some(inserted_ids), Some(deltas)) = (table_id, inserted_ids, deltas) {
@@ -2623,6 +2651,8 @@ impl InsertBuilder {
             &self.cache,
             &self.query_registry,
             &self.table_id_map,
+            #[cfg(feature = "benchmark")]
+            &self.last_insert_profile,
             &self.table_name,
             values,
         )?;

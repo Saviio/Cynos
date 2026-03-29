@@ -333,19 +333,21 @@ impl ObservableQuery {
             return TraceUpdateProfile::default();
         }
 
-        let (output_batch, profile) = self.view.on_table_change_batch_profiled(table_id, deltas, now_fn);
+        let (output_batch, profile) = self
+            .view
+            .on_table_change_batch_profiled(table_id, deltas, now_fn);
 
         if !output_batch.is_empty() {
             if !self.trace_batch_subscriptions.is_empty() {
                 self.trace_batch_subscriptions.notify_all(&output_batch);
             }
 
-            let materialized = if self.raw_delta_subscriptions.is_empty() && self.subscriptions.is_empty()
-            {
-                None
-            } else {
-                Some(output_batch.materialize_rows())
-            };
+            let materialized =
+                if self.raw_delta_subscriptions.is_empty() && self.subscriptions.is_empty() {
+                    None
+                } else {
+                    Some(output_batch.materialize_rows())
+                };
 
             if !self.raw_delta_subscriptions.is_empty() {
                 if let Some(ref output_deltas) = materialized {

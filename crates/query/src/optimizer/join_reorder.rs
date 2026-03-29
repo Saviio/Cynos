@@ -466,7 +466,8 @@ impl JoinReorder {
             .anchor_table
             .as_ref()?;
 
-        nodes.iter()
+        nodes
+            .iter()
             .enumerate()
             .filter(|(_, node)| node.tables.iter().any(|table| table == anchor_table))
             .min_by_key(|(_, node)| node.cardinality)

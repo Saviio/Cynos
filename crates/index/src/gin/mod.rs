@@ -8,12 +8,11 @@ mod posting;
 pub use posting::PostingList;
 
 use crate::stats::IndexStats;
-use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use cynos_core::RowId;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 /// Synthetic key namespace used for JSONB_CONTAINS trigram prefilters.
 pub const CONTAINS_TRIGRAM_KEY_PREFIX: &str = "__cynos_contains3__:";
@@ -25,20 +24,60 @@ pub fn contains_trigram_key(path: &str) -> String {
     key
 }
 
+fn trigram_code(first: char, second: char, third: char) -> u128 {
+    ((first as u128) << 42) | ((second as u128) << 21) | (third as u128)
+}
+
+fn push_trigram_string(out: &mut String, first: char, second: char, third: char) {
+    out.clear();
+    out.push(first);
+    out.push(second);
+    out.push(third);
+}
+
+fn for_each_unique_trigram<F>(value: &str, mut visitor: F) -> usize
+where
+    F: FnMut(&str),
+{
+    let mut chars = value.chars();
+    let Some(mut first) = chars.next() else {
+        return 0;
+    };
+    let Some(mut second) = chars.next() else {
+        return 0;
+    };
+    let Some(mut third) = chars.next() else {
+        return 0;
+    };
+
+    let mut seen = HashSet::with_capacity(value.len().saturating_sub(2));
+    let mut gram = String::with_capacity(first.len_utf8() + second.len_utf8() + third.len_utf8());
+    let mut count = 0usize;
+
+    loop {
+        if seen.insert(trigram_code(first, second, third)) {
+            push_trigram_string(&mut gram, first, second, third);
+            visitor(gram.as_str());
+            count += 1;
+        }
+
+        let Some(next) = chars.next() else {
+            break;
+        };
+        first = second;
+        second = third;
+        third = next;
+    }
+
+    count
+}
+
 /// Extracts unique trigrams from a string for substring prefiltering.
 pub fn contains_trigrams(value: &str) -> Vec<String> {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() < 3 {
-        return Vec::new();
-    }
-
-    let mut grams = BTreeSet::new();
-    for window in chars.windows(3) {
-        let gram: String = window.iter().collect();
-        grams.insert(gram);
-    }
-
-    grams.into_iter().collect()
+    let mut grams = Vec::new();
+    for_each_unique_trigram(value, |gram| grams.push(gram.into()));
+    grams.sort_unstable();
+    grams
 }
 
 /// Builds the synthetic (key, value) pairs used to prefilter JSONB_CONTAINS.
@@ -89,17 +128,19 @@ impl GinBulkBuilder {
     }
 
     pub fn add_key_value_ref(&mut self, key: &str, value: &str, row_id: RowId) {
-        let values = self
-            .key_value_index
-            .entry(key.into())
-            .or_insert_with(HashMap::new);
+        if let Some(values) = self.key_value_index.get_mut(key) {
+            if let Some(rows) = values.get_mut(value) {
+                push_sorted_unique_row(rows, row_id);
+                return;
+            }
 
-        if let Some(rows) = values.get_mut(value) {
-            push_sorted_unique_row(rows, row_id);
+            values.insert(value.into(), vec![row_id]);
             return;
         }
 
+        let mut values = HashMap::new();
         values.insert(value.into(), vec![row_id]);
+        self.key_value_index.insert(key.into(), values);
     }
 
     pub fn add_key_value(&mut self, key: String, value: String, row_id: RowId) {
@@ -127,12 +168,9 @@ impl GinBulkBuilder {
         needle: &str,
         row_id: RowId,
     ) -> usize {
-        let grams = contains_trigrams(needle);
-        let count = grams.len();
-        for gram in grams {
-            self.add_key_value_ref(contains_key, &gram, row_id);
-        }
-        count
+        for_each_unique_trigram(needle, |gram| {
+            self.add_key_value_ref(contains_key, gram, row_id)
+        })
     }
 
     fn finish(self) -> GinBulkDelta {
@@ -230,12 +268,9 @@ impl GinIndex {
 
     pub fn add_contains_trigrams(&mut self, path: &str, needle: &str, row_id: RowId) -> usize {
         let key = contains_trigram_key(path);
-        let grams = contains_trigrams(needle);
-        let count = grams.len();
-        for gram in grams {
-            self.add_key_value(key.clone(), gram, row_id);
-        }
-        count
+        for_each_unique_trigram(needle, |gram| {
+            self.add_key_value(key.clone(), gram.into(), row_id);
+        })
     }
 
     pub fn apply_bulk_builder(&mut self, builder: GinBulkBuilder) {

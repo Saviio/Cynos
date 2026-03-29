@@ -369,9 +369,11 @@ impl<'a> IndexJoinPass<'a> {
         let outer_rows = self.estimate_rows(outer);
         let effective_outer_rows = row_goal.map_or(outer_rows, |goal| outer_rows.min(goal));
         let inner_rows = self.ctx.row_count(inner_table);
-        let point_lookup_rows = self
-            .ctx
-            .estimate_point_lookup_rows(inner_table, &inner_index.name, inner_index.is_unique);
+        let point_lookup_rows = self.ctx.estimate_point_lookup_rows(
+            inner_table,
+            &inner_index.name,
+            inner_index.is_unique,
+        );
 
         if effective_outer_rows == 0 || inner_rows == 0 {
             return false;
@@ -412,7 +414,11 @@ impl<'a> IndexJoinPass<'a> {
         match plan {
             PhysicalPlan::TableScan { table } => {
                 let count = self.ctx.row_count(table);
-                if count > 0 { count } else { 1000 }
+                if count > 0 {
+                    count
+                } else {
+                    1000
+                }
             }
             PhysicalPlan::IndexGet { .. } => 1,
             PhysicalPlan::IndexInGet { keys, .. } => keys.len(),
@@ -475,16 +481,14 @@ impl<'a> IndexJoinPass<'a> {
                 } else {
                     Some(costs.iter().copied().sum())
                 };
-                estimated
-                    .filter(|cost| *cost > 0)
-                    .unwrap_or_else(|| {
-                        let row_count = self.ctx.row_count(table);
-                        if row_count == 0 {
-                            50
-                        } else {
-                            core::cmp::max(row_count / 20, 1)
-                        }
-                    })
+                estimated.filter(|cost| *cost > 0).unwrap_or_else(|| {
+                    let row_count = self.ctx.row_count(table);
+                    if row_count == 0 {
+                        50
+                    } else {
+                        core::cmp::max(row_count / 20, 1)
+                    }
+                })
             }
             PhysicalPlan::Filter { input, .. } => core::cmp::max(self.estimate_rows(input) / 10, 1),
             PhysicalPlan::Project { input, .. }

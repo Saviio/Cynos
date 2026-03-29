@@ -16,8 +16,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use cynos_core::{schema::Table, Row, Value};
 use cynos_incremental::{
-    AggregateType, DataflowNode, JoinKeySpec, JoinType as IvmJoinType, TableId,
-    TraceTupleArena, TraceTupleHandle,
+    AggregateType, DataflowNode, JoinKeySpec, JoinType as IvmJoinType, TableId, TraceTupleArena,
+    TraceTupleHandle,
 };
 use cynos_index::KeyRange;
 use cynos_jsonb::{JsonPath, JsonbObject, JsonbValue};
@@ -473,10 +473,8 @@ fn compile_node(
                     dataflow: DataflowNode::Map {
                         input: Box::new(input_node.dataflow),
                         mapper: Box::new(move |row: &Row| {
-                            let values: Vec<Value> = row_exprs
-                                .iter()
-                                .map(|expr| eval_expr(expr, row))
-                                .collect();
+                            let values: Vec<Value> =
+                                row_exprs.iter().map(|expr| eval_expr(expr, row)).collect();
                             Row::new_with_version(row.id(), row.version(), values)
                         }),
                         trace_mapper: Some(trace_mapper),
@@ -718,12 +716,16 @@ where
         }
         Expr::In { expr, list } => {
             let val = eval_expr_with(expr, value_at);
-            let found = list.iter().any(|item| eval_expr_with(item, value_at) == val);
+            let found = list
+                .iter()
+                .any(|item| eval_expr_with(item, value_at) == val);
             Value::Boolean(found)
         }
         Expr::NotIn { expr, list } => {
             let val = eval_expr_with(expr, value_at);
-            let found = list.iter().any(|item| eval_expr_with(item, value_at) == val);
+            let found = list
+                .iter()
+                .any(|item| eval_expr_with(item, value_at) == val);
             Value::Boolean(!found)
         }
         Expr::Between { expr, low, high } => {
