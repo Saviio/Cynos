@@ -19,6 +19,13 @@ export class BinaryResult {
      */
     free(): void;
     /**
+     * Copy the buffer into a standalone Uint8Array suitable for `postMessage`
+     * transfer lists and other ownership-taking APIs.
+     *
+     * Unlike `asView()`, the returned bytes are no longer tied to WASM memory.
+     */
+    intoTransferable(): Uint8Array;
+    /**
      * Check if buffer is empty
      */
     isEmpty(): boolean;
@@ -271,6 +278,12 @@ export class Database {
      * Returns all table names.
      */
     tableNames(): Array<any>;
+    takeLastCommitProfile(): any;
+    takeLastDeltaFlushProfile(): any;
+    takeLastIvmBridgeProfile(): any;
+    takeLastSnapshotFlushProfile(): any;
+    takeLastSnapshotInitProfile(): any;
+    takeLastTraceInitProfile(): any;
     /**
      * Returns the total row count across all tables.
      */
@@ -389,6 +402,16 @@ export class JsChangesStream {
      * Returns an unsubscribe function.
      */
     subscribe(callback: Function): Function;
+    /**
+     * Subscribes to the changes stream using binary snapshots.
+     *
+     * The callback receives a `BinaryResult` for the full current result set.
+     * It is called immediately with the initial data, and again whenever data changes.
+     * Use `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+     *
+     * Returns an unsubscribe function.
+     */
+    subscribeBinary(callback: Function): Function;
 }
 
 /**
@@ -507,6 +530,17 @@ export class JsObservableQuery {
      * Returns an unsubscribe function.
      */
     subscribe(callback: Function): Function;
+    /**
+     * Subscribes to query changes using binary snapshots.
+     *
+     * The callback receives a `BinaryResult` for the complete current result set.
+     * This avoids per-update JS object materialization inside the WASM bridge.
+     * Call `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+     *
+     * It is called whenever data changes (not immediately - use getResultBinary for initial data).
+     * Returns an unsubscribe function.
+     */
+    subscribeBinary(callback: Function): Function;
     /**
      * Returns the number of active subscriptions.
      */
@@ -987,6 +1021,12 @@ export interface InitOutput {
     readonly database_table: (a: number, b: number, c: number) => number;
     readonly database_tableCount: (a: number) => number;
     readonly database_tableNames: (a: number) => number;
+    readonly database_takeLastCommitProfile: (a: number) => number;
+    readonly database_takeLastDeltaFlushProfile: (a: number) => number;
+    readonly database_takeLastIvmBridgeProfile: (a: number) => number;
+    readonly database_takeLastSnapshotFlushProfile: (a: number) => number;
+    readonly database_takeLastSnapshotInitProfile: (a: number) => number;
+    readonly database_takeLastTraceInitProfile: (a: number) => number;
     readonly database_totalRowCount: (a: number) => number;
     readonly database_transaction: (a: number) => number;
     readonly database_update: (a: number, b: number, c: number) => number;
@@ -1005,6 +1045,7 @@ export interface InitOutput {
     readonly jschangesstream_getResultBinary: (a: number) => number;
     readonly jschangesstream_getSchemaLayout: (a: number) => number;
     readonly jschangesstream_subscribe: (a: number, b: number) => number;
+    readonly jschangesstream_subscribeBinary: (a: number, b: number) => number;
     readonly jsgraphqlsubscription_getResult: (a: number) => number;
     readonly jsgraphqlsubscription_subscribe: (a: number, b: number) => number;
     readonly jsgraphqlsubscription_subscriptionCount: (a: number) => number;
@@ -1021,6 +1062,7 @@ export interface InitOutput {
     readonly jsobservablequery_isEmpty: (a: number) => number;
     readonly jsobservablequery_length: (a: number) => number;
     readonly jsobservablequery_subscribe: (a: number, b: number) => number;
+    readonly jsobservablequery_subscribeBinary: (a: number, b: number) => number;
     readonly jsobservablequery_subscriptionCount: (a: number) => number;
     readonly jsonbcolumn_contains: (a: number, b: number) => number;
     readonly jsonbcolumn_eq: (a: number, b: number) => number;
@@ -1088,6 +1130,7 @@ export interface InitOutput {
     readonly __wbg_schemalayout_free: (a: number, b: number) => void;
     readonly binaryresult_asView: (a: number) => number;
     readonly binaryresult_free: (a: number) => void;
+    readonly binaryresult_intoTransferable: (a: number) => number;
     readonly binaryresult_isEmpty: (a: number) => number;
     readonly binaryresult_len: (a: number) => number;
     readonly binaryresult_ptr: (a: number) => number;
@@ -1101,10 +1144,10 @@ export interface InitOutput {
     readonly schemalayout_nullMaskSize: (a: number) => number;
     readonly schemalayout_rowStride: (a: number) => number;
     readonly __wasm_bindgen_func_elem_84: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2524: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_6882: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_2531: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_1138: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_3444: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_8227: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_3451: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1527: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

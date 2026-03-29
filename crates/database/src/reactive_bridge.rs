@@ -13,19 +13,32 @@
 
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
 use crate::convert::{gql_response_to_js, value_to_js};
+use crate::live_runtime::{
+    RowsSnapshotDependencyGraph, RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey,
+    RowsSnapshotPartialRefreshMetadata, RowsSnapshotPartialRefreshState,
+    RowsSnapshotRootSubsetMetadata, RowsSnapshotRootSubsetPlan,
+};
+use crate::profiling::{
+    now_ms, IvmBridgeProfile, IvmBridgeProfiler, SnapshotQueryProfile, SnapshotRefreshMode,
+};
 use crate::query_engine::{
-    execute_compiled_physical_plan_with_summary, CompiledPhysicalPlan, QueryResultSummary,
+    execute_compiled_physical_plan_on_table_subset, execute_compiled_physical_plan_with_summary,
+    CompiledPhysicalPlan, QueryResultSummary, RootSubsetPlanVariant,
 };
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::cmp::Ordering;
 use cynos_core::schema::Table;
 use cynos_core::{Row, Value};
-use cynos_incremental::{DataflowNode, Delta, MaterializedView, TableId};
+use cynos_incremental::{
+    DataflowNode, Delta, MaterializedView, TableId, TraceDeltaBatch, TraceTupleArena,
+    TraceTupleHandle,
+};
 use cynos_reactive::ObservableQuery;
-use cynos_storage::TableCache;
+use cynos_storage::{RowStore, TableCache};
 use hashbrown::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
 
@@ -60,6 +73,453 @@ fn query_results_equal(
                 && old_row.version() == new_row.version()
                 && old_row.values() == new_row.values())
     })
+}
+
+fn encode_rc_rows_to_binary(rows: &[Rc<Row>], binary_layout: &SchemaLayout) -> BinaryResult {
+    encode_rc_rows_iter_to_binary(rows.iter(), rows.len(), binary_layout)
+}
+
+fn encode_rc_rows_iter_to_binary<'a, I>(
+    rows: I,
+    row_count: usize,
+    binary_layout: &SchemaLayout,
+) -> BinaryResult
+where
+    I: IntoIterator<Item = &'a Rc<Row>>,
+{
+    let mut encoder = BinaryEncoder::new(binary_layout.clone(), row_count);
+    encoder.encode_rows_iter(rows);
+    BinaryResult::new(encoder.finish())
+}
+
+fn binary_result_to_js_value(result: BinaryResult) -> JsValue {
+    result.into()
+}
+
+#[derive(Clone)]
+struct PartialRefreshCandidateRow {
+    row: Rc<Row>,
+    root_row_id: u64,
+}
+
+struct SnapshotPartialRefreshRuntime {
+    metadata: RowsSnapshotPartialRefreshMetadata,
+    candidate_rows: Vec<PartialRefreshCandidateRow>,
+}
+
+impl SnapshotPartialRefreshRuntime {
+    fn new(cache: &TableCache, state: RowsSnapshotPartialRefreshState) -> Self {
+        let candidate_rows = build_partial_refresh_candidate_rows(
+            cache,
+            &state.metadata,
+            &state.initial_candidate_rows,
+        )
+        .expect("partial refresh candidate rows should be resolvable");
+        Self {
+            metadata: state.metadata,
+            candidate_rows,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SnapshotRootKey {
+    Empty,
+    One(Value),
+    Many(Vec<Value>),
+}
+
+impl SnapshotRootKey {
+    fn from_values(mut values: Vec<Value>) -> Self {
+        match values.len() {
+            0 => Self::Empty,
+            1 => Self::One(values.pop().unwrap()),
+            _ => Self::Many(values),
+        }
+    }
+
+    fn from_output_row(row: &Row, indices: &[usize]) -> Option<Self> {
+        let mut values = Vec::with_capacity(indices.len());
+        for &index in indices {
+            values.push(row.get(index)?.clone());
+        }
+        Some(Self::from_values(values))
+    }
+
+    fn from_store_row(row: &Row, indices: &[usize]) -> Option<Self> {
+        let mut values = Vec::with_capacity(indices.len());
+        for &column_index in indices {
+            values.push(row.get(column_index)?.clone());
+        }
+        Some(Self::from_values(values))
+    }
+}
+
+struct RootSubsetRefreshRuntime {
+    compiled_plans: crate::live_runtime::RowsSnapshotRootSubsetVariants,
+    metadata: RowsSnapshotRootSubsetMetadata,
+    row_id_to_root_key: HashMap<u64, SnapshotRootKey>,
+    root_ordinals: HashMap<SnapshotRootKey, usize>,
+    next_root_ordinal: usize,
+    root_rows: HashMap<SnapshotRootKey, Vec<Rc<Row>>>,
+    visible_root_order: Vec<SnapshotRootKey>,
+}
+
+impl RootSubsetRefreshRuntime {
+    fn new(
+        cache: &TableCache,
+        plan: RowsSnapshotRootSubsetPlan,
+        initial_rows: &[Rc<Row>],
+    ) -> Option<Self> {
+        let RowsSnapshotRootSubsetPlan {
+            metadata,
+            compiled_plans,
+        } = plan;
+        let store = cache.get_table(&metadata.root_table)?;
+
+        let mut row_id_to_root_key = HashMap::new();
+        let mut root_ordinals = HashMap::new();
+        let mut next_root_ordinal = 0usize;
+        store.visit_rows(|row| {
+            if let Some(root_key) =
+                SnapshotRootKey::from_store_row(row, &metadata.root_pk_store_indices)
+            {
+                row_id_to_root_key.insert(row.id(), root_key.clone());
+                if !root_ordinals.contains_key(&root_key) {
+                    root_ordinals.insert(root_key, next_root_ordinal);
+                    next_root_ordinal += 1;
+                }
+            }
+            true
+        });
+
+        let mut root_rows = HashMap::new();
+        let mut visible_root_order = Vec::new();
+        let mut seen_roots = HashSet::new();
+        let mut last_root_key: Option<SnapshotRootKey> = None;
+
+        for row in initial_rows {
+            let root_key =
+                SnapshotRootKey::from_output_row(row.as_ref(), &metadata.root_pk_output_indices)?;
+            if last_root_key.as_ref() != Some(&root_key) && seen_roots.contains(&root_key) {
+                return None;
+            }
+            if seen_roots.insert(root_key.clone()) {
+                visible_root_order.push(root_key.clone());
+            }
+            root_rows
+                .entry(root_key.clone())
+                .or_insert_with(Vec::new)
+                .push(row.clone());
+            last_root_key = Some(root_key);
+        }
+
+        Some(Self {
+            compiled_plans,
+            metadata,
+            row_id_to_root_key,
+            root_ordinals,
+            next_root_ordinal,
+            root_rows,
+            visible_root_order,
+        })
+    }
+
+    fn select_variant(&self, cache: &TableCache, affected_root_ids: &HashSet<u64>) -> RootSubsetPlanVariant {
+        let table_row_count = cache
+            .get_table(&self.metadata.root_table)
+            .map(|store| store.len())
+            .unwrap_or(0);
+        if affected_root_ids.len() <= 8192
+            || affected_root_ids.len().saturating_mul(4) <= table_row_count
+        {
+            RootSubsetPlanVariant::Small
+        } else {
+            RootSubsetPlanVariant::Large
+        }
+    }
+
+    fn select_compiled_plan<'a>(
+        &'a self,
+        cache: &TableCache,
+        affected_root_ids: &HashSet<u64>,
+    ) -> &'a CompiledPhysicalPlan {
+        self.compiled_plans
+            .select(self.select_variant(cache, affected_root_ids))
+    }
+
+    fn collect_affected_root_keys(
+        &mut self,
+        cache: &TableCache,
+        affected_root_ids: &HashSet<u64>,
+        refresh_existing: bool,
+    ) -> Option<HashSet<SnapshotRootKey>> {
+        let store = cache.get_table(&self.metadata.root_table)?;
+        let mut affected_keys = HashSet::new();
+
+        for &row_id in affected_root_ids {
+            if let Some(existing) = self.row_id_to_root_key.get(&row_id).cloned() {
+                affected_keys.insert(existing);
+                if !refresh_existing {
+                    continue;
+                }
+            }
+
+            if let Some(row) = store.get(row_id) {
+                let root_key = SnapshotRootKey::from_store_row(
+                    row.as_ref(),
+                    &self.metadata.root_pk_store_indices,
+                )?;
+                affected_keys.insert(root_key.clone());
+                if !self.root_ordinals.contains_key(&root_key) {
+                    self.root_ordinals
+                        .insert(root_key.clone(), self.next_root_ordinal);
+                    self.next_root_ordinal += 1;
+                }
+                self.row_id_to_root_key.insert(row_id, root_key);
+            } else {
+                self.row_id_to_root_key.remove(&row_id);
+            }
+        }
+
+        Some(affected_keys)
+    }
+
+    fn apply_subset_rows(
+        &mut self,
+        affected_root_keys: &HashSet<SnapshotRootKey>,
+        rows: Vec<Rc<Row>>,
+    ) -> Option<Vec<Rc<Row>>> {
+        let mut recomputed_groups: HashMap<SnapshotRootKey, Vec<Rc<Row>>> = HashMap::new();
+        for row in rows {
+            let root_key = SnapshotRootKey::from_output_row(
+                row.as_ref(),
+                &self.metadata.root_pk_output_indices,
+            )?;
+            recomputed_groups
+                .entry(root_key)
+                .or_insert_with(Vec::new)
+                .push(row);
+        }
+
+        let mut next_visible_root_order = Vec::with_capacity(
+            self.visible_root_order
+                .len()
+                .saturating_add(recomputed_groups.len()),
+        );
+        for root_key in affected_root_keys {
+            if !recomputed_groups.contains_key(root_key) {
+                self.root_rows.remove(root_key);
+            }
+        }
+
+        for root_key in self.visible_root_order.drain(..) {
+            if affected_root_keys.contains(&root_key) {
+                if let Some(group) = recomputed_groups.remove(&root_key) {
+                    self.root_rows.insert(root_key.clone(), group);
+                    next_visible_root_order.push(root_key);
+                }
+                continue;
+            }
+
+            next_visible_root_order.push(root_key);
+        }
+
+        let mut new_root_keys: Vec<SnapshotRootKey> = recomputed_groups.keys().cloned().collect();
+        new_root_keys.sort_by_key(|root_key| {
+            self.root_ordinals
+                .get(root_key)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+
+        for root_key in new_root_keys {
+            let group = recomputed_groups.remove(&root_key).unwrap_or_default();
+            self.root_rows.insert(root_key.clone(), group);
+            let ordinal = self
+                .root_ordinals
+                .get(&root_key)
+                .copied()
+                .unwrap_or(usize::MAX);
+            let insert_at = next_visible_root_order
+                .iter()
+                .position(|candidate| {
+                    self.root_ordinals
+                        .get(candidate)
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                        > ordinal
+                })
+                .unwrap_or(next_visible_root_order.len());
+            next_visible_root_order.insert(insert_at, root_key);
+        }
+
+        self.visible_root_order = next_visible_root_order;
+
+        let total_rows = self
+            .visible_root_order
+            .iter()
+            .filter_map(|root_key| self.root_rows.get(root_key).map(Vec::len))
+            .sum();
+        let mut result = Vec::with_capacity(total_rows);
+        for root_key in &self.visible_root_order {
+            if let Some(group) = self.root_rows.get(root_key) {
+                result.extend(group.iter().cloned());
+            }
+        }
+        Some(result)
+    }
+}
+
+fn slice_partial_visible_rows(
+    candidate_rows: &[PartialRefreshCandidateRow],
+    metadata: &RowsSnapshotPartialRefreshMetadata,
+) -> Vec<Rc<Row>> {
+    candidate_rows
+        .iter()
+        .skip(metadata.visible_offset)
+        .take(metadata.visible_limit)
+        .map(|entry| entry.row.clone())
+        .collect()
+}
+
+fn compare_partial_refresh_values(
+    left: Option<&Value>,
+    right: Option<&Value>,
+    order: cynos_query::ast::SortOrder,
+) -> Ordering {
+    let cmp = match (left, right) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
+
+    match order {
+        cynos_query::ast::SortOrder::Asc => cmp,
+        cynos_query::ast::SortOrder::Desc => cmp.reverse(),
+    }
+}
+
+fn compare_partial_refresh_rows(
+    left: &PartialRefreshCandidateRow,
+    right: &PartialRefreshCandidateRow,
+    order_keys: &[RowsSnapshotOrderKey],
+) -> Ordering {
+    for order_key in order_keys {
+        let cmp = compare_partial_refresh_values(
+            left.row.get(order_key.output_index),
+            right.row.get(order_key.output_index),
+            order_key.order,
+        );
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+
+    left.root_row_id
+        .cmp(&right.root_row_id)
+        .then_with(|| left.row.values().cmp(right.row.values()))
+        .then_with(|| left.row.version().cmp(&right.row.version()))
+}
+
+fn insert_row_ids_by_column_values(
+    store: &RowStore,
+    column_index: usize,
+    lookup: &RowsSnapshotLookupPrimitive,
+    values: &HashSet<Value>,
+    row_ids: &mut HashSet<u64>,
+) -> bool {
+    if values.is_empty() {
+        return false;
+    }
+
+    let mut added = false;
+    match lookup {
+        RowsSnapshotLookupPrimitive::PrimaryKey => {
+            for value in values {
+                store.visit_row_ids_by_pk_values(core::slice::from_ref(value), |row_id| {
+                    added |= row_ids.insert(row_id);
+                    true
+                });
+            }
+        }
+        RowsSnapshotLookupPrimitive::SingleColumnIndex { index_name } => {
+            for value in values {
+                store.visit_index_row_ids_by_value(index_name, value, |row_id| {
+                    added |= row_ids.insert(row_id);
+                    true
+                });
+            }
+        }
+        RowsSnapshotLookupPrimitive::ScanFallback => {
+            store.visit_rows(|row| {
+                if row
+                    .get(column_index)
+                    .map(|candidate| values.iter().any(|value| candidate.sql_eq(value)))
+                    .unwrap_or(false)
+                {
+                    added |= row_ids.insert(row.id());
+                }
+                true
+            });
+        }
+    }
+
+    added
+}
+
+fn collect_join_values_by_row_ids(
+    store: &RowStore,
+    row_ids: &[u64],
+    column_index: usize,
+    join_values: &mut HashSet<Value>,
+) {
+    join_values.clear();
+    store.visit_rows_by_ids(row_ids, |row| {
+        if let Some(value) = row.get(column_index) {
+            if !value.is_null() {
+                join_values.insert(value.clone());
+            }
+        }
+        true
+    });
+}
+
+fn resolve_root_row_id_for_output_row(
+    cache: &TableCache,
+    metadata: &RowsSnapshotPartialRefreshMetadata,
+    row: &Rc<Row>,
+) -> Option<u64> {
+    let store = cache.get_table(&metadata.root_table)?;
+    let pk_values: Vec<Value> = metadata
+        .root_pk_output_indices
+        .iter()
+        .map(|&output_index| row.get(output_index).cloned())
+        .collect::<Option<Vec<_>>>()?;
+    if pk_values.iter().any(Value::is_null) {
+        return None;
+    }
+
+    store
+        .get_by_pk_values(&pk_values)
+        .first()
+        .map(|root_row| root_row.id())
+}
+
+fn build_partial_refresh_candidate_rows(
+    cache: &TableCache,
+    metadata: &RowsSnapshotPartialRefreshMetadata,
+    rows: &[Rc<Row>],
+) -> Option<Vec<PartialRefreshCandidateRow>> {
+    let mut candidate_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        candidate_rows.push(PartialRefreshCandidateRow {
+            row: row.clone(),
+            root_row_id: resolve_root_row_id_for_output_row(cache, metadata, row)?,
+        });
+    }
+    Some(candidate_rows)
 }
 
 #[derive(Default)]
@@ -266,10 +726,16 @@ pub struct ReQueryObservable {
     compiled_plan: CompiledPhysicalPlan,
     /// Reference to the table cache
     cache: Rc<RefCell<TableCache>>,
+    /// Table ID -> table name bindings for dependency-aware invalidation.
+    dependency_table_names: HashMap<TableId, String>,
     /// Current result set
     result: Vec<Rc<Row>>,
     /// Summary of the current result set for fast equality checks
     result_summary: QueryResultSummary,
+    /// Optional runtime state for candidate-window partial requery.
+    partial_refresh: Option<SnapshotPartialRefreshRuntime>,
+    /// Optional runtime state for root-subset requery on no-blocking snapshot queries.
+    root_subset_refresh: Option<RootSubsetRefreshRuntime>,
     /// Subscription callbacks
     subscriptions: Vec<(usize, Box<dyn Fn(&[Rc<Row>]) + 'static>)>,
     /// Next subscription ID
@@ -282,23 +748,47 @@ impl ReQueryObservable {
         compiled_plan: CompiledPhysicalPlan,
         cache: Rc<RefCell<TableCache>>,
         initial_result: Vec<Rc<Row>>,
+        dependency_table_bindings: Vec<(TableId, String)>,
     ) -> Self {
         let result_summary = QueryResultSummary::from_rows(&initial_result);
-        Self::new_with_summary(compiled_plan, cache, initial_result, result_summary)
+        Self::new_with_summary(
+            compiled_plan,
+            cache,
+            initial_result,
+            result_summary,
+            dependency_table_bindings,
+            None,
+            None,
+        )
     }
 
     #[doc(hidden)]
-    pub fn new_with_summary(
+    pub(crate) fn new_with_summary(
         compiled_plan: CompiledPhysicalPlan,
         cache: Rc<RefCell<TableCache>>,
         initial_result: Vec<Rc<Row>>,
         result_summary: QueryResultSummary,
+        dependency_table_bindings: Vec<(TableId, String)>,
+        partial_refresh: Option<RowsSnapshotPartialRefreshState>,
+        root_subset_refresh: Option<RowsSnapshotRootSubsetPlan>,
     ) -> Self {
+        let (partial_refresh, root_subset_refresh) = {
+            let cache_ref = cache.borrow();
+            let partial_refresh =
+                partial_refresh.map(|state| SnapshotPartialRefreshRuntime::new(&cache_ref, state));
+            let root_subset_refresh = root_subset_refresh.and_then(|metadata| {
+                RootSubsetRefreshRuntime::new(&cache_ref, metadata, &initial_result)
+            });
+            (partial_refresh, root_subset_refresh)
+        };
         Self {
             compiled_plan,
             cache,
+            dependency_table_names: dependency_table_bindings.into_iter().collect(),
             result: initial_result,
             result_summary,
+            partial_refresh,
+            root_subset_refresh,
             subscriptions: Vec::new(),
             next_sub_id: 0,
         }
@@ -343,58 +833,418 @@ impl ReQueryObservable {
     /// Only notifies subscribers if the result actually changed.
     /// Skips re-query entirely if there are no subscribers.
     ///
-    /// `changed_ids` contains the row IDs that were modified.
-    /// For simple single-table pipelines this enables a row-local fast path;
-    /// all other plans fall back to deterministic full-result comparison.
-    pub fn on_change(&mut self, changed_ids: &HashSet<u64>) {
+    /// `changes` contains row IDs grouped by the table that changed.
+    /// For simple single-table pipelines this enables a row-local fast path
+    /// only when the underlying patch table changed; all other plans fall back
+    /// to deterministic full-result comparison.
+    pub fn on_change(&mut self, changes: &HashMap<TableId, HashSet<u64>>) {
+        let _ = self.on_change_profiled(changes);
+    }
+
+    pub(crate) fn on_change_profiled(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+    ) -> SnapshotQueryProfile {
+        let started_at = now_ms();
+        let mut profile = SnapshotQueryProfile::default();
+
         // Skip re-query if no subscribers - major optimization for unused observables
         if self.subscriptions.is_empty() {
-            return;
+            return profile;
         }
 
-        if let Some(changed_rows) =
-            collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
-        {
-            match self
-                .compiled_plan
-                .apply_reactive_patch(&mut self.result, &changed_rows)
+        if let Some(changed_ids) = self.patch_table_changed_ids(changes) {
+            if let Some(changed_rows) =
+                collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
             {
-                Some(true) => {
-                    self.result_summary = QueryResultSummary::from_rows(&self.result);
-                    for (_, callback) in &self.subscriptions {
-                        callback(&self.result);
+                profile.reactive_patch_attempted = true;
+                let patch_started_at = now_ms();
+                match self
+                    .compiled_plan
+                    .apply_reactive_patch(&mut self.result, &changed_rows)
+                {
+                    Some(true) => {
+                        profile.reactive_patch_hit = true;
+                        profile.reactive_patch_ms = now_ms() - patch_started_at;
+                        self.result_summary = QueryResultSummary::from_rows(&self.result);
+                        let callback_started_at = now_ms();
+                        for (_, callback) in &self.subscriptions {
+                            callback(&self.result);
+                        }
+                        profile.callback_ms += now_ms() - callback_started_at;
+                        profile.total_ms = now_ms() - started_at;
+                        return profile;
                     }
-                    return;
+                    Some(false) => {
+                        profile.reactive_patch_ms = now_ms() - patch_started_at;
+                        profile.total_ms = now_ms() - started_at;
+                        return profile;
+                    }
+                    None => {}
                 }
-                Some(false) => return,
-                None => {}
+                profile.reactive_patch_ms = now_ms() - patch_started_at;
             }
         }
 
-        // Re-execute the cached compiled plan (no optimization or lowering overhead)
-        let cache = self.cache.borrow();
+        if let Some(changed) = self.try_partial_refresh_profiled(changes, &mut profile) {
+            if changed {
+                let callback_started_at = now_ms();
+                for (_, callback) in &self.subscriptions {
+                    callback(&self.result);
+                }
+                profile.callback_ms += now_ms() - callback_started_at;
+            }
+            profile.total_ms = now_ms() - started_at;
+            return profile;
+        }
 
-        match execute_compiled_physical_plan_with_summary(&cache, &self.compiled_plan) {
+        if let Some(changed) = self.try_root_subset_refresh_profiled(changes, &mut profile) {
+            if changed {
+                let callback_started_at = now_ms();
+                for (_, callback) in &self.subscriptions {
+                    callback(&self.result);
+                }
+                profile.callback_ms += now_ms() - callback_started_at;
+            }
+            profile.total_ms = now_ms() - started_at;
+            return profile;
+        }
+
+        // Re-execute the cached compiled plan (no optimization or lowering overhead)
+        profile.refresh_mode = SnapshotRefreshMode::FullRequery;
+        let full_requery_started_at = now_ms();
+        let output = {
+            let cache = self.cache.borrow();
+            execute_compiled_physical_plan_with_summary(&cache, &self.compiled_plan)
+        };
+        profile.full_requery_ms = now_ms() - full_requery_started_at;
+
+        match output {
             Ok(output) => {
-                // Only notify if result changed
-                if !query_results_equal(
-                    &self.result_summary,
-                    &output.summary,
-                    &self.result,
-                    &output.rows,
+                if self.apply_full_requery_output_profiled(
+                    output.rows,
+                    output.summary,
+                    &mut profile.full_requery_compare_ms,
                 ) {
-                    self.result = output.rows;
-                    self.result_summary = output.summary;
                     // Notify all subscribers
+                    let callback_started_at = now_ms();
                     for (_, callback) in &self.subscriptions {
                         callback(&self.result);
                     }
+                    profile.callback_ms += now_ms() - callback_started_at;
                 }
             }
             Err(_) => {
                 // Query execution failed, keep old result
             }
         }
+
+        profile.total_ms = now_ms() - started_at;
+        profile
+    }
+
+    fn patch_table_changed_ids<'a>(
+        &self,
+        changes: &'a HashMap<TableId, HashSet<u64>>,
+    ) -> Option<&'a HashSet<u64>> {
+        let patch_table = self.compiled_plan.reactive_patch_table()?;
+        if changes.len() != 1 {
+            return None;
+        }
+
+        let (&table_id, changed_ids) = changes.iter().next()?;
+        let table_name = self.dependency_table_names.get(&table_id)?;
+        if table_name == patch_table {
+            Some(changed_ids)
+        } else {
+            None
+        }
+    }
+
+    fn apply_full_requery_output_profiled(
+        &mut self,
+        rows: Vec<Rc<Row>>,
+        summary: QueryResultSummary,
+        compare_ms: &mut f64,
+    ) -> bool {
+        if let Some(metadata) = self
+            .partial_refresh
+            .as_ref()
+            .map(|partial_refresh| partial_refresh.metadata.clone())
+        {
+            let candidate_rows = {
+                let cache = self.cache.borrow();
+                build_partial_refresh_candidate_rows(&cache, &metadata, &rows)
+            };
+            let Some(candidate_rows) = candidate_rows else {
+                return false;
+            };
+            let visible_rows = slice_partial_visible_rows(&candidate_rows, &metadata);
+            let visible_summary = QueryResultSummary::from_rows(&visible_rows);
+            let compare_started_at = now_ms();
+            let changed = !query_results_equal(
+                &self.result_summary,
+                &visible_summary,
+                &self.result,
+                &visible_rows,
+            );
+            *compare_ms += now_ms() - compare_started_at;
+
+            if let Some(partial_refresh) = &mut self.partial_refresh {
+                partial_refresh.candidate_rows = candidate_rows;
+            }
+            self.result = visible_rows;
+            self.result_summary = visible_summary;
+            return changed;
+        }
+
+        let compare_started_at = now_ms();
+        if query_results_equal(&self.result_summary, &summary, &self.result, &rows) {
+            *compare_ms += now_ms() - compare_started_at;
+            return false;
+        }
+        *compare_ms += now_ms() - compare_started_at;
+
+        self.result = rows;
+        self.result_summary = summary;
+        true
+    }
+
+    fn try_partial_refresh_profiled(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        profile: &mut SnapshotQueryProfile,
+    ) -> Option<bool> {
+        profile.partial_refresh_attempted = self.partial_refresh.is_some();
+        let collect_started_at = now_ms();
+        let (affected_root_ids, affected_candidate_rows, partial_metadata, current_candidate_rows) = {
+            let partial_refresh = self.partial_refresh.as_ref()?;
+            let affected_root_ids = Self::collect_affected_root_row_ids(
+                &self.cache,
+                changes,
+                &partial_refresh.metadata.dependency_graph,
+            )?;
+            if affected_root_ids.is_empty() {
+                return Some(false);
+            }
+
+            let affected_candidate_rows = partial_refresh
+                .candidate_rows
+                .iter()
+                .filter(|entry| affected_root_ids.contains(&entry.root_row_id))
+                .count();
+            (
+                affected_root_ids,
+                affected_candidate_rows,
+                partial_refresh.metadata.clone(),
+                partial_refresh.candidate_rows.clone(),
+            )
+        };
+        profile.partial_refresh_collect_ms += now_ms() - collect_started_at;
+        if affected_candidate_rows > partial_metadata.overscan {
+            return None;
+        }
+
+        let requery_started_at = now_ms();
+        let recomputed_rows = {
+            let cache = self.cache.borrow();
+            let rows = execute_compiled_physical_plan_on_table_subset(
+                &cache,
+                &self.compiled_plan,
+                &partial_metadata.root_table,
+                &affected_root_ids,
+            )
+            .ok()?;
+            build_partial_refresh_candidate_rows(&cache, &partial_metadata, &rows)?
+        };
+        profile.partial_refresh_requery_ms += now_ms() - requery_started_at;
+
+        let apply_started_at = now_ms();
+        let unaffected = current_candidate_rows
+            .iter()
+            .filter(|entry| !affected_root_ids.contains(&entry.root_row_id))
+            .cloned();
+        let mut merged_rows: Vec<PartialRefreshCandidateRow> =
+            unaffected.chain(recomputed_rows.into_iter()).collect();
+        merged_rows.sort_by(|left, right| {
+            compare_partial_refresh_rows(left, right, &partial_metadata.order_keys)
+        });
+        merged_rows.truncate(partial_metadata.candidate_limit);
+        let min_shadow_window = partial_metadata
+            .visible_offset
+            .saturating_add(partial_metadata.visible_limit)
+            .saturating_add(partial_metadata.overscan);
+        if merged_rows.len() < min_shadow_window
+            && current_candidate_rows.len() >= min_shadow_window
+        {
+            return None;
+        }
+
+        let visible_rows = slice_partial_visible_rows(&merged_rows, &partial_metadata);
+        let visible_summary = QueryResultSummary::from_rows(&visible_rows);
+        let compare_started_at = now_ms();
+        let changed = !query_results_equal(
+            &self.result_summary,
+            &visible_summary,
+            &self.result,
+            &visible_rows,
+        );
+        profile.partial_refresh_compare_ms += now_ms() - compare_started_at;
+
+        if let Some(partial_refresh) = &mut self.partial_refresh {
+            partial_refresh.candidate_rows = merged_rows;
+        }
+        self.result = visible_rows;
+        self.result_summary = visible_summary;
+        profile.partial_refresh_hit = true;
+        profile.refresh_mode = SnapshotRefreshMode::CandidateWindowPartialRefresh;
+        profile.partial_refresh_apply_ms += now_ms() - apply_started_at;
+        Some(changed)
+    }
+
+    fn try_root_subset_refresh_profiled(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        profile: &mut SnapshotQueryProfile,
+    ) -> Option<bool> {
+        profile.root_subset_attempted = self.root_subset_refresh.is_some();
+        let collect_started_at = now_ms();
+        let (affected_root_ids, affected_root_keys) = {
+            let root_subset_refresh = self.root_subset_refresh.as_mut()?;
+            let affected_root_ids = Self::collect_affected_root_row_ids(
+                &self.cache,
+                changes,
+                &root_subset_refresh.metadata.dependency_graph,
+            )?;
+            if affected_root_ids.is_empty() {
+                return Some(false);
+            }
+
+            let cache = self.cache.borrow();
+            let refresh_existing_root_keys =
+                changes.contains_key(&root_subset_refresh.metadata.dependency_graph.root_table_id);
+            let affected_root_keys = root_subset_refresh.collect_affected_root_keys(
+                &cache,
+                &affected_root_ids,
+                refresh_existing_root_keys,
+            )?;
+            (affected_root_ids, affected_root_keys)
+        };
+        profile.root_subset_collect_ms += now_ms() - collect_started_at;
+
+        if affected_root_keys.is_empty() {
+            return Some(false);
+        }
+
+        let root_table = self
+            .root_subset_refresh
+            .as_ref()
+            .map(|runtime| runtime.metadata.root_table.clone())?;
+        let requery_started_at = now_ms();
+        let rows = {
+            let cache = self.cache.borrow();
+            let subset_plan = self
+                .root_subset_refresh
+                .as_ref()
+                .map(|runtime| runtime.select_compiled_plan(&cache, &affected_root_ids))?;
+            execute_compiled_physical_plan_on_table_subset(
+                &cache,
+                subset_plan,
+                &root_table,
+                &affected_root_ids,
+            )
+            .ok()?
+        };
+        profile.root_subset_requery_ms += now_ms() - requery_started_at;
+
+        let apply_started_at = now_ms();
+        let rows = {
+            let root_subset_refresh = self.root_subset_refresh.as_mut()?;
+            root_subset_refresh.apply_subset_rows(&affected_root_keys, rows)?
+        };
+        let summary = QueryResultSummary::from_rows(&rows);
+        let compare_started_at = now_ms();
+        let changed = !query_results_equal(&self.result_summary, &summary, &self.result, &rows);
+        profile.root_subset_compare_ms += now_ms() - compare_started_at;
+        self.result = rows;
+        self.result_summary = summary;
+        profile.root_subset_apply_ms += now_ms() - apply_started_at;
+        profile.root_subset_hit = true;
+        profile.refresh_mode = SnapshotRefreshMode::RootSubsetRefresh;
+        Some(changed)
+    }
+
+    fn collect_affected_root_row_ids(
+        cache_ref: &Rc<RefCell<TableCache>>,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        dependency_graph: &RowsSnapshotDependencyGraph,
+    ) -> Option<HashSet<u64>> {
+        let cache = cache_ref.borrow();
+        let mut dirty_rows_by_table: HashMap<TableId, HashSet<u64>> = HashMap::new();
+        for (table_id, row_ids) in changes {
+            dirty_rows_by_table
+                .entry(*table_id)
+                .or_insert_with(HashSet::new)
+                .extend(row_ids.iter().copied());
+        }
+
+        let mut queue: Vec<TableId> = dirty_rows_by_table.keys().copied().collect();
+        let mut queued_tables: HashSet<TableId> = queue.iter().copied().collect();
+        let mut dirty_row_ids = Vec::new();
+        let mut join_values = HashSet::new();
+
+        while let Some(table_id) = queue.pop() {
+            queued_tables.remove(&table_id);
+            let dirty_row_set = dirty_rows_by_table.get(&table_id)?;
+            if dirty_row_set.is_empty() {
+                continue;
+            }
+
+            dirty_row_ids.clear();
+            dirty_row_ids.extend(dirty_row_set.iter().copied());
+
+            let table_name = dependency_graph.table_name(table_id)?;
+            let store = cache.get_table(table_name)?;
+            if table_id != dependency_graph.root_table_id
+                && store.count_existing_rows_by_ids(&dirty_row_ids) != dirty_row_ids.len()
+            {
+                return None;
+            }
+
+            for edge in dependency_graph.edges_from(table_id) {
+                collect_join_values_by_row_ids(
+                    store,
+                    &dirty_row_ids,
+                    edge.source_column_index,
+                    &mut join_values,
+                );
+                if join_values.is_empty() {
+                    continue;
+                }
+
+                let target_store = cache.get_table(&edge.target_table)?;
+                let target_entry = dirty_rows_by_table
+                    .entry(edge.target_table_id)
+                    .or_insert_with(HashSet::new);
+                let added = insert_row_ids_by_column_values(
+                    target_store,
+                    edge.target_column_index,
+                    &edge.lookup,
+                    &join_values,
+                    target_entry,
+                );
+                if added && !queued_tables.contains(&edge.target_table_id) {
+                    queued_tables.insert(edge.target_table_id);
+                    queue.push(edge.target_table_id);
+                }
+            }
+        }
+
+        Some(
+            dirty_rows_by_table
+                .remove(&dependency_graph.root_table_id)
+                .unwrap_or_default(),
+        )
     }
 }
 
@@ -665,6 +1515,109 @@ impl GraphqlDeltaObservable {
     ) -> Self {
         Self {
             view: MaterializedView::with_initial(dataflow, initial_rows),
+            cache,
+            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
+                .ok()
+                .filter(|plan| plan.has_relations()),
+            batch_state: cynos_gql::GraphqlBatchState::default(),
+            dependency_table_names: dependency_table_bindings.into_iter().collect(),
+            catalog,
+            has_nested_relations: root_field_has_relations(&field),
+            field,
+            response: None,
+            response_js: None,
+            response_dirty: true,
+            subscribers: GraphqlSubscribers::default(),
+        }
+    }
+
+    pub fn new_with_sources(
+        dataflow: DataflowNode,
+        cache: Rc<RefCell<TableCache>>,
+        catalog: cynos_gql::GraphqlCatalog,
+        field: cynos_gql::bind::BoundRootField,
+        dependency_table_bindings: Vec<(TableId, String)>,
+        initial_rows: Vec<Row>,
+        source_rows: &HashMap<TableId, Vec<Row>>,
+    ) -> Self {
+        Self {
+            view: MaterializedView::with_sources(dataflow, initial_rows, source_rows),
+            cache,
+            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
+                .ok()
+                .filter(|plan| plan.has_relations()),
+            batch_state: cynos_gql::GraphqlBatchState::default(),
+            dependency_table_names: dependency_table_bindings.into_iter().collect(),
+            catalog,
+            has_nested_relations: root_field_has_relations(&field),
+            field,
+            response: None,
+            response_js: None,
+            response_dirty: true,
+            subscribers: GraphqlSubscribers::default(),
+        }
+    }
+
+    pub fn new_with_compiled_loader<F>(
+        dataflow: DataflowNode,
+        compiled_ivm_plan: cynos_incremental::CompiledIvmPlan,
+        compiled_bootstrap_plan: cynos_incremental::CompiledBootstrapPlan,
+        cache: Rc<RefCell<TableCache>>,
+        catalog: cynos_gql::GraphqlCatalog,
+        field: cynos_gql::bind::BoundRootField,
+        dependency_table_bindings: Vec<(TableId, String)>,
+        initial_rows: Vec<Rc<Row>>,
+        load_source_rows: F,
+    ) -> Self
+    where
+        F: FnMut(TableId) -> Vec<Rc<Row>>,
+    {
+        Self {
+            view: MaterializedView::with_compiled_loader_and_bootstrap(
+                dataflow,
+                compiled_ivm_plan,
+                compiled_bootstrap_plan,
+                initial_rows,
+                load_source_rows,
+            ),
+            cache,
+            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
+                .ok()
+                .filter(|plan| plan.has_relations()),
+            batch_state: cynos_gql::GraphqlBatchState::default(),
+            dependency_table_names: dependency_table_bindings.into_iter().collect(),
+            catalog,
+            has_nested_relations: root_field_has_relations(&field),
+            field,
+            response: None,
+            response_js: None,
+            response_dirty: true,
+            subscribers: GraphqlSubscribers::default(),
+        }
+    }
+
+    pub fn new_with_compiled_source_visitor<F>(
+        dataflow: DataflowNode,
+        compiled_ivm_plan: cynos_incremental::CompiledIvmPlan,
+        compiled_bootstrap_plan: cynos_incremental::CompiledBootstrapPlan,
+        cache: Rc<RefCell<TableCache>>,
+        catalog: cynos_gql::GraphqlCatalog,
+        field: cynos_gql::bind::BoundRootField,
+        dependency_table_bindings: Vec<(TableId, String)>,
+        initial_rows: Vec<Rc<Row>>,
+        visit_source_rows: F,
+    ) -> Self
+    where
+        F: FnMut(TableId, &mut dyn FnMut(Rc<Row>)),
+    {
+        Self {
+            view: MaterializedView::with_compiled_source_visitor_and_bootstrap(
+                dataflow,
+                compiled_ivm_plan,
+                compiled_bootstrap_plan,
+                initial_rows,
+                visit_source_rows,
+            ),
             cache,
             batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
                 .ok()
@@ -961,19 +1914,53 @@ impl JsObservableQuery {
         let schema = self.schema.clone();
         let projected_columns = self.projected_columns.clone();
         let aggregate_columns = self.aggregate_columns.clone();
+        let materializer = if let Some(ref cols) = aggregate_columns {
+            JsSnapshotRowsMaterializer::projected(cols.clone())
+        } else if let Some(ref cols) = projected_columns {
+            JsSnapshotRowsMaterializer::projected(cols.clone())
+        } else {
+            JsSnapshotRowsMaterializer::full(schema.clone())
+        };
+        let materialization_cache = Rc::new(RefCell::new(JsSnapshotRowsCache::default()));
 
         let sub_id = self.inner.borrow_mut().subscribe(move |rows| {
-            let current_data = if let Some(ref cols) = aggregate_columns {
-                projected_rows_to_js_array(rows, cols)
-            } else if let Some(ref cols) = projected_columns {
-                projected_rows_to_js_array(rows, cols)
-            } else {
-                rows_to_js_array(rows, &schema)
-            };
+            let current_data =
+                materializer.materialize(rows, &mut materialization_cache.borrow_mut());
             callback.call1(&JsValue::NULL, &current_data).ok();
         });
 
         // Create unsubscribe function
+        let inner_unsub = self.inner.clone();
+        let called = Rc::new(RefCell::new(false));
+        let called_c = called.clone();
+        let unsubscribe = Closure::wrap(Box::new(move || {
+            let mut c = called_c.borrow_mut();
+            if !*c {
+                *c = true;
+                inner_unsub.borrow_mut().unsubscribe(sub_id);
+            }
+        }) as Box<dyn FnMut()>);
+        unsubscribe.into_js_value().unchecked_into()
+    }
+
+    /// Subscribes to query changes using binary snapshots.
+    ///
+    /// The callback receives a `BinaryResult` for the complete current result set.
+    /// This avoids per-update JS object materialization inside the WASM bridge.
+    /// Call `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+    ///
+    /// It is called whenever data changes (not immediately - use getResultBinary for initial data).
+    /// Returns an unsubscribe function.
+    #[wasm_bindgen(js_name = subscribeBinary)]
+    pub fn subscribe_binary(&mut self, callback: js_sys::Function) -> js_sys::Function {
+        let binary_layout = self.binary_layout.clone();
+
+        let sub_id = self.inner.borrow_mut().subscribe(move |rows| {
+            let current_data =
+                binary_result_to_js_value(encode_rc_rows_to_binary(rows, &binary_layout));
+            callback.call1(&JsValue::NULL, &current_data).ok();
+        });
+
         let inner_unsub = self.inner.clone();
         let called = Rc::new(RefCell::new(false));
         let called_c = called.clone();
@@ -1004,10 +1991,7 @@ impl JsObservableQuery {
     #[wasm_bindgen(js_name = getResultBinary)]
     pub fn get_result_binary(&self) -> BinaryResult {
         let inner = self.inner.borrow();
-        let rows = inner.result();
-        let mut encoder = BinaryEncoder::new(self.binary_layout.clone(), rows.len());
-        encoder.encode_rows(rows);
-        BinaryResult::new(encoder.finish())
+        encode_rc_rows_to_binary(inner.result(), &self.binary_layout)
     }
 
     /// Returns the schema layout for decoding binary results.
@@ -1040,13 +2024,14 @@ impl JsObservableQuery {
 #[wasm_bindgen]
 pub struct JsIvmObservableQuery {
     inner: Rc<RefCell<ObservableQuery>>,
-    schema: Table,
-    /// Optional projected column names.
-    projected_columns: Option<Vec<String>>,
     /// Pre-computed binary layout for getResultBinary().
     binary_layout: SchemaLayout,
-    /// Optional aggregate column names.
-    aggregate_columns: Option<Vec<String>>,
+    /// Pre-built row materializer with cached property keys.
+    materializer: JsSnapshotRowsMaterializer,
+    /// Snapshot cache reused across getResult() calls.
+    materialization_cache: Rc<RefCell<JsSnapshotRowsCache>>,
+    /// Shared sink for per-flush bridge profiling.
+    bridge_profiler: Rc<RefCell<IvmBridgeProfiler>>,
 }
 
 impl JsIvmObservableQuery {
@@ -1054,28 +2039,32 @@ impl JsIvmObservableQuery {
         inner: Rc<RefCell<ObservableQuery>>,
         schema: Table,
         binary_layout: SchemaLayout,
+        bridge_profiler: Rc<RefCell<IvmBridgeProfiler>>,
     ) -> Self {
+        let materializer = JsSnapshotRowsMaterializer::full(schema.clone());
         Self {
             inner,
-            schema,
-            projected_columns: None,
             binary_layout,
-            aggregate_columns: None,
+            materializer,
+            materialization_cache: Rc::new(RefCell::new(JsSnapshotRowsCache::default())),
+            bridge_profiler,
         }
     }
 
     pub(crate) fn new_with_projection(
         inner: Rc<RefCell<ObservableQuery>>,
-        schema: Table,
+        _schema: Table,
         projected_columns: Vec<String>,
         binary_layout: SchemaLayout,
+        bridge_profiler: Rc<RefCell<IvmBridgeProfiler>>,
     ) -> Self {
+        let materializer = JsSnapshotRowsMaterializer::projected(projected_columns.clone());
         Self {
             inner,
-            schema,
-            projected_columns: Some(projected_columns),
             binary_layout,
-            aggregate_columns: None,
+            materializer,
+            materialization_cache: Rc::new(RefCell::new(JsSnapshotRowsCache::default())),
+            bridge_profiler,
         }
     }
 }
@@ -1091,35 +2080,41 @@ impl JsIvmObservableQuery {
     /// Use `getResult()` to get the initial full result before subscribing.
     /// Returns an unsubscribe function.
     pub fn subscribe(&mut self, callback: js_sys::Function) -> js_sys::Function {
-        let schema = self.schema.clone();
-        let projected_columns = self.projected_columns.clone();
-        let aggregate_columns = self.aggregate_columns.clone();
+        let materializer = self.materializer.clone();
+        let bridge_profiler = self.bridge_profiler.clone();
+        let added_key = JsValue::from_str("added");
+        let removed_key = JsValue::from_str("removed");
+        let materialization_cache = self.materialization_cache.clone();
 
-        let sub_id = self.inner.borrow_mut().subscribe(move |change_set| {
-            let delta_obj = js_sys::Object::new();
+        let sub_id = self.inner.borrow_mut().subscribe_trace_batches(move |batch| {
+            let total_started_at = now_ms();
+            let (delta_obj, serialize_added_ms, serialize_removed_ms, assemble_delta_ms) =
+                trace_delta_batch_to_js_delta(
+                    batch,
+                    &materializer,
+                    &mut materialization_cache.borrow_mut(),
+                    &added_key,
+                    &removed_key,
+                );
+            let added_row_count = batch.insert_count();
+            let removed_row_count = batch.delete_count();
 
-            // Serialize only added rows
-            let added = if let Some(ref cols) = aggregate_columns {
-                ivm_rows_to_js_array(&change_set.added, cols)
-            } else if let Some(ref cols) = projected_columns {
-                ivm_rows_to_js_array(&change_set.added, cols)
-            } else {
-                ivm_full_rows_to_js_array(&change_set.added, &schema)
-            };
-
-            // Serialize only removed rows
-            let removed = if let Some(ref cols) = aggregate_columns {
-                ivm_rows_to_js_array(&change_set.removed, cols)
-            } else if let Some(ref cols) = projected_columns {
-                ivm_rows_to_js_array(&change_set.removed, cols)
-            } else {
-                ivm_full_rows_to_js_array(&change_set.removed, &schema)
-            };
-
-            js_sys::Reflect::set(&delta_obj, &JsValue::from_str("added"), &added).ok();
-            js_sys::Reflect::set(&delta_obj, &JsValue::from_str("removed"), &removed).ok();
-
+            let callback_started_at = now_ms();
             callback.call1(&JsValue::NULL, &delta_obj).ok();
+            let callback_call_ms = now_ms() - callback_started_at;
+
+            bridge_profiler
+                .borrow_mut()
+                .record_sample(&IvmBridgeProfile {
+                    callback_count: 1,
+                    added_row_count,
+                    removed_row_count,
+                    serialize_added_ms,
+                    serialize_removed_ms,
+                    assemble_delta_ms,
+                    callback_call_ms,
+                    total_ms: now_ms() - total_started_at,
+                });
         });
 
         let inner_unsub = self.inner.clone();
@@ -1139,25 +2134,18 @@ impl JsIvmObservableQuery {
     #[wasm_bindgen(js_name = getResult)]
     pub fn get_result(&self) -> JsValue {
         let inner = self.inner.borrow();
-        let rows = inner.result();
-        if let Some(ref cols) = self.aggregate_columns {
-            ivm_rows_to_js_array(&rows, cols)
-        } else if let Some(ref cols) = self.projected_columns {
-            ivm_rows_to_js_array(&rows, cols)
-        } else {
-            ivm_full_rows_to_js_array(&rows, &self.schema)
-        }
+        self.materializer.materialize_from_iter(
+            inner.result_row_refs(),
+            inner.len(),
+            &mut self.materialization_cache.borrow_mut(),
+        )
     }
 
     /// Returns the current result as a binary buffer for zero-copy access.
     #[wasm_bindgen(js_name = getResultBinary)]
     pub fn get_result_binary(&self) -> BinaryResult {
         let inner = self.inner.borrow();
-        let rows = inner.result();
-        let rc_rows: Vec<Rc<Row>> = rows.into_iter().map(Rc::new).collect();
-        let mut encoder = BinaryEncoder::new(self.binary_layout.clone(), rc_rows.len());
-        encoder.encode_rows(&rc_rows);
-        BinaryResult::new(encoder.finish())
+        encode_rc_rows_iter_to_binary(inner.result_row_refs(), inner.len(), &self.binary_layout)
     }
 
     /// Returns the schema layout for decoding binary results.
@@ -1185,36 +2173,39 @@ impl JsIvmObservableQuery {
     }
 }
 
-/// Converts IVM rows (owned Row, not Rc<Row>) to a JavaScript array using projected columns.
-fn ivm_rows_to_js_array(rows: &[Row], column_names: &[String]) -> JsValue {
-    let arr = js_sys::Array::new_with_length(rows.len() as u32);
-    for (i, row) in rows.iter().enumerate() {
-        let obj = js_sys::Object::new();
-        for (col_idx, col_name) in column_names.iter().enumerate() {
-            if let Some(value) = row.get(col_idx) {
-                let js_val = value_to_js(value);
-                js_sys::Reflect::set(&obj, &JsValue::from_str(col_name), &js_val).ok();
-            }
-        }
-        arr.set(i as u32, obj.into());
-    }
-    arr.into()
-}
+fn trace_delta_batch_to_js_delta(
+    batch: &TraceDeltaBatch,
+    materializer: &JsSnapshotRowsMaterializer,
+    cache: &mut JsSnapshotRowsCache,
+    added_key: &JsValue,
+    removed_key: &JsValue,
+) -> (JsValue, f64, f64, f64) {
+    let serialize_started_at = now_ms();
+    let added = js_sys::Array::new_with_length(batch.insert_count() as u32);
+    let removed = js_sys::Array::new_with_length(batch.delete_count() as u32);
+    let mut added_index = 0u32;
+    let mut removed_index = 0u32;
 
-/// Converts IVM rows (owned Row, not Rc<Row>) to a JavaScript array using full schema.
-fn ivm_full_rows_to_js_array(rows: &[Row], schema: &Table) -> JsValue {
-    let arr = js_sys::Array::new_with_length(rows.len() as u32);
-    for (i, row) in rows.iter().enumerate() {
-        let obj = js_sys::Object::new();
-        for col in schema.columns() {
-            if let Some(value) = row.get(col.index()) {
-                let js_val = value_to_js(value);
-                js_sys::Reflect::set(&obj, &JsValue::from_str(col.name()), &js_val).ok();
-            }
+    for delta in batch.deltas() {
+        let js_row = cache.materialize_trace_handle(materializer, batch.arena(), &delta.data);
+        if delta.is_insert() {
+            added.set(added_index, js_row);
+            added_index += 1;
+        } else if delta.is_delete() {
+            removed.set(removed_index, js_row);
+            removed_index += 1;
+            cache.remove_row(batch.arena().row_id(&delta.data));
         }
-        arr.set(i as u32, obj.into());
     }
-    arr.into()
+
+    let serialize_delta_ms = now_ms() - serialize_started_at;
+    let assemble_started_at = now_ms();
+    let delta_obj = js_sys::Object::new();
+    js_sys::Reflect::set(&delta_obj, added_key, &added).ok();
+    js_sys::Reflect::set(&delta_obj, removed_key, &removed).ok();
+    let assemble_delta_ms = now_ms() - assemble_started_at;
+
+    (delta_obj.into(), serialize_delta_ms, 0.0, assemble_delta_ms)
 }
 
 /// JavaScript-friendly GraphQL subscription wrapper.
@@ -1328,28 +2319,65 @@ impl JsChangesStream {
         let schema = self.schema.clone();
         let inner = self.inner.clone();
         let projected_columns = self.projected_columns.clone();
+        let materializer = if let Some(ref cols) = projected_columns {
+            JsSnapshotRowsMaterializer::projected(cols.clone())
+        } else {
+            JsSnapshotRowsMaterializer::full(schema.clone())
+        };
+        let materialization_cache = Rc::new(RefCell::new(JsSnapshotRowsCache::default()));
 
         // Emit initial value immediately
-        let initial_data = if let Some(ref cols) = projected_columns {
-            projected_rows_to_js_array(inner.borrow().result(), cols)
-        } else {
-            rows_to_js_array(inner.borrow().result(), &schema)
-        };
+        let initial_data = materializer.materialize(
+            inner.borrow().result(),
+            &mut materialization_cache.borrow_mut(),
+        );
         callback.call1(&JsValue::NULL, &initial_data).ok();
 
         // Subscribe to subsequent changes
-        let schema_clone = schema.clone();
-        let projected_columns_clone = projected_columns.clone();
         let sub_id = inner.borrow_mut().subscribe(move |rows| {
-            let current_data = if let Some(ref cols) = projected_columns_clone {
-                projected_rows_to_js_array(rows, cols)
-            } else {
-                rows_to_js_array(rows, &schema_clone)
-            };
+            let current_data =
+                materializer.materialize(rows, &mut materialization_cache.borrow_mut());
             callback.call1(&JsValue::NULL, &current_data).ok();
         });
 
         // Create unsubscribe function
+        let called = Rc::new(RefCell::new(false));
+        let called_c = called.clone();
+        let unsubscribe = Closure::wrap(Box::new(move || {
+            let mut c = called_c.borrow_mut();
+            if !*c {
+                *c = true;
+                inner.borrow_mut().unsubscribe(sub_id);
+            }
+        }) as Box<dyn FnMut()>);
+        unsubscribe.into_js_value().unchecked_into()
+    }
+
+    /// Subscribes to the changes stream using binary snapshots.
+    ///
+    /// The callback receives a `BinaryResult` for the full current result set.
+    /// It is called immediately with the initial data, and again whenever data changes.
+    /// Use `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+    ///
+    /// Returns an unsubscribe function.
+    #[wasm_bindgen(js_name = subscribeBinary)]
+    pub fn subscribe_binary(&self, callback: js_sys::Function) -> js_sys::Function {
+        let inner = self.inner.clone();
+        let binary_layout = self.binary_layout.clone();
+
+        let initial_data = binary_result_to_js_value(encode_rc_rows_to_binary(
+            inner.borrow().result(),
+            &binary_layout,
+        ));
+        callback.call1(&JsValue::NULL, &initial_data).ok();
+
+        let binary_layout_clone = binary_layout.clone();
+        let sub_id = inner.borrow_mut().subscribe(move |rows| {
+            let current_data =
+                binary_result_to_js_value(encode_rc_rows_to_binary(rows, &binary_layout_clone));
+            callback.call1(&JsValue::NULL, &current_data).ok();
+        });
+
         let called = Rc::new(RefCell::new(false));
         let called_c = called.clone();
         let unsubscribe = Closure::wrap(Box::new(move || {
@@ -1377,10 +2405,7 @@ impl JsChangesStream {
     #[wasm_bindgen(js_name = getResultBinary)]
     pub fn get_result_binary(&self) -> BinaryResult {
         let inner = self.inner.borrow();
-        let rows = inner.result();
-        let mut encoder = BinaryEncoder::new(self.binary_layout.clone(), rows.len());
-        encoder.encode_rows(rows);
-        BinaryResult::new(encoder.finish())
+        encode_rc_rows_to_binary(inner.result(), &self.binary_layout)
     }
 
     /// Returns the schema layout for decoding binary results.
@@ -1390,48 +2415,194 @@ impl JsChangesStream {
     }
 }
 
+struct CachedSnapshotRowJs {
+    version: u64,
+    epoch: u64,
+    value: JsValue,
+}
+
+#[derive(Default)]
+struct JsSnapshotRowsCache {
+    rows: HashMap<u64, CachedSnapshotRowJs>,
+    jsonb_cache: HashMap<Vec<u8>, JsValue>,
+    epoch: u64,
+}
+
+#[derive(Clone)]
+enum JsSnapshotRowsMaterializer {
+    Full { property_keys: Vec<JsValue> },
+    Projected { property_keys: Vec<JsValue> },
+}
+
+impl JsSnapshotRowsMaterializer {
+    fn full(schema: Table) -> Self {
+        let property_keys = schema
+            .columns()
+            .iter()
+            .map(|column| JsValue::from_str(column.name()))
+            .collect();
+        Self::Full { property_keys }
+    }
+
+    fn projected(column_names: Vec<String>) -> Self {
+        let property_keys = column_names
+            .iter()
+            .map(|column_name| JsValue::from_str(column_name))
+            .collect();
+        Self::Projected { property_keys }
+    }
+
+    fn materialize(&self, rows: &[Rc<Row>], cache: &mut JsSnapshotRowsCache) -> JsValue {
+        self.materialize_from_iter(rows.iter(), rows.len(), cache)
+    }
+
+    fn materialize_from_iter<'a, I>(
+        &self,
+        rows: I,
+        row_count: usize,
+        cache: &mut JsSnapshotRowsCache,
+    ) -> JsValue
+    where
+        I: IntoIterator<Item = &'a Rc<Row>>,
+    {
+        if cache.epoch == u64::MAX {
+            cache.rows.clear();
+            cache.epoch = 1;
+        } else {
+            cache.epoch += 1;
+            if cache.epoch == 0 {
+                cache.epoch = 1;
+            }
+        }
+        let epoch = cache.epoch;
+
+        let arr = js_sys::Array::new_with_length(row_count as u32);
+        for (index, row) in rows.into_iter().enumerate() {
+            let js_row = self.materialize_row(row.as_ref(), cache, epoch);
+            arr.set(index as u32, js_row);
+        }
+
+        cache.rows.retain(|_, entry| entry.epoch == epoch);
+        arr.into()
+    }
+
+    fn materialize_row(&self, row: &Row, cache: &mut JsSnapshotRowsCache, epoch: u64) -> JsValue {
+        if let Some(entry) = cache.rows.get_mut(&row.id()) {
+            if entry.version == row.version() {
+                entry.epoch = epoch;
+                return entry.value.clone();
+            }
+        }
+
+        let value = self.build_row_object(row, &mut cache.jsonb_cache);
+        cache.rows.insert(
+            row.id(),
+            CachedSnapshotRowJs {
+                version: row.version(),
+                epoch,
+                value: value.clone(),
+            },
+        );
+        value
+    }
+
+    fn build_row_object(&self, row: &Row, jsonb_cache: &mut HashMap<Vec<u8>, JsValue>) -> JsValue {
+        match self {
+            Self::Full { property_keys } | Self::Projected { property_keys } => {
+                row_to_js_with_keys(row, property_keys, jsonb_cache)
+            }
+        }
+    }
+
+    fn build_trace_handle_object(
+        &self,
+        arena: &TraceTupleArena,
+        handle: &TraceTupleHandle,
+        jsonb_cache: &mut HashMap<Vec<u8>, JsValue>,
+    ) -> JsValue {
+        match self {
+            Self::Full { property_keys } | Self::Projected { property_keys } => {
+                trace_handle_to_js_with_keys(arena, handle, property_keys, jsonb_cache)
+            }
+        }
+    }
+}
+
+impl JsSnapshotRowsCache {
+    fn materialize_trace_handle(
+        &mut self,
+        materializer: &JsSnapshotRowsMaterializer,
+        arena: &TraceTupleArena,
+        handle: &TraceTupleHandle,
+    ) -> JsValue {
+        let row_id = arena.row_id(handle);
+        let version = arena.version(handle);
+
+        if let Some(entry) = self.rows.get_mut(&row_id) {
+            if entry.version == version {
+                return entry.value.clone();
+            }
+        }
+
+        let value = materializer.build_trace_handle_object(arena, handle, &mut self.jsonb_cache);
+        self.rows.insert(
+            row_id,
+            CachedSnapshotRowJs {
+                version,
+                epoch: self.epoch,
+                value: value.clone(),
+            },
+        );
+        value
+    }
+
+    fn remove_row(&mut self, row_id: u64) {
+        self.rows.remove(&row_id);
+    }
+}
+
 /// Converts rows to a JavaScript array.
 fn rows_to_js_array(rows: &[Rc<Row>], schema: &Table) -> JsValue {
-    let arr = js_sys::Array::new_with_length(rows.len() as u32);
-    let mut jsonb_cache: HashMap<Vec<u8>, JsValue> = HashMap::new();
-    for (i, row) in rows.iter().enumerate() {
-        arr.set(
-            i as u32,
-            row_to_js_cached(row.as_ref(), schema, &mut jsonb_cache),
-        );
-    }
-    arr.into()
+    JsSnapshotRowsMaterializer::full(schema.clone())
+        .materialize(rows, &mut JsSnapshotRowsCache::default())
 }
 
 /// Converts projected rows to a JavaScript array.
 /// Only includes the specified columns in the output.
 fn projected_rows_to_js_array(rows: &[Rc<Row>], column_names: &[String]) -> JsValue {
-    let arr = js_sys::Array::new_with_length(rows.len() as u32);
-    let mut jsonb_cache: HashMap<Vec<u8>, JsValue> = HashMap::new();
-    for (i, row) in rows.iter().enumerate() {
-        let obj = js_sys::Object::new();
-        for (col_idx, col_name) in column_names.iter().enumerate() {
-            if let Some(value) = row.get(col_idx) {
-                let js_val = value_to_js_cached(value, &mut jsonb_cache);
-                js_sys::Reflect::set(&obj, &JsValue::from_str(col_name), &js_val).ok();
-            }
-        }
-        arr.set(i as u32, obj.into());
-    }
-    arr.into()
+    JsSnapshotRowsMaterializer::projected(column_names.to_vec())
+        .materialize(rows, &mut JsSnapshotRowsCache::default())
 }
 
-fn row_to_js_cached(
+fn row_to_js_with_keys(
     row: &Row,
-    schema: &Table,
+    property_keys: &[JsValue],
     jsonb_cache: &mut HashMap<Vec<u8>, JsValue>,
 ) -> JsValue {
     let obj = js_sys::Object::new();
 
-    for (i, col) in schema.columns().iter().enumerate() {
+    for (i, property_key) in property_keys.iter().enumerate() {
         if let Some(value) = row.get(i) {
             let js_val = value_to_js_cached(value, jsonb_cache);
-            js_sys::Reflect::set(&obj, &JsValue::from_str(col.name()), &js_val).ok();
+            js_sys::Reflect::set(&obj, property_key, &js_val).ok();
+        }
+    }
+
+    obj.into()
+}
+
+fn trace_handle_to_js_with_keys(
+    arena: &TraceTupleArena,
+    handle: &TraceTupleHandle,
+    property_keys: &[JsValue],
+    jsonb_cache: &mut HashMap<Vec<u8>, JsValue>,
+) -> JsValue {
+    let obj = js_sys::Object::new();
+
+    for (i, property_key) in property_keys.iter().enumerate() {
+        if let Some(value) = arena.value_at(handle, i) {
+            let js_val = value_to_js_cached(&value, jsonb_cache);
+            js_sys::Reflect::set(&obj, property_key, &js_val).ok();
         }
     }
 
@@ -1456,12 +2627,19 @@ fn value_to_js_cached(value: &Value, jsonb_cache: &mut HashMap<Vec<u8>, JsValue>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live_runtime::LiveRegistry;
+    use crate::live_runtime::{
+        LiveRegistry, RowsSnapshotDependencyGraph, RowsSnapshotDirectedJoinEdge,
+        RowsSnapshotLookupPrimitive, RowsSnapshotPartialRefreshMetadata,
+        RowsSnapshotRootSubsetMetadata, RowsSnapshotRootSubsetPlan,
+    };
+    use crate::query_engine::QueryResultSummary;
+    use crate::query_engine::{compile_cached_plan, execute_compiled_physical_plan_with_summary};
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Value};
-    use cynos_query::ast::Expr;
+    use cynos_query::ast::{Expr, SortOrder};
     use cynos_query::executor::{InMemoryDataSource, PhysicalPlanRunner};
-    use cynos_query::planner::PhysicalPlan;
+    use cynos_query::planner::{LogicalPlan, PhysicalPlan};
+    use cynos_storage::TableCache;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -1492,6 +2670,489 @@ mod tests {
         )
     }
 
+    fn partial_refresh_dependency_graph() -> RowsSnapshotDependencyGraph {
+        RowsSnapshotDependencyGraph {
+            root_table_id: 1,
+            table_names: HashMap::from([
+                (1, "issues".into()),
+                (2, "projects".into()),
+                (3, "counters".into()),
+            ]),
+            edges_by_source: HashMap::from([
+                (
+                    1,
+                    alloc::vec![RowsSnapshotDirectedJoinEdge {
+                        source_column_index: 1,
+                        target_table_id: 2,
+                        target_table: "projects".into(),
+                        target_column_index: 0,
+                        lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                    }],
+                ),
+                (
+                    2,
+                    alloc::vec![
+                        RowsSnapshotDirectedJoinEdge {
+                            source_column_index: 0,
+                            target_table_id: 1,
+                            target_table: "issues".into(),
+                            target_column_index: 1,
+                            lookup: RowsSnapshotLookupPrimitive::SingleColumnIndex {
+                                index_name: "idx_issues_project_id".into(),
+                            },
+                        },
+                        RowsSnapshotDirectedJoinEdge {
+                            source_column_index: 0,
+                            target_table_id: 3,
+                            target_table: "counters".into(),
+                            target_column_index: 0,
+                            lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                        },
+                    ],
+                ),
+                (
+                    3,
+                    alloc::vec![RowsSnapshotDirectedJoinEdge {
+                        source_column_index: 0,
+                        target_table_id: 2,
+                        target_table: "projects".into(),
+                        target_column_index: 0,
+                        lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                    }],
+                ),
+            ]),
+        }
+    }
+
+    fn root_subset_dependency_graph() -> RowsSnapshotDependencyGraph {
+        RowsSnapshotDependencyGraph {
+            root_table_id: 1,
+            table_names: HashMap::from([
+                (1, "issues".into()),
+                (2, "projects".into()),
+                (3, "counters".into()),
+            ]),
+            edges_by_source: HashMap::from([
+                (
+                    1,
+                    alloc::vec![RowsSnapshotDirectedJoinEdge {
+                        source_column_index: 1,
+                        target_table_id: 2,
+                        target_table: "projects".into(),
+                        target_column_index: 0,
+                        lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                    }],
+                ),
+                (
+                    2,
+                    alloc::vec![
+                        RowsSnapshotDirectedJoinEdge {
+                            source_column_index: 0,
+                            target_table_id: 1,
+                            target_table: "issues".into(),
+                            target_column_index: 1,
+                            lookup: RowsSnapshotLookupPrimitive::ScanFallback,
+                        },
+                        RowsSnapshotDirectedJoinEdge {
+                            source_column_index: 0,
+                            target_table_id: 3,
+                            target_table: "counters".into(),
+                            target_column_index: 0,
+                            lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                        },
+                    ],
+                ),
+                (
+                    3,
+                    alloc::vec![RowsSnapshotDirectedJoinEdge {
+                        source_column_index: 0,
+                        target_table_id: 2,
+                        target_table: "projects".into(),
+                        target_column_index: 0,
+                        lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                    }],
+                ),
+            ]),
+        }
+    }
+
+    fn patch_test_observable() -> ReQueryObservable {
+        let users = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("age", DataType::Int32)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let orders = TableBuilder::new("orders")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("amount", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(users).unwrap();
+        cache.create_table(orders).unwrap();
+        cache
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(1, alloc::vec![Value::Int64(1), Value::Int32(42)]))
+            .unwrap();
+        cache
+            .get_table_mut("orders")
+            .unwrap()
+            .insert(Row::new(1, alloc::vec![Value::Int64(1), Value::Int64(100)]))
+            .unwrap();
+
+        let cache = Rc::new(RefCell::new(cache));
+        let compiled_plan = CompiledPhysicalPlan::new(PhysicalPlan::filter(
+            PhysicalPlan::table_scan("users"),
+            Expr::gt(
+                Expr::column("users", "age", 1),
+                Expr::literal(Value::Int32(30)),
+            ),
+        ));
+        let initial_output = {
+            let cache_ref = cache.borrow();
+            execute_compiled_physical_plan_with_summary(&cache_ref, &compiled_plan).unwrap()
+        };
+
+        ReQueryObservable::new_with_summary(
+            compiled_plan,
+            cache,
+            initial_output.rows,
+            initial_output.summary,
+            alloc::vec![(1, "users".into()), (2, "orders".into())],
+            None,
+            None,
+        )
+    }
+
+    fn partial_refresh_test_observable() -> (Rc<RefCell<TableCache>>, ReQueryObservable) {
+        let issues = TableBuilder::new("issues")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("project_id", DataType::Int64)
+            .unwrap()
+            .add_column("updated_at", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_issues_project_id", &["project_id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let projects = TableBuilder::new("projects")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("state", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let counters = TableBuilder::new("counters")
+            .unwrap()
+            .add_column("project_id", DataType::Int64)
+            .unwrap()
+            .add_column("open_count", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["project_id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(issues).unwrap();
+        cache.create_table(projects).unwrap();
+        cache.create_table(counters).unwrap();
+
+        {
+            let store = cache.get_table_mut("issues").unwrap();
+            for (id, updated_at) in [(1u64, 500i64), (2, 400), (3, 300), (4, 200), (5, 100)] {
+                store
+                    .insert(Row::new(
+                        id,
+                        alloc::vec![
+                            Value::Int64(id as i64),
+                            Value::Int64(id as i64),
+                            Value::Int64(updated_at),
+                        ],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        {
+            let store = cache.get_table_mut("projects").unwrap();
+            for id in 1..=5u64 {
+                store
+                    .insert(Row::new(
+                        id,
+                        alloc::vec![Value::Int64(id as i64), Value::String("active".into()),],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        {
+            let store = cache.get_table_mut("counters").unwrap();
+            for (project_id, open_count) in [(1u64, 10i64), (2, 20), (3, 30), (4, 40), (5, 50)] {
+                store
+                    .insert(Row::new(
+                        project_id,
+                        alloc::vec![Value::Int64(project_id as i64), Value::Int64(open_count)],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let cache = Rc::new(RefCell::new(cache));
+        let logical_plan = LogicalPlan::project(
+            LogicalPlan::limit(
+                LogicalPlan::sort(
+                    LogicalPlan::filter(
+                        LogicalPlan::left_join(
+                            LogicalPlan::left_join(
+                                LogicalPlan::scan("issues"),
+                                LogicalPlan::scan("projects"),
+                                Expr::eq(
+                                    Expr::column("issues", "project_id", 1),
+                                    Expr::column("projects", "id", 0),
+                                ),
+                            ),
+                            LogicalPlan::scan("counters"),
+                            Expr::eq(
+                                Expr::column("projects", "id", 0),
+                                Expr::column("counters", "project_id", 0),
+                            ),
+                        ),
+                        Expr::eq(
+                            Expr::column("projects", "state", 1),
+                            Expr::literal(Value::String("active".into())),
+                        ),
+                    ),
+                    alloc::vec![(Expr::column("issues", "updated_at", 2), SortOrder::Desc)],
+                ),
+                4,
+                0,
+            ),
+            alloc::vec![
+                Expr::column("issues", "id", 0),
+                Expr::column("issues", "updated_at", 2),
+                Expr::column("projects", "state", 1),
+                Expr::column("counters", "open_count", 1),
+            ],
+        );
+        let compiled_plan = {
+            let cache_ref = cache.borrow();
+            compile_cached_plan(&cache_ref, "issues", logical_plan.clone())
+        };
+        let initial_output = {
+            let cache_ref = cache.borrow();
+            execute_compiled_physical_plan_with_summary(&cache_ref, &compiled_plan).unwrap()
+        };
+        let visible_rows: Vec<Rc<Row>> = initial_output.rows.iter().take(2).cloned().collect();
+        let visible_summary = QueryResultSummary::from_rows(&visible_rows);
+        let observable = ReQueryObservable::new_with_summary(
+            compiled_plan,
+            cache.clone(),
+            visible_rows,
+            visible_summary,
+            alloc::vec![
+                (1, "issues".into()),
+                (2, "projects".into()),
+                (3, "counters".into()),
+            ],
+            Some(RowsSnapshotPartialRefreshState {
+                metadata: RowsSnapshotPartialRefreshMetadata {
+                    root_table: "issues".into(),
+                    root_pk_output_indices: alloc::vec![0],
+                    order_keys: alloc::vec![RowsSnapshotOrderKey {
+                        output_index: 1,
+                        order: SortOrder::Desc,
+                    }],
+                    visible_offset: 0,
+                    visible_limit: 2,
+                    overscan: 1,
+                    candidate_limit: 4,
+                    dependency_graph: partial_refresh_dependency_graph(),
+                },
+                initial_candidate_rows: initial_output.rows,
+            }),
+            None,
+        );
+        (cache, observable)
+    }
+
+    fn root_subset_test_observable() -> (Rc<RefCell<TableCache>>, ReQueryObservable) {
+        let issues = TableBuilder::new("issues")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("project_id", DataType::Int64)
+            .unwrap()
+            .add_column("updated_at", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let projects = TableBuilder::new("projects")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("state", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let counters = TableBuilder::new("counters")
+            .unwrap()
+            .add_column("project_id", DataType::Int64)
+            .unwrap()
+            .add_column("open_count", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["project_id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(issues).unwrap();
+        cache.create_table(projects).unwrap();
+        cache.create_table(counters).unwrap();
+
+        {
+            let store = cache.get_table_mut("issues").unwrap();
+            for (id, updated_at) in [(1u64, 500i64), (2, 400), (3, 300), (4, 200), (5, 100)] {
+                store
+                    .insert(Row::new(
+                        id,
+                        alloc::vec![
+                            Value::Int64(id as i64),
+                            Value::Int64(id as i64),
+                            Value::Int64(updated_at),
+                        ],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        {
+            let store = cache.get_table_mut("projects").unwrap();
+            for id in 1..=5u64 {
+                store
+                    .insert(Row::new(
+                        id,
+                        alloc::vec![Value::Int64(id as i64), Value::String("active".into())],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        {
+            let store = cache.get_table_mut("counters").unwrap();
+            for (project_id, open_count) in [(1u64, 10i64), (2, 20), (3, 30), (4, 40), (5, 50)] {
+                store
+                    .insert(Row::new(
+                        project_id,
+                        alloc::vec![Value::Int64(project_id as i64), Value::Int64(open_count)],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let cache = Rc::new(RefCell::new(cache));
+        let logical_plan = LogicalPlan::project(
+            LogicalPlan::filter(
+                LogicalPlan::left_join(
+                    LogicalPlan::left_join(
+                        LogicalPlan::scan("issues"),
+                        LogicalPlan::scan("projects"),
+                        Expr::eq(
+                            Expr::column("issues", "project_id", 1),
+                            Expr::column("projects", "id", 0),
+                        ),
+                    ),
+                    LogicalPlan::scan("counters"),
+                    Expr::eq(
+                        Expr::column("projects", "id", 0),
+                        Expr::column("counters", "project_id", 0),
+                    ),
+                ),
+                Expr::eq(
+                    Expr::column("projects", "state", 1),
+                    Expr::literal(Value::String("active".into())),
+                ),
+            ),
+            alloc::vec![
+                Expr::column("issues", "id", 0),
+                Expr::column("issues", "updated_at", 2),
+                Expr::column("projects", "state", 1),
+                Expr::column("counters", "open_count", 1),
+            ],
+        );
+        let compiled_plan = {
+            let cache_ref = cache.borrow();
+            compile_cached_plan(&cache_ref, "issues", logical_plan.clone())
+        };
+        let root_subset_plan = {
+            let cache_ref = cache.borrow();
+            compile_cached_plan(&cache_ref, "issues", logical_plan)
+        };
+        let initial_output = {
+            let cache_ref = cache.borrow();
+            execute_compiled_physical_plan_with_summary(&cache_ref, &compiled_plan).unwrap()
+        };
+
+        let observable = ReQueryObservable::new_with_summary(
+            compiled_plan,
+            cache.clone(),
+            initial_output.rows,
+            initial_output.summary,
+            alloc::vec![
+                (1, "issues".into()),
+                (2, "projects".into()),
+                (3, "counters".into()),
+            ],
+            None,
+            Some(RowsSnapshotRootSubsetPlan {
+                metadata: RowsSnapshotRootSubsetMetadata {
+                    root_table: "issues".into(),
+                    root_pk_store_indices: alloc::vec![0],
+                    root_pk_output_indices: alloc::vec![0],
+                    dependency_graph: root_subset_dependency_graph(),
+                },
+                compiled_plans: crate::live_runtime::RowsSnapshotRootSubsetVariants {
+                    small: root_subset_plan.clone(),
+                    large: root_subset_plan,
+                },
+            }),
+        );
+        (cache, observable)
+    }
+
+    fn visible_issue_ids(observable: &ReQueryObservable) -> Vec<i64> {
+        observable
+            .result()
+            .iter()
+            .filter_map(|row| row.get(0))
+            .filter_map(Value::as_i64)
+            .collect()
+    }
+
     #[wasm_bindgen_test]
     fn test_live_registry_new() {
         let registry = LiveRegistry::new();
@@ -1509,6 +3170,149 @@ mod tests {
         let js = rows_to_js_array(&rows, &schema);
         let arr = js_sys::Array::from(&js);
         assert_eq!(arr.length(), 2);
+    }
+
+    #[test]
+    fn test_patch_table_changed_ids_accepts_exact_patch_table_changes() {
+        let observable = patch_test_observable();
+        let changes = HashMap::from([(1, HashSet::from([1u64]))]);
+
+        let changed_ids = observable
+            .patch_table_changed_ids(&changes)
+            .expect("patch table change should be eligible for reactive patching");
+        assert!(changed_ids.contains(&1));
+    }
+
+    #[test]
+    fn test_patch_table_changed_ids_rejects_unrelated_or_mixed_table_changes() {
+        let observable = patch_test_observable();
+
+        let unrelated = HashMap::from([(2, HashSet::from([1u64]))]);
+        assert!(
+            observable.patch_table_changed_ids(&unrelated).is_none(),
+            "unrelated table changes must not be routed into the patch fast-path",
+        );
+
+        let mixed = HashMap::from([(1, HashSet::from([1u64])), (2, HashSet::from([1u64]))]);
+        assert!(
+            observable.patch_table_changed_ids(&mixed).is_none(),
+            "mixed-table changes must fall back to full requery so we keep table provenance intact",
+        );
+    }
+
+    #[test]
+    fn test_partial_refresh_propagates_multi_hop_join_changes() {
+        let (cache, mut observable) = partial_refresh_test_observable();
+        observable.subscribe(|_| {});
+
+        {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("counters").unwrap();
+            let old_row = store.get(1).unwrap();
+            store
+                .update(
+                    1,
+                    Row::new_with_version(
+                        1,
+                        old_row.version().wrapping_add(1),
+                        alloc::vec![Value::Int64(1), Value::Int64(99)],
+                    ),
+                )
+                .unwrap();
+        }
+
+        observable.on_change(&HashMap::from([(3, HashSet::from([1u64]))]));
+
+        let first_row = observable.result().first().expect("visible row");
+        assert_eq!(first_row.get(0), Some(&Value::Int64(1)));
+        assert_eq!(first_row.get(3), Some(&Value::Int64(99)));
+    }
+
+    #[test]
+    fn test_partial_refresh_falls_back_when_shadow_window_is_depleted() {
+        let (cache, mut observable) = partial_refresh_test_observable();
+        observable.subscribe(|_| {});
+
+        {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("projects").unwrap();
+            let old_row = store.get(1).unwrap();
+            store
+                .update(
+                    1,
+                    Row::new_with_version(
+                        1,
+                        old_row.version().wrapping_add(1),
+                        alloc::vec![Value::Int64(1), Value::String("paused".into())],
+                    ),
+                )
+                .unwrap();
+        }
+        observable.on_change(&HashMap::from([(2, HashSet::from([1u64]))]));
+        assert_eq!(visible_issue_ids(&observable), alloc::vec![2, 3]);
+
+        {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("projects").unwrap();
+            let old_row = store.get(2).unwrap();
+            store
+                .update(
+                    2,
+                    Row::new_with_version(
+                        2,
+                        old_row.version().wrapping_add(1),
+                        alloc::vec![Value::Int64(2), Value::String("paused".into())],
+                    ),
+                )
+                .unwrap();
+        }
+        observable.on_change(&HashMap::from([(2, HashSet::from([2u64]))]));
+
+        assert_eq!(visible_issue_ids(&observable), alloc::vec![3, 4]);
+        let partial_refresh = observable
+            .partial_refresh
+            .as_ref()
+            .expect("partial refresh runtime");
+        let candidate_issue_ids: Vec<i64> = partial_refresh
+            .candidate_rows
+            .iter()
+            .filter_map(|entry| entry.row.get(0))
+            .filter_map(Value::as_i64)
+            .collect();
+        assert_eq!(candidate_issue_ids, alloc::vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn test_root_subset_refresh_updates_multi_hop_join_without_full_requery() {
+        let (cache, mut observable) = root_subset_test_observable();
+        observable.subscribe(|_| {});
+
+        {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("counters").unwrap();
+            let old_row = store.get(3).unwrap();
+            store
+                .update(
+                    3,
+                    Row::new_with_version(
+                        3,
+                        old_row.version().wrapping_add(1),
+                        alloc::vec![Value::Int64(3), Value::Int64(300)],
+                    ),
+                )
+                .unwrap();
+        }
+
+        let profile = observable.on_change_profiled(&HashMap::from([(3, HashSet::from([3u64]))]));
+
+        assert_eq!(profile.refresh_mode, SnapshotRefreshMode::RootSubsetRefresh);
+        assert!(profile.root_subset_hit);
+        let updated_row = observable
+            .result()
+            .iter()
+            .find(|row| row.get(0) == Some(&Value::Int64(3)))
+            .expect("issue 3 should still be visible");
+        assert_eq!(updated_row.get(3), Some(&Value::Int64(300)));
     }
 
     #[test]

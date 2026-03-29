@@ -12,7 +12,11 @@ import {
   or,
 } from '@tanstack/db'
 import { queryCollectionOptions } from '@tanstack/query-db-collection'
-import { DATASET_CONFIG } from './tanstack_db_benchmark_shared.mjs'
+import {
+  API_REFRESH_COUNT,
+  DATASET_CONFIG,
+  SOCKET_PATCH_COUNT,
+} from './tanstack_db_benchmark_shared.mjs'
 
 if (!parentPort) {
   throw new Error('This module must run inside a worker thread.')
@@ -26,6 +30,11 @@ const ISSUE_LANES = ['backlog', 'triage', 'delivery', 'follow_up']
 const PRIMARY_TAGS = ['ux', 'api', 'infra', 'growth', 'security', 'sales']
 const SECONDARY_TAGS = ['mobile', 'web', 'sync', 'billing', 'search', 'ai']
 const RISK_BUCKETS = ['low', 'medium', 'high', 'critical']
+const MAX_TRACKED_PROJECT_IDS = Math.max(
+  256,
+  SOCKET_PATCH_COUNT,
+  API_REFRESH_COUNT,
+)
 
 function createRandom(seed) {
   let value = seed >>> 0
@@ -342,6 +351,27 @@ const runtime = {
   server: null,
   collections: null,
   active: null,
+  scenarioVariant: 'default',
+}
+
+function usesAlignedFilters(scenarioVariant) {
+  return scenarioVariant === 'trace_aligned'
+}
+
+function usesTraceCapabilityAlignment(scenarioVariant) {
+  return scenarioVariant === 'trace_capability_aligned'
+}
+
+function normalizeScenarioVariant(scenarioVariant) {
+  if (scenarioVariant === 'trace_aligned') {
+    return 'trace_aligned'
+  }
+
+  if (scenarioVariant === 'trace_capability_aligned') {
+    return 'trace_capability_aligned'
+  }
+
+  return 'default'
 }
 
 function createBaseCollections(queryClient, api) {
@@ -433,11 +463,23 @@ function createBaseCollections(queryClient, api) {
   return collections
 }
 
-function buildScenarioCollection(scenarioId, collections) {
-  if (scenarioId === 'issue_window_500' || scenarioId === 'issue_window_5000') {
-    const limit = scenarioId === 'issue_window_500' ? 500 : 5_000
+function buildScenarioCollection(scenarioId, collections, scenarioVariant) {
+  if (
+    scenarioId === 'issue_window_500' ||
+    scenarioId === 'issue_window_5000' ||
+    scenarioId === 'issue_stream_all'
+  ) {
+    const limit =
+      scenarioId === 'issue_window_500'
+        ? 500
+        : scenarioId === 'issue_window_5000'
+          ? 5_000
+          : null
+    const alignedFilters = usesAlignedFilters(scenarioVariant)
+    const disableBlockingOps = usesTraceCapabilityAlignment(scenarioVariant)
     return createLiveQueryCollection((q) =>
-      q
+      {
+        let query = q
         .from({ issue: collections.issues })
         .leftJoin({ project: collections.projects }, ({ issue, project }) =>
           eq(issue.projectId, project.id),
@@ -462,21 +504,30 @@ function buildScenarioCollection(scenarioId, collections) {
           eq(project.id, snapshot.projectId),
         )
         .where(({ issue, project, counter, snapshot }) =>
-          and(
-            or(eq(issue.status, 'open'), eq(issue.status, 'in_progress')),
-            gte(issue.estimate, 3),
-            or(
-              eq(issue.metadata.customer.tier, 'enterprise'),
-              eq(issue.metadata.customer.tier, 'mid_market'),
-            ),
-            gte(project.healthScore, 45),
-            or(
-              eq(project.metadata.risk.bucket, 'high'),
-              eq(project.metadata.risk.bucket, 'critical'),
-            ),
-            gte(counter.openIssueCount, 5),
-            gte(snapshot.velocity, 18),
-          ),
+          alignedFilters
+            ? and(
+                or(eq(issue.status, 'open'), eq(issue.status, 'in_progress')),
+                gte(issue.estimate, 3),
+                or(
+                  eq(issue.metadata.customer.tier, 'enterprise'),
+                  eq(issue.metadata.customer.tier, 'mid_market'),
+                ),
+              )
+            : and(
+                or(eq(issue.status, 'open'), eq(issue.status, 'in_progress')),
+                gte(issue.estimate, 3),
+                or(
+                  eq(issue.metadata.customer.tier, 'enterprise'),
+                  eq(issue.metadata.customer.tier, 'mid_market'),
+                ),
+                gte(project.healthScore, 45),
+                or(
+                  eq(project.metadata.risk.bucket, 'high'),
+                  eq(project.metadata.risk.bucket, 'critical'),
+                ),
+                gte(counter.openIssueCount, 5),
+                gte(snapshot.velocity, 18),
+              ),
         )
         .select(
           ({ issue, project, org, team, assignee, milestone, counter, snapshot }) => ({
@@ -502,14 +553,26 @@ function buildScenarioCollection(scenarioId, collections) {
             updatedAt: issue.updatedAt,
           }),
         )
-        .orderBy(({ $selected }) => $selected.updatedAt, 'desc')
-        .limit(limit),
+        if (Number.isFinite(limit) && !disableBlockingOps) {
+          query = query
+            .orderBy(({ $selected }) => $selected.updatedAt, 'desc')
+            .limit(limit)
+        }
+        return query
+      },
     )
   }
 
-  if (scenarioId === 'project_board_2000') {
+  if (
+    scenarioId === 'project_board_2000' ||
+    scenarioId === 'project_board_stream_all'
+  ) {
+    const limit = scenarioId === 'project_board_2000' ? 2_000 : null
+    const alignedFilters = usesAlignedFilters(scenarioVariant)
+    const disableBlockingOps = usesTraceCapabilityAlignment(scenarioVariant)
     return createLiveQueryCollection((q) =>
-      q
+      {
+        let query = q
         .from({ project: collections.projects })
         .leftJoin({ org: collections.organizations }, ({ project, org }) =>
           eq(project.organizationId, org.id),
@@ -531,16 +594,25 @@ function buildScenarioCollection(scenarioId, collections) {
           ({ project, milestone }) => eq(project.id, milestone.projectId),
         )
         .where(({ project, counter, snapshot }) =>
-          and(
-            or(eq(project.state, 'active'), eq(project.state, 'at_risk')),
-            gte(project.healthScore, 45),
-            or(
-              eq(project.metadata.risk.bucket, 'high'),
-              eq(project.metadata.risk.bucket, 'critical'),
-            ),
-            gte(counter.openIssueCount, 4),
-            gte(snapshot.velocity, 20),
-          ),
+          alignedFilters
+            ? and(
+                or(eq(project.state, 'active'), eq(project.state, 'at_risk')),
+                gte(project.healthScore, 45),
+                or(
+                  eq(project.metadata.risk.bucket, 'high'),
+                  eq(project.metadata.risk.bucket, 'critical'),
+                ),
+              )
+            : and(
+                or(eq(project.state, 'active'), eq(project.state, 'at_risk')),
+                gte(project.healthScore, 45),
+                or(
+                  eq(project.metadata.risk.bucket, 'high'),
+                  eq(project.metadata.risk.bucket, 'critical'),
+                ),
+                gte(counter.openIssueCount, 4),
+                gte(snapshot.velocity, 20),
+              ),
         )
         .select(({ project, org, team, lead, counter, snapshot, milestone }) => ({
           projectId: project.id,
@@ -559,27 +631,34 @@ function buildScenarioCollection(scenarioId, collections) {
           openIssueCount: counter.openIssueCount,
           blockerCount: counter.blockerCount,
           staleIssueCount: counter.staleIssueCount,
-          velocity: snapshot.velocity,
-          blockedRatio: snapshot.blockedRatio,
-          updatedAt: project.updatedAt,
-        }))
-        .orderBy(({ $selected }) => $selected.projectHealth, 'desc')
-        .limit(2_000),
+            velocity: snapshot.velocity,
+            blockedRatio: snapshot.blockedRatio,
+            updatedAt: project.updatedAt,
+          }))
+        if (Number.isFinite(limit) && !disableBlockingOps) {
+          query = query
+            .orderBy(({ $selected }) => $selected.projectHealth, 'desc')
+            .limit(limit)
+        }
+        return query
+      },
     )
   }
 
   throw new Error(`Unknown scenario: ${scenarioId}`)
 }
 
-async function initRuntime() {
+async function initRuntime(message = {}) {
   if (runtime.initialized) {
     return {
       type: 'ready',
+      scenarioVariant: runtime.scenarioVariant,
       dataset: summarizeDataset(runtime.server.tables),
     }
   }
 
   const startedAt = performance.now()
+  runtime.scenarioVariant = normalizeScenarioVariant(message.scenarioVariant)
   runtime.server = buildServerDataset(DATASET_CONFIG)
   runtime.api = createApi(runtime.server)
   runtime.queryClient = new QueryClient({
@@ -597,6 +676,7 @@ async function initRuntime() {
   return {
     type: 'ready',
     initMs: performance.now() - startedAt,
+    scenarioVariant: runtime.scenarioVariant,
     dataset: summarizeDataset(runtime.server.tables),
   }
 }
@@ -667,6 +747,7 @@ function subscribeScenario(message) {
   active.collection = buildScenarioCollection(
     message.scenarioId,
     runtime.collections,
+    runtime.scenarioVariant,
   )
 
   active.subscription = active.collection.subscribeChanges(
@@ -674,7 +755,7 @@ function subscribeScenario(message) {
       const pending = active.pending
       const nextProjectIds = extractProjectIds(
         active.collection.toArray,
-        Number.POSITIVE_INFINITY,
+        MAX_TRACKED_PROJECT_IDS,
       )
       if (nextProjectIds.length > 0) {
         active.lastProjectIds = nextProjectIds
@@ -803,7 +884,7 @@ parentPort.on('message', async (message) => {
   try {
     switch (message.type) {
       case 'init':
-        post(await initRuntime())
+        post(await initRuntime(message))
         return
       case 'subscribe':
         subscribeScenario(message)

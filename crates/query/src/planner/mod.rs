@@ -10,4 +10,4 @@ pub use index_bounds::IndexBounds;
 pub use logical::LogicalPlan;
 pub use physical::{JoinAlgorithm, PhysicalPlan};
 pub use properties::{OrderingColumn, OrderingProperty, PhysicalProperties};
-pub use query_planner::QueryPlanner;
+pub use query_planner::{PlannerProfile, QueryPlanner};

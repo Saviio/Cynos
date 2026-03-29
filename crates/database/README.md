@@ -44,6 +44,7 @@ import {
   col,
   createDatabase,
   initCynos,
+  snapshotSchemaLayout,
 } from '@cynos/core';
 
 await initCynos();
@@ -71,6 +72,13 @@ const current = await db
 const stream = db.select('*').from('users').changes();
 const stop = stream.subscribe((rows) => {
   console.log('current result', rows);
+});
+
+const binaryLayout = snapshotSchemaLayout(stream.getSchemaLayout());
+const stopBinary = stream.subscribeBinary((binary) => {
+  const transferable = binary.intoTransferable();
+  const rs = new ResultSet(transferable, binaryLayout);
+  console.log('binary snapshot', rs.toArray());
 });
 
 const trace = db

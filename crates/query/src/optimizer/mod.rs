@@ -11,6 +11,7 @@ mod limit_skip_by_index;
 mod multi_column_or;
 mod not_simplification;
 mod order_by_index;
+mod outer_join_removal;
 mod outer_join_simplification;
 mod pass;
 mod predicate_pushdown;
@@ -27,6 +28,7 @@ pub use limit_skip_by_index::LimitSkipByIndexPass;
 pub use multi_column_or::{MultiColumnOrConfig, MultiColumnOrPass};
 pub use not_simplification::NotSimplification;
 pub use order_by_index::OrderByIndexPass;
+pub use outer_join_removal::OuterJoinRemoval;
 pub use outer_join_simplification::OuterJoinSimplification;
 pub use pass::OptimizerPass;
 pub use predicate_pushdown::PredicatePushdown;
@@ -154,6 +156,7 @@ impl Optimizer {
                 index,
                 column: _,
                 pairs,
+                match_all,
                 recheck,
             } => {
                 // Convert (path, value) pairs to (key, value_str) pairs
@@ -173,7 +176,7 @@ impl Optimizer {
                     })
                     .collect();
 
-                PhysicalPlan::gin_index_scan_multi(table, index, string_pairs, recheck)
+                PhysicalPlan::gin_index_scan_multi(table, index, string_pairs, match_all, recheck)
             }
 
             LogicalPlan::Filter { input, predicate } => {

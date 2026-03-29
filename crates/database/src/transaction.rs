@@ -3,18 +3,33 @@
 //! This module provides transaction support with commit and rollback capabilities.
 
 use crate::convert::{js_array_to_rows, js_to_value};
-use crate::expr::Expr;
+use crate::expr::{ComparisonOp, Expr, ExprInner};
 use crate::live_runtime::LiveRegistry;
+use crate::profiling::now_ms;
 use crate::query_builder::evaluate_predicate;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use cynos_core::schema::{IndexType, Table};
 use cynos_core::{reserve_row_ids, Row};
+use cynos_incremental::Delta;
+use cynos_index::KeyRange;
 use cynos_reactive::TableId;
-use cynos_storage::{TableCache, Transaction, TransactionState};
+use cynos_storage::{RowStore, TableCache, Transaction, TransactionState};
 use hashbrown::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CommitProfile {
+    pub storage_commit_ms: f64,
+    pub registry_flush_ms: f64,
+    pub total_commit_ms: f64,
+    pub changed_table_count: usize,
+    pub changed_row_count: usize,
+    pub delta_row_count: usize,
+}
 
 /// JavaScript-friendly transaction wrapper.
 #[wasm_bindgen]
@@ -22,9 +37,12 @@ pub struct JsTransaction {
     cache: Rc<RefCell<TableCache>>,
     query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    last_commit_profile: Rc<RefCell<Option<CommitProfile>>>,
     inner: Option<Transaction>,
     /// Pending changes grouped by table so one commit triggers one live flush per table.
     pending_changes: HashMap<TableId, HashSet<u64>>,
+    /// Pending row deltas grouped by table for trace()/delta-backed subscriptions.
+    pending_deltas: HashMap<TableId, Vec<Delta<Row>>>,
 }
 
 impl JsTransaction {
@@ -32,17 +50,25 @@ impl JsTransaction {
         cache: Rc<RefCell<TableCache>>,
         query_registry: Rc<RefCell<LiveRegistry>>,
         table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+        last_commit_profile: Rc<RefCell<Option<CommitProfile>>>,
     ) -> Self {
         Self {
             cache,
             query_registry,
             table_id_map,
+            last_commit_profile,
             inner: Some(Transaction::begin()),
             pending_changes: HashMap::new(),
+            pending_deltas: HashMap::new(),
         }
     }
 
-    fn record_pending_change(&mut self, table_id: TableId, changed_ids: HashSet<u64>) {
+    fn record_pending_change(
+        &mut self,
+        table_id: TableId,
+        changed_ids: HashSet<u64>,
+        deltas: Vec<Delta<Row>>,
+    ) {
         if changed_ids.is_empty() {
             return;
         }
@@ -51,6 +77,136 @@ impl JsTransaction {
             .entry(table_id)
             .or_insert_with(HashSet::new)
             .extend(changed_ids);
+
+        if !deltas.is_empty() {
+            self.pending_deltas
+                .entry(table_id)
+                .or_insert_with(Vec::new)
+                .extend(deltas);
+        }
+    }
+
+    fn collect_candidate_rows(
+        store: &RowStore,
+        schema: &Table,
+        predicate: Option<&Expr>,
+    ) -> Result<Vec<Row>, JsValue> {
+        let Some(predicate) = predicate else {
+            return Ok(store.scan().map(|rc| (*rc).clone()).collect());
+        };
+
+        if let Some(rows) = Self::lookup_rows_for_predicate(store, schema, predicate)? {
+            return Ok(rows);
+        }
+
+        Ok(store
+            .scan()
+            .filter(|row| evaluate_predicate(predicate, &**row, schema))
+            .map(|rc| (*rc).clone())
+            .collect())
+    }
+
+    fn lookup_rows_for_predicate(
+        store: &RowStore,
+        schema: &Table,
+        predicate: &Expr,
+    ) -> Result<Option<Vec<Row>>, JsValue> {
+        let mut equalities = HashMap::<usize, cynos_core::Value>::new();
+        if !Self::collect_point_equalities(schema, predicate, &mut equalities)? {
+            return Ok(None);
+        }
+
+        if !store.pk_columns().is_empty()
+            && store
+                .pk_columns()
+                .iter()
+                .all(|idx| equalities.contains_key(idx))
+        {
+            let pk_values: Vec<_> = store
+                .pk_columns()
+                .iter()
+                .filter_map(|idx| equalities.get(idx).cloned())
+                .collect();
+            let rows = store
+                .get_by_pk_values(&pk_values)
+                .into_iter()
+                .filter(|row| evaluate_predicate(predicate, &**row, schema))
+                .map(|row| (*row).clone())
+                .collect();
+            return Ok(Some(rows));
+        }
+
+        if equalities.len() != 1 {
+            return Ok(None);
+        }
+
+        let Some((&column_idx, value)) = equalities.iter().next() else {
+            return Ok(None);
+        };
+        let Some(index_name) = Self::find_single_column_index(schema, column_idx) else {
+            return Ok(None);
+        };
+        let rows = store
+            .index_scan(&index_name, Some(&KeyRange::only(value.clone())))
+            .into_iter()
+            .filter(|row| evaluate_predicate(predicate, &**row, schema))
+            .map(|row| (*row).clone())
+            .collect();
+        Ok(Some(rows))
+    }
+
+    fn collect_point_equalities(
+        schema: &Table,
+        predicate: &Expr,
+        equalities: &mut HashMap<usize, cynos_core::Value>,
+    ) -> Result<bool, JsValue> {
+        match predicate.inner() {
+            ExprInner::And { left, right } => {
+                Ok(Self::collect_point_equalities(schema, left, equalities)?
+                    && Self::collect_point_equalities(schema, right, equalities)?)
+            }
+            ExprInner::Comparison { column, op, value } if *op == ComparisonOp::Eq => {
+                if value.is_object() {
+                    return Ok(false);
+                }
+
+                if let Some(table_name) = column.table_name() {
+                    if table_name != schema.name() {
+                        return Ok(false);
+                    }
+                }
+
+                let Some(schema_column) = schema.get_column(&column.name()) else {
+                    return Ok(false);
+                };
+                let literal = js_to_value(value, schema_column.data_type())?;
+                match equalities.get(&schema_column.index()) {
+                    Some(existing) if existing != &literal => Ok(false),
+                    Some(_) => Ok(true),
+                    None => {
+                        equalities.insert(schema_column.index(), literal);
+                        Ok(true)
+                    }
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn find_single_column_index(schema: &Table, column_idx: usize) -> Option<String> {
+        schema
+            .indices()
+            .iter()
+            .find(|index| {
+                index.get_index_type() != IndexType::Gin
+                    && index.columns().len() == 1
+                    && index
+                        .columns()
+                        .first()
+                        .and_then(|col| schema.get_column_index(&col.name))
+                        == Some(column_idx)
+            })
+            .map(|index| index.name().to_string())
     }
 }
 
@@ -81,10 +237,12 @@ impl JsTransaction {
 
         // Collect inserted row IDs
         let mut inserted_ids = HashSet::new();
+        let mut deltas = Vec::with_capacity(rows.len());
 
         // Insert through transaction
         for row in rows {
             inserted_ids.insert(row.id());
+            deltas.push(Delta::insert(row.clone()));
             tx.insert(&mut *cache, table, row)
                 .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
         }
@@ -94,7 +252,7 @@ impl JsTransaction {
         // Store pending changes
         let table_id = self.table_id_map.borrow().get(table).copied();
         if let Some(table_id) = table_id {
-            self.record_pending_change(table_id, inserted_ids);
+            self.record_pending_change(table_id, inserted_ids, deltas);
         }
 
         Ok(())
@@ -134,20 +292,11 @@ impl JsTransaction {
         }
 
         // Find rows to update
-        let rows_to_update: Vec<Row> = store
-            .scan()
-            .filter(|row| {
-                if let Some(ref pred) = predicate {
-                    evaluate_predicate(pred, &**row, &schema)
-                } else {
-                    true
-                }
-            })
-            .map(|rc| (*rc).clone())
-            .collect();
+        let rows_to_update = Self::collect_candidate_rows(store, &schema, predicate.as_ref())?;
 
         let mut updated_ids = HashSet::new();
         let mut update_count = 0;
+        let mut deltas = Vec::with_capacity(rows_to_update.len() * 2);
 
         for old_row in rows_to_update {
             let mut new_values = old_row.values().to_vec();
@@ -167,6 +316,8 @@ impl JsTransaction {
             let new_row = Row::new_with_version(old_row.id(), new_version, new_values);
 
             updated_ids.insert(old_row.id());
+            deltas.push(Delta::delete(old_row.clone()));
+            deltas.push(Delta::insert(new_row.clone()));
 
             tx.update(&mut *cache, table, old_row.id(), new_row)
                 .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
@@ -178,7 +329,7 @@ impl JsTransaction {
 
         let table_id = self.table_id_map.borrow().get(table).copied();
         if let Some(table_id) = table_id {
-            self.record_pending_change(table_id, updated_ids);
+            self.record_pending_change(table_id, updated_ids, deltas);
         }
 
         Ok(update_count)
@@ -199,23 +350,15 @@ impl JsTransaction {
         let schema = store.schema().clone();
 
         // Find rows to delete
-        let rows_to_delete: Vec<Row> = store
-            .scan()
-            .filter(|row| {
-                if let Some(ref pred) = predicate {
-                    evaluate_predicate(pred, &**row, &schema)
-                } else {
-                    true
-                }
-            })
-            .map(|rc| (*rc).clone())
-            .collect();
+        let rows_to_delete = Self::collect_candidate_rows(store, &schema, predicate.as_ref())?;
 
         let delete_count = rows_to_delete.len();
 
         let mut deleted_ids = HashSet::new();
+        let mut deltas = Vec::with_capacity(delete_count);
         for row in rows_to_delete {
             deleted_ids.insert(row.id());
+            deltas.push(Delta::delete(row.clone()));
             tx.delete(&mut *cache, table, row.id())
                 .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
         }
@@ -224,7 +367,7 @@ impl JsTransaction {
 
         let table_id = self.table_id_map.borrow().get(table).copied();
         if let Some(table_id) = table_id {
-            self.record_pending_change(table_id, deleted_ids);
+            self.record_pending_change(table_id, deleted_ids, deltas);
         }
 
         Ok(delete_count)
@@ -237,15 +380,44 @@ impl JsTransaction {
             .take()
             .ok_or_else(|| JsValue::from_str("Transaction already completed"))?;
 
+        let storage_started_at = now_ms();
         tx.commit()
             .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
+        let storage_commit_ms = now_ms() - storage_started_at;
 
         // Notify query registry of all changes
-        for (table_id, changed_ids) in self.pending_changes.drain() {
-            self.query_registry
-                .borrow_mut()
-                .on_table_change(table_id, &changed_ids);
+        let notify_started_at = now_ms();
+        let mut changed_table_count = 0usize;
+        let mut changed_row_count = 0usize;
+        let mut delta_row_count = 0usize;
+        {
+            let mut registry = self.query_registry.borrow_mut();
+            for (table_id, changed_ids) in self.pending_changes.drain() {
+                changed_table_count += 1;
+                changed_row_count += changed_ids.len();
+                let deltas = self.pending_deltas.remove(&table_id).unwrap_or_default();
+                delta_row_count += deltas.len();
+                if deltas.is_empty() {
+                    registry.on_table_change(table_id, &changed_ids);
+                } else {
+                    registry.on_table_change_delta(table_id, deltas, &changed_ids);
+                }
+            }
+
+            if registry.has_pending_changes() {
+                registry.flush();
+            }
         }
+        let registry_flush_ms = now_ms() - notify_started_at;
+
+        *self.last_commit_profile.borrow_mut() = Some(CommitProfile {
+            storage_commit_ms,
+            registry_flush_ms,
+            total_commit_ms: storage_commit_ms + registry_flush_ms,
+            changed_table_count,
+            changed_row_count,
+            delta_row_count,
+        });
 
         Ok(())
     }
@@ -261,11 +433,15 @@ impl JsTransaction {
         tx.rollback(&mut *cache)
             .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
 
+        self.pending_deltas.clear();
+
         // Notify Live Query of rollback changes (data was restored)
+        let mut registry = self.query_registry.borrow_mut();
         for (table_id, changed_ids) in self.pending_changes.drain() {
-            self.query_registry
-                .borrow_mut()
-                .on_table_change(table_id, &changed_ids);
+            registry.on_table_change(table_id, &changed_ids);
+        }
+        if registry.has_pending_changes() {
+            registry.flush();
         }
 
         Ok(())

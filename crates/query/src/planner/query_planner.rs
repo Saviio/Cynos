@@ -14,10 +14,15 @@
 //!    - ImplicitJoinsPass
 //!    - OuterJoinSimplification
 //!    - PredicatePushdown
+//!    - OuterJoinSimplification (rerun after pushdown to expose deeper join collapses)
+//!    - PredicatePushdown
+//!    - OuterJoinSimplification
 //!    - JoinReorder
+//!    - PredicatePushdown (rerun after join reorder to expose new single-table filters)
 //!
 //! 2. **Context-Aware Logical Optimization** - Requires ExecutionContext:
 //!    - IndexSelection (converts Filter+Scan to IndexScan/IndexGet)
+//!    - OuterJoinRemoval (removes unused cardinality-preserving outer joins)
 //!
 //! 3. **Physical Plan Conversion** - Converts logical to physical plan
 //!
@@ -39,7 +44,7 @@ use crate::context::ExecutionContext;
 use crate::optimizer::{
     AndPredicatePass, CrossProductPass, ImplicitJoinsPass, IndexJoinPass, IndexSelection,
     JoinReorder, LimitSkipByIndexPass, NotSimplification, OptimizerPass, OrderByIndexPass,
-    OuterJoinSimplification, PredicatePushdown, TopNPushdown,
+    OuterJoinRemoval, OuterJoinSimplification, PredicatePushdown, TopNPushdown,
 };
 use crate::planner::{LogicalPlan, PhysicalPlan};
 use alloc::boxed::Box;
@@ -56,26 +61,72 @@ pub struct QueryPlanner {
     logical_passes: Vec<Box<dyn OptimizerPass>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlannerProfile {
+    Default,
+    RootSubset,
+}
+
 impl QueryPlanner {
+    fn default_logical_passes(ctx: &ExecutionContext) -> Vec<Box<dyn OptimizerPass>> {
+        alloc::vec![
+            Box::new(NotSimplification),
+            Box::new(AndPredicatePass),
+            Box::new(CrossProductPass),
+            Box::new(ImplicitJoinsPass),
+            Box::new(OuterJoinSimplification),
+            Box::new(PredicatePushdown),
+            // Predicate pushdown can surface new null-rejecting filters directly above
+            // deeper outer joins, so rerun simplification before join reordering.
+            Box::new(OuterJoinSimplification),
+            // When an intermediate outer join collapses to inner, another pushdown/simplify
+            // round can expose the next join in the chain.
+            Box::new(PredicatePushdown),
+            Box::new(OuterJoinSimplification),
+            Box::new(JoinReorder::with_context(ctx.clone())),
+            // Join reordering can surface a new join boundary for a filter that still
+            // references only one side, so give pushdown one final pass before index selection.
+            Box::new(PredicatePushdown),
+        ]
+    }
+
+    fn root_subset_logical_passes(ctx: &ExecutionContext) -> Vec<Box<dyn OptimizerPass>> {
+        // Root-subset planning now uses the ordinary logical pipeline and relies on
+        // restricted-relation intent plus costed join/index choices to keep the anchor
+        // relation as the driver, rather than disabling logical passes wholesale.
+        Self::default_logical_passes(ctx)
+    }
+
     /// Creates a new QueryPlanner with the given execution context.
     ///
     /// The planner is initialized with default optimization passes:
     /// - Logical: NotSimplification, AndPredicatePass, CrossProductPass,
-    ///   ImplicitJoinsPass, OuterJoinSimplification, PredicatePushdown, JoinReorder
+    ///   ImplicitJoinsPass, OuterJoinSimplification, PredicatePushdown,
+    ///   OuterJoinSimplification, PredicatePushdown, OuterJoinSimplification,
+    ///   JoinReorder, PredicatePushdown
     /// - Context-aware logical: IndexSelection
     /// - Physical: TopNPushdown, OrderByIndexPass, LimitSkipByIndexPass
     pub fn new(ctx: ExecutionContext) -> Self {
+        Self::for_profile(ctx, PlannerProfile::Default)
+    }
+
+    /// Creates a planner profile tailored for root-subset snapshot refresh.
+    ///
+    /// The subset profile now uses the normal logical pipeline and relies on
+    /// restricted-relation planning intent plus physical costing to keep the
+    /// declared root table as the driver.
+    pub fn for_root_subset(ctx: ExecutionContext) -> Self {
+        Self::for_profile(ctx, PlannerProfile::RootSubset)
+    }
+
+    pub fn for_profile(ctx: ExecutionContext, profile: PlannerProfile) -> Self {
+        let logical_passes = match profile {
+            PlannerProfile::Default => Self::default_logical_passes(&ctx),
+            PlannerProfile::RootSubset => Self::root_subset_logical_passes(&ctx),
+        };
         Self {
-            ctx: ctx.clone(),
-            logical_passes: alloc::vec![
-                Box::new(NotSimplification),
-                Box::new(AndPredicatePass),
-                Box::new(CrossProductPass),
-                Box::new(ImplicitJoinsPass),
-                Box::new(OuterJoinSimplification),
-                Box::new(PredicatePushdown),
-                Box::new(JoinReorder::with_context(ctx.clone())),
-            ],
+            ctx,
+            logical_passes,
         }
     }
 
@@ -95,11 +146,17 @@ impl QueryPlanner {
         &self.ctx
     }
 
+    fn optimize_context_aware_logical(&self, mut logical: LogicalPlan) -> LogicalPlan {
+        let index_selection = IndexSelection::with_context(self.ctx.clone());
+        logical = index_selection.optimize(logical);
+        OuterJoinRemoval::new(&self.ctx).optimize(logical)
+    }
+
     /// Plans a logical query into an optimized physical plan.
     ///
     /// This is the main entry point that runs the complete optimization pipeline:
     /// 1. Apply context-free logical optimizations
-    /// 2. Apply context-aware logical optimizations (IndexSelection)
+    /// 2. Apply context-aware logical optimizations (IndexSelection, OuterJoinRemoval)
     /// 3. Convert to physical plan
     /// 4. Apply physical optimizations (TopNPushdown, OrderByIndexPass, LimitSkipByIndexPass)
     pub fn plan(&self, plan: LogicalPlan) -> PhysicalPlan {
@@ -110,8 +167,7 @@ impl QueryPlanner {
         }
 
         // Phase 2: Context-aware logical optimizations
-        let index_selection = IndexSelection::with_context(self.ctx.clone());
-        logical = index_selection.optimize(logical);
+        logical = self.optimize_context_aware_logical(logical);
 
         // Phase 3: Convert to physical plan
         self.optimize_physical(self.logical_to_physical(logical))
@@ -129,10 +185,7 @@ impl QueryPlanner {
         }
 
         // Context-aware passes
-        let index_selection = IndexSelection::with_context(self.ctx.clone());
-        logical = index_selection.optimize(logical);
-
-        logical
+        self.optimize_context_aware_logical(logical)
     }
 
     /// Converts a logical plan to physical and applies physical optimizations.
@@ -197,6 +250,7 @@ impl QueryPlanner {
                 index,
                 column: _,
                 pairs,
+                match_all,
                 recheck,
             } => {
                 let string_pairs: Vec<(alloc::string::String, alloc::string::String)> = pairs
@@ -214,7 +268,7 @@ impl QueryPlanner {
                         (key, value_str)
                     })
                     .collect();
-                PhysicalPlan::gin_index_scan_multi(table, index, string_pairs, recheck)
+                PhysicalPlan::gin_index_scan_multi(table, index, string_pairs, match_all, recheck)
             }
 
             LogicalPlan::Filter { input, predicate } => {
@@ -328,7 +382,7 @@ impl QueryPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Expr, SortOrder};
+    use crate::ast::{Expr, JoinType, SortOrder};
     use crate::context::{IndexInfo, TableStats};
     use alloc::string::String;
 
@@ -369,6 +423,75 @@ mod tests {
             }
             LogicalPlan::Empty => {}
         }
+    }
+
+    fn collect_join_types(plan: &LogicalPlan, join_types: &mut Vec<JoinType>) {
+        match plan {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                ..
+            } => {
+                join_types.push(*join_type);
+                collect_join_types(left, join_types);
+                collect_join_types(right, join_types);
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => collect_join_types(input, join_types),
+            LogicalPlan::CrossProduct { left, right } | LogicalPlan::Union { left, right, .. } => {
+                collect_join_types(left, join_types);
+                collect_join_types(right, join_types);
+            }
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::IndexScan { .. }
+            | LogicalPlan::IndexGet { .. }
+            | LogicalPlan::IndexInGet { .. }
+            | LogicalPlan::GinIndexScan { .. }
+            | LogicalPlan::GinIndexScanMulti { .. }
+            | LogicalPlan::Empty => {}
+        }
+    }
+
+    fn build_issue_project_counter_outer_join_plan() -> LogicalPlan {
+        LogicalPlan::filter(
+            LogicalPlan::Join {
+                left: Box::new(LogicalPlan::Join {
+                    left: Box::new(LogicalPlan::scan("issues")),
+                    right: Box::new(LogicalPlan::scan("projects")),
+                    condition: Expr::eq(
+                        Expr::column("issues", "project_id", 1),
+                        Expr::column("projects", "id", 0),
+                    ),
+                    join_type: JoinType::LeftOuter,
+                    output_tables: alloc::vec!["issues".into(), "projects".into()],
+                }),
+                right: Box::new(LogicalPlan::scan("project_counters")),
+                condition: Expr::eq(
+                    Expr::column("projects", "id", 0),
+                    Expr::column("project_counters", "project_id", 0),
+                ),
+                join_type: JoinType::LeftOuter,
+                output_tables: alloc::vec![
+                    "issues".into(),
+                    "projects".into(),
+                    "project_counters".into(),
+                ],
+            },
+            Expr::and(
+                Expr::gte(
+                    Expr::column("projects", "health_score", 1),
+                    Expr::literal(45i64),
+                ),
+                Expr::gte(
+                    Expr::column("project_counters", "open_issue_count", 1),
+                    Expr::literal(5i64),
+                ),
+            ),
+        )
     }
 
     #[test]
@@ -597,5 +720,106 @@ mod tests {
                 alloc::string::String::from("b")
             ]
         );
+    }
+
+    #[test]
+    fn test_query_planner_reruns_outer_join_simplification_after_pushdown() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "issues",
+            TableStats {
+                row_count: 10_000,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        ctx.register_table(
+            "projects",
+            TableStats {
+                row_count: 1_000,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        ctx.register_table(
+            "project_counters",
+            TableStats {
+                row_count: 1_000,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+
+        let planner = QueryPlanner::new(ctx);
+        let plan = build_issue_project_counter_outer_join_plan();
+
+        let optimized = planner.optimize_logical(plan);
+        let mut join_types = Vec::new();
+        collect_join_types(&optimized, &mut join_types);
+
+        assert!(!join_types.is_empty());
+        assert!(join_types
+            .iter()
+            .all(|join_type| *join_type == JoinType::Inner));
+    }
+
+    #[test]
+    fn test_root_subset_profile_keeps_anchor_table_as_driver() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "a",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        ctx.register_table(
+            "b",
+            TableStats {
+                row_count: 10,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        ctx.register_table(
+            "c",
+            TableStats {
+                row_count: 100,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        ctx.set_planner_feature_flags(crate::context::PlannerFeatureFlags {
+            restricted_relation_cbo: true,
+        });
+        ctx.set_planning_intent(crate::context::PlanningIntent {
+            mode: crate::context::PlanningMode::RestrictedRelation,
+            restricted_table: Some("a".into()),
+            exact_subset_rows: Some(32),
+            subset_fraction: Some(0.032),
+            preferred_access_mode: crate::context::RestrictedAccessMode::SubsetDriven,
+            anchor_table: Some("a".into()),
+            allow_global_fallback: true,
+        });
+        ctx.register_effective_row_count("a", 32);
+
+        let planner = QueryPlanner::for_root_subset(ctx);
+        let plan = LogicalPlan::inner_join(
+            LogicalPlan::inner_join(
+                LogicalPlan::scan("a"),
+                LogicalPlan::scan("c"),
+                Expr::eq(Expr::column("a", "id", 0), Expr::column("c", "a_id", 0)),
+            ),
+            LogicalPlan::scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+        );
+
+        let optimized = planner.optimize_logical(plan);
+        let mut order = Vec::new();
+        collect_scan_order(&optimized, &mut order);
+
+        assert!(!order.is_empty());
+        assert_eq!(order.first().map(String::as_str), Some("a"));
     }
 }

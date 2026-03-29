@@ -261,6 +261,20 @@ impl GinIndex {
         result
     }
 
+    /// Gets all row IDs that contain ANY of the given key-value pairs (OR query).
+    pub fn get_by_key_values_any(&self, pairs: &[(&str, &str)]) -> Vec<RowId> {
+        let mut result = PostingList::new();
+
+        for (key, value) in pairs {
+            let pair = ((*key).into(), (*value).into());
+            if let Some(posting) = self.key_value_index.get(&pair) {
+                result = result.union(posting);
+            }
+        }
+
+        result.to_vec()
+    }
+
     /// Visits row IDs that contain all of the given key-value pairs.
     /// Return `false` from the visitor to stop early.
     pub fn visit_by_key_values_all<F>(&self, pairs: &[(&str, &str)], mut visitor: F)
@@ -268,6 +282,19 @@ impl GinIndex {
         F: FnMut(RowId) -> bool,
     {
         for row_id in self.get_by_key_values_all(pairs) {
+            if !visitor(row_id) {
+                break;
+            }
+        }
+    }
+
+    /// Visits row IDs that contain any of the given key-value pairs.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_by_key_values_any<F>(&self, pairs: &[(&str, &str)], mut visitor: F)
+    where
+        F: FnMut(RowId) -> bool,
+    {
+        for row_id in self.get_by_key_values_any(pairs) {
             if !visitor(row_id) {
                 break;
             }
@@ -461,6 +488,26 @@ mod tests {
 
         // Query: status=active (any type)
         let result = gin.get_by_key_values_all(&[("status", "active")]);
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_gin_get_by_key_values_any() {
+        let mut gin = GinIndex::new();
+
+        gin.add_key_value("status".into(), "active".into(), 1);
+        gin.add_key_value("type".into(), "user".into(), 1);
+
+        gin.add_key_value("status".into(), "active".into(), 2);
+        gin.add_key_value("type".into(), "admin".into(), 2);
+
+        gin.add_key_value("status".into(), "inactive".into(), 3);
+        gin.add_key_value("type".into(), "user".into(), 3);
+
+        let result = gin.get_by_key_values_any(&[("status", "active"), ("type", "user")]);
+        assert_eq!(result, vec![1, 2, 3]);
+
+        let result = gin.get_by_key_values_any(&[("status", "active")]);
         assert_eq!(result, vec![1, 2]);
     }
 

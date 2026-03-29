@@ -569,6 +569,7 @@ mod tests {
                 table: "documents".into(),
                 index: "idx_metadata".into(),
                 pairs: alloc::vec![("category".into(), "tech".into())],
+                match_all: true,
                 recheck: Some(recheck.clone()),
             }),
             order_by: alloc::vec![(Expr::column("documents", "updated_at", 2), SortOrder::Desc)],

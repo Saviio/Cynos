@@ -50,6 +50,15 @@ export const SCENARIOS = {
     description:
       'Same query shape as the interactive feed, but with a much larger snapshot to surface worker→host structured-clone costs.',
   },
+  issue_stream_all: {
+    id: 'issue_stream_all',
+    label: 'Issue Feed · 7-way left join · no order/limit',
+    limit: null,
+    root: 'issues',
+    updateSource: 'projects',
+    description:
+      'Control scenario for pure incremental join/filter maintenance: same issue-centric multi-join shape, but with ORDER BY / LIMIT removed so both engines can stay on a non-blocking live path.',
+  },
   project_board_2000: {
     id: 'project_board_2000',
     label: 'Project Board · 6-way left join · limit 2000',
@@ -58,6 +67,15 @@ export const SCENARIOS = {
     updateSource: 'projects',
     description:
       'Project-centric board shaped around project patches, nested metadata, and one-to-one rollup tables to emulate Linear-like project views.',
+  },
+  project_board_stream_all: {
+    id: 'project_board_stream_all',
+    label: 'Project Board · 6-way left join · no order/limit',
+    limit: null,
+    root: 'projects',
+    updateSource: 'projects',
+    description:
+      'Control scenario for pure incremental maintenance on the project board join graph, with the same left joins and predicates but no blocking operators.',
   },
 }
 

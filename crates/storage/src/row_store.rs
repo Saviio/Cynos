@@ -189,6 +189,8 @@ pub trait IndexStore {
     }
     /// Returns all row IDs in the index.
     fn get_all(&self) -> Vec<RowId>;
+    /// Returns the number of distinct keys currently stored in the index.
+    fn distinct_key_count(&self) -> usize;
 }
 
 /// Wrapper for BTreeIndex that implements IndexStore.
@@ -254,6 +256,10 @@ impl BTreeIndexStore {
     {
         self.inner.visit_range(range, reverse, limit, skip, visitor);
     }
+
+    fn distinct_key_count(&self) -> usize {
+        self.inner.distinct_key_count()
+    }
 }
 
 impl IndexStore for BTreeIndexStore {
@@ -314,6 +320,10 @@ impl IndexStore for BTreeIndexStore {
 
     fn get_all(&self) -> Vec<RowId> {
         self.get_range_index_keys(None, false, None, 0)
+    }
+
+    fn distinct_key_count(&self) -> usize {
+        self.inner.distinct_key_count()
     }
 
     fn visit_range<F>(
@@ -398,6 +408,10 @@ impl HashIndexStore {
             }
         }
     }
+
+    fn distinct_key_count(&self) -> usize {
+        self.inner.distinct_key_count()
+    }
 }
 
 impl IndexStore for HashIndexStore {
@@ -456,6 +470,10 @@ impl IndexStore for HashIndexStore {
 
     fn get_all(&self) -> Vec<RowId> {
         self.inner.get_all_row_ids()
+    }
+
+    fn distinct_key_count(&self) -> usize {
+        self.inner.distinct_key_count()
     }
 
     fn visit_range<F>(
@@ -532,6 +550,13 @@ impl SecondaryIndexStore {
         match self {
             Self::BTree(index) => index.clear(),
             Self::Hash(index) => index.clear(),
+        }
+    }
+
+    fn distinct_key_count(&self) -> usize {
+        match self {
+            Self::BTree(index) => index.distinct_key_count(),
+            Self::Hash(index) => index.distinct_key_count(),
         }
     }
 
@@ -654,6 +679,36 @@ impl RowStore {
         &self.schema
     }
 
+    /// Returns the number of distinct primary-key values, if this table has a primary key.
+    pub fn primary_index_distinct_key_count(&self) -> Option<usize> {
+        self.primary_index
+            .as_ref()
+            .map(BTreeIndexStore::distinct_key_count)
+    }
+
+    /// Returns the number of distinct keys tracked by the named secondary index.
+    pub fn secondary_index_distinct_key_count(&self, index_name: &str) -> Option<usize> {
+        self.secondary_indices
+            .get(index_name)
+            .map(SecondaryIndexStore::distinct_key_count)
+    }
+
+    /// Returns the posting-list size for a GIN key lookup.
+    pub fn gin_index_cost_key(&self, index_name: &str, key: &str) -> usize {
+        self.gin_indices
+            .get(index_name)
+            .map(|gin| gin.cost_key(key))
+            .unwrap_or(0)
+    }
+
+    /// Returns the posting-list size for a GIN key/value lookup.
+    pub fn gin_index_cost_key_value(&self, index_name: &str, key: &str, value: &str) -> usize {
+        self.gin_indices
+            .get(index_name)
+            .map(|gin| gin.cost_key_value(key, value))
+            .unwrap_or(0)
+    }
+
     /// Returns the number of rows.
     pub fn len(&self) -> usize {
         self.rows.len()
@@ -728,6 +783,123 @@ impl RowStore {
         }
 
         Some(removed_slot.row)
+    }
+
+    /// Bulk loads rows into an empty store without per-row slot/index interleaving.
+    ///
+    /// This is intended for initial hydration paths where the table is known to be
+    /// empty and no live-query notifications should be emitted between rows.
+    pub fn bulk_load(&mut self, rows: Vec<Row>) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        if !self.is_empty() {
+            return Err(Error::invalid_operation(
+                "Bulk load requires an empty table store",
+            ));
+        }
+
+        debug_assert!(rows
+            .windows(2)
+            .all(|window| window[0].id() <= window[1].id()));
+
+        let secondary_defs: Vec<(String, Vec<usize>)> = self
+            .index_columns
+            .iter()
+            .map(|(name, cols)| (name.clone(), cols.clone()))
+            .collect();
+        let gin_defs: Vec<(String, GinIndexConfig)> = self
+            .gin_index_configs
+            .iter()
+            .map(|(name, config)| (name.clone(), config.clone()))
+            .collect();
+
+        for row in &rows {
+            let row_id = row.id();
+            if self
+                .row_id_index
+                .add(Value::Int64(row_id as i64), row_id)
+                .is_err()
+            {
+                self.clear();
+                return Err(Error::invalid_operation(
+                    "Failed to add to row ID index during bulk load",
+                ));
+            }
+        }
+
+        if let Some(ref mut pk_index) = self.primary_index {
+            let mut violation = None;
+            for row in &rows {
+                let pk = extract_key(row, &self.pk_columns);
+                if pk_index.add_index_key(pk.clone(), row.id()).is_err() {
+                    violation = Some(Error::UniqueConstraint {
+                        column: "primary_key".into(),
+                        value: pk.to_error_value(),
+                    });
+                    break;
+                }
+            }
+            if let Some(error) = violation {
+                self.clear();
+                return Err(error);
+            }
+        }
+
+        for (idx_name, cols) in &secondary_defs {
+            let mut violation = None;
+            {
+                let Some(idx) = self.secondary_indices.get_mut(idx_name) else {
+                    continue;
+                };
+                for row in &rows {
+                    let key = extract_key(row, cols);
+                    if idx.add_index_key(key.clone(), row.id()).is_err() {
+                        violation = Some(Error::UniqueConstraint {
+                            column: idx_name.clone(),
+                            value: key.to_error_value(),
+                        });
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = violation {
+                self.clear();
+                return Err(error);
+            }
+        }
+
+        for (idx_name, config) in &gin_defs {
+            let Some(gin_idx) = self.gin_indices.get_mut(idx_name) else {
+                continue;
+            };
+            for row in &rows {
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::index_jsonb_value(
+                        gin_idx,
+                        value,
+                        row.id(),
+                        config.indexed_paths.as_deref(),
+                    );
+                }
+            }
+        }
+
+        self.row_slots.reserve(rows.len());
+        self.scan_order.reserve(rows.len());
+
+        for (slot_idx, row) in rows.into_iter().enumerate() {
+            let row_id = row.id();
+            self.rows.insert(row_id, slot_idx);
+            self.row_slots.push(RowSlot {
+                row_id,
+                row: Rc::new(row),
+            });
+            self.scan_order.push(slot_idx);
+        }
+
+        Ok(self.row_slots.len())
     }
 
     /// Inserts a row into the store.
@@ -1101,6 +1273,57 @@ impl RowStore {
         }
     }
 
+    /// Visits rows identified by a row-id subset in the same deterministic order as table scans.
+    /// Missing row ids are skipped.
+    pub fn visit_rows_by_ids<F>(&self, row_ids: &[RowId], mut visitor: F)
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        for &row_id in row_ids {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                continue;
+            };
+            if !visitor(row) {
+                break;
+            }
+        }
+    }
+
+    /// Visits rows identified by an arbitrary row-id iterator.
+    /// Missing row ids are skipped and iteration order follows the provided iterator.
+    pub fn visit_rows_by_iter<I, F>(&self, row_ids: I, mut visitor: F)
+    where
+        I: IntoIterator<Item = RowId>,
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        for row_id in row_ids {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                continue;
+            };
+            if !visitor(row) {
+                break;
+            }
+        }
+    }
+
+    /// Returns rows identified by a row-id subset in scan order.
+    pub fn get_rows_by_ids(&self, row_ids: &[RowId]) -> Vec<Rc<Row>> {
+        let mut rows = Vec::with_capacity(row_ids.len().min(self.len()));
+        self.visit_rows_by_ids(row_ids, |row| {
+            rows.push(row.clone());
+            true
+        });
+        rows
+    }
+
+    /// Counts how many row ids in a subset still exist in the store.
+    pub fn count_existing_rows_by_ids(&self, row_ids: &[RowId]) -> usize {
+        row_ids
+            .iter()
+            .filter(|row_id| self.rows.contains_key(row_id))
+            .count()
+    }
+
     /// Returns all row IDs.
     pub fn row_ids(&self) -> Vec<RowId> {
         self.scan_order
@@ -1130,6 +1353,36 @@ impl RowStore {
         } else {
             Vec::new()
         }
+    }
+
+    /// Visits row ids matching the provided primary-key components.
+    pub fn visit_row_ids_by_pk_values<F>(&self, pk_values: &[Value], mut visitor: F)
+    where
+        F: FnMut(RowId) -> bool,
+    {
+        if pk_values.len() != self.pk_columns.len() {
+            return;
+        }
+
+        let Some(ref pk_index) = self.primary_index else {
+            return;
+        };
+        let pk_key = extract_key_from_values(pk_values);
+        for row_id in pk_index.get_index_key(&pk_key) {
+            if !visitor(row_id) {
+                break;
+            }
+        }
+    }
+
+    /// Finds the first row id matching the provided primary-key components.
+    pub fn find_row_id_by_pk_values(&self, pk_values: &[Value]) -> Option<RowId> {
+        let mut found = None;
+        self.visit_row_ids_by_pk_values(pk_values, |row_id| {
+            found = Some(row_id);
+            false
+        });
+        found
     }
 
     /// Finds existing row ID by primary key.
@@ -1250,6 +1503,109 @@ impl RowStore {
         }
     }
 
+    /// Visits row ids from a single-column index equality scan without materializing rows.
+    pub fn visit_index_row_ids_by_value<F>(&self, index_name: &str, value: &Value, visitor: F)
+    where
+        F: FnMut(RowId) -> bool,
+    {
+        let Some(idx) = self.secondary_indices.get(index_name) else {
+            return;
+        };
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return;
+        };
+        if columns.len() != 1 {
+            return;
+        }
+
+        let range = IndexKey::from_scalar_range(Some(&KeyRange::only(value.clone())));
+        idx.visit_range_index_keys(range.as_ref(), false, None, 0, visitor);
+    }
+
+    /// Returns whether a row matches the scalar key range for a single-column index.
+    pub fn row_matches_index_range(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Value>>,
+        row: &Row,
+    ) -> bool {
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return false;
+        };
+        if columns.len() != 1 {
+            return false;
+        }
+
+        let key = row.get(columns[0]).cloned().unwrap_or(Value::Null);
+        range.map_or(true, |range| range.contains(&key))
+    }
+
+    /// Visits rows from an index scan restricted to a row-id subset.
+    /// `subset_driven=true` iterates the subset directly; otherwise it intersects an index scan.
+    pub fn visit_index_scan_with_options_restricted<F>(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Value>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let mut skipped = 0usize;
+        let mut emitted = 0usize;
+        let mut visit_matched = |row: &Rc<Row>| {
+            if skipped < offset {
+                skipped += 1;
+                return true;
+            }
+            if let Some(limit) = limit {
+                if emitted >= limit {
+                    return false;
+                }
+            }
+            emitted += 1;
+            visitor(row)
+        };
+
+        if subset_driven {
+            let mut visit_subset_row_id = |row_id: RowId| {
+                let Some(row) = self.row_ref_by_id(row_id) else {
+                    return true;
+                };
+                if !self.row_matches_index_range(index_name, range, row) {
+                    return true;
+                }
+                visit_matched(row)
+            };
+
+            if reverse {
+                for &row_id in allowed_row_ids.iter().rev() {
+                    if !visit_subset_row_id(row_id) {
+                        break;
+                    }
+                }
+            } else {
+                for &row_id in allowed_row_ids {
+                    if !visit_subset_row_id(row_id) {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        self.visit_index_scan_with_options(index_name, range, None, 0, reverse, |row| {
+            if allowed_row_ids.binary_search(&row.id()).is_err() {
+                return true;
+            }
+            visit_matched(row)
+        });
+    }
+
     /// Gets rows by composite index scan.
     /// Use this for multi-column indexes where the bounds are real tuple keys.
     pub fn index_scan_composite(
@@ -1346,6 +1702,93 @@ impl RowStore {
                 visitor(row)
             },
         );
+    }
+
+    /// Returns whether a row matches the tuple key range for a composite index.
+    pub fn row_matches_index_composite_range(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        row: &Row,
+    ) -> bool {
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return false;
+        };
+        if columns.len() <= 1 {
+            return false;
+        }
+
+        let key: Vec<Value> = columns
+            .iter()
+            .map(|&column_index| row.get(column_index).cloned().unwrap_or(Value::Null))
+            .collect();
+        range.map_or(true, |range| range.contains(&key))
+    }
+
+    /// Visits rows from a composite index scan restricted to a row-id subset.
+    /// `subset_driven=true` iterates the subset directly; otherwise it intersects an index scan.
+    pub fn visit_index_scan_composite_with_options_restricted<F>(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let mut skipped = 0usize;
+        let mut emitted = 0usize;
+        let mut visit_matched = |row: &Rc<Row>| {
+            if skipped < offset {
+                skipped += 1;
+                return true;
+            }
+            if let Some(limit) = limit {
+                if emitted >= limit {
+                    return false;
+                }
+            }
+            emitted += 1;
+            visitor(row)
+        };
+
+        if subset_driven {
+            let mut visit_subset_row_id = |row_id: RowId| {
+                let Some(row) = self.row_ref_by_id(row_id) else {
+                    return true;
+                };
+                if !self.row_matches_index_composite_range(index_name, range, row) {
+                    return true;
+                }
+                visit_matched(row)
+            };
+
+            if reverse {
+                for &row_id in allowed_row_ids.iter().rev() {
+                    if !visit_subset_row_id(row_id) {
+                        break;
+                    }
+                }
+            } else {
+                for &row_id in allowed_row_ids {
+                    if !visit_subset_row_id(row_id) {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        self.visit_index_scan_composite_with_options(index_name, range, None, 0, reverse, |row| {
+            if allowed_row_ids.binary_search(&row.id()).is_err() {
+                return true;
+            }
+            visit_matched(row)
+        });
     }
 
     /// Clears all rows and indices.
@@ -1781,6 +2224,104 @@ impl RowStore {
         });
     }
 
+    /// Returns whether a row contains the indexed JSON path.
+    pub fn row_matches_gin_key(&self, index_name: &str, row: &Row, key: &str) -> bool {
+        self.row_gin_path_value(index_name, row, key).is_some()
+    }
+
+    /// Returns whether a row contains the indexed JSON path with the expected scalar value.
+    pub fn row_matches_gin_key_value(
+        &self,
+        index_name: &str,
+        row: &Row,
+        key: &str,
+        value: &str,
+    ) -> bool {
+        self.row_contains_gin_token_pair(index_name, row, key, value)
+    }
+
+    /// Returns whether a row satisfies a multi-key GIN predicate.
+    pub fn row_matches_gin_key_values(
+        &self,
+        index_name: &str,
+        row: &Row,
+        pairs: &[(&str, &str)],
+        match_all: bool,
+    ) -> bool {
+        if match_all {
+            pairs
+                .iter()
+                .all(|(key, value)| self.row_matches_gin_key_value(index_name, row, key, value))
+        } else {
+            pairs
+                .iter()
+                .any(|(key, value)| self.row_matches_gin_key_value(index_name, row, key, value))
+        }
+    }
+
+    /// Visits rows matching a GIN key-value query restricted to a row-id subset.
+    pub fn visit_gin_index_by_key_value_restricted<F>(
+        &self,
+        index_name: &str,
+        key: &str,
+        value: &str,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        if subset_driven {
+            self.visit_rows_by_ids(allowed_row_ids, |row| {
+                if self.row_matches_gin_key_value(index_name, row, key, value) {
+                    visitor(row)
+                } else {
+                    true
+                }
+            });
+            return;
+        }
+
+        self.visit_gin_index_by_key_value(index_name, key, value, |row| {
+            if allowed_row_ids.binary_search(&row.id()).is_ok() {
+                visitor(row)
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Visits rows matching a GIN key-existence query restricted to a row-id subset.
+    pub fn visit_gin_index_by_key_restricted<F>(
+        &self,
+        index_name: &str,
+        key: &str,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        if subset_driven {
+            self.visit_rows_by_ids(allowed_row_ids, |row| {
+                if self.row_matches_gin_key(index_name, row, key) {
+                    visitor(row)
+                } else {
+                    true
+                }
+            });
+            return;
+        }
+
+        self.visit_gin_index_by_key(index_name, key, |row| {
+            if allowed_row_ids.binary_search(&row.id()).is_ok() {
+                visitor(row)
+            } else {
+                true
+            }
+        });
+    }
+
     /// Queries the GIN index by multiple key-value pairs (AND query).
     /// Returns rows that match ALL of the given key-value pairs.
     pub fn gin_index_get_by_key_values_all(
@@ -1790,6 +2331,24 @@ impl RowStore {
     ) -> Vec<Rc<Row>> {
         if let Some(gin_idx) = self.gin_indices.get(index_name) {
             let row_ids = gin_idx.get_by_key_values_all(pairs);
+            row_ids
+                .iter()
+                .filter_map(|&id| self.row_ref_by_id(id).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Queries the GIN index by multiple key-value pairs (OR query).
+    /// Returns rows that match ANY of the given key-value pairs.
+    pub fn gin_index_get_by_key_values_any(
+        &self,
+        index_name: &str,
+        pairs: &[(&str, &str)],
+    ) -> Vec<Rc<Row>> {
+        if let Some(gin_idx) = self.gin_indices.get(index_name) {
+            let row_ids = gin_idx.get_by_key_values_any(pairs);
             row_ids
                 .iter()
                 .filter_map(|&id| self.row_ref_by_id(id).cloned())
@@ -1821,6 +2380,66 @@ impl RowStore {
         });
     }
 
+    /// Visits rows matching any GIN key-value pairs without materializing the full row set.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_gin_index_by_key_values_any<F>(
+        &self,
+        index_name: &str,
+        pairs: &[(&str, &str)],
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let Some(gin_idx) = self.gin_indices.get(index_name) else {
+            return;
+        };
+
+        gin_idx.visit_by_key_values_any(pairs, |row_id| {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                return true;
+            };
+            visitor(row)
+        });
+    }
+
+    /// Visits rows matching a multi-predicate GIN query restricted to a row-id subset.
+    pub fn visit_gin_index_by_key_values_restricted<F>(
+        &self,
+        index_name: &str,
+        pairs: &[(&str, &str)],
+        match_all: bool,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        if subset_driven {
+            self.visit_rows_by_ids(allowed_row_ids, |row| {
+                if self.row_matches_gin_key_values(index_name, row, pairs, match_all) {
+                    visitor(row)
+                } else {
+                    true
+                }
+            });
+            return;
+        }
+
+        let mut visit_intersected = |row: &Rc<Row>| {
+            if allowed_row_ids.binary_search(&row.id()).is_ok() {
+                visitor(row)
+            } else {
+                true
+            }
+        };
+
+        if match_all {
+            self.visit_gin_index_by_key_values_all(index_name, pairs, |row| visit_intersected(row));
+        } else {
+            self.visit_gin_index_by_key_values_any(index_name, pairs, |row| visit_intersected(row));
+        }
+    }
+
     /// Returns the raw row IDs from the GIN index for a given key.
     /// This is useful for testing to detect ghost entries (entries that point to deleted rows).
     #[cfg(test)]
@@ -1847,6 +2466,176 @@ impl RowStore {
             Vec::new()
         }
     }
+
+    fn row_gin_path_value(
+        &self,
+        index_name: &str,
+        row: &Row,
+        key: &str,
+    ) -> Option<ParsedJsonbValue> {
+        let config = self.gin_index_configs.get(index_name)?;
+        let value = row.get(config.column_idx)?;
+        let parsed = Self::parse_jsonb_value(value)?;
+        Self::jsonb_value_at_encoded_gin_path(&parsed, key).cloned()
+    }
+
+    fn row_contains_gin_token_pair(
+        &self,
+        index_name: &str,
+        row: &Row,
+        key: &str,
+        value: &str,
+    ) -> bool {
+        let Some(config) = self.gin_index_configs.get(index_name) else {
+            return false;
+        };
+        let Some(row_value) = row.get(config.column_idx) else {
+            return false;
+        };
+        let Some(parsed) = Self::parse_jsonb_value(row_value) else {
+            return false;
+        };
+
+        let mut current_path = String::new();
+        let mut matched = false;
+        Self::visit_jsonb_gin_pairs(
+            &parsed,
+            &mut current_path,
+            config.indexed_paths.as_deref(),
+            &mut |candidate_key, candidate_value| {
+                if candidate_key == key && candidate_value == value {
+                    matched = true;
+                    false
+                } else {
+                    true
+                }
+            },
+        );
+        matched
+    }
+
+    fn jsonb_value_at_encoded_gin_path<'a>(
+        value: &'a ParsedJsonbValue,
+        path: &str,
+    ) -> Option<&'a ParsedJsonbValue> {
+        let segments = decode_gin_path_segments(path);
+        let mut current = value;
+        for segment in segments {
+            current = match current {
+                ParsedJsonbValue::Object(object) => object.get(&segment)?,
+                ParsedJsonbValue::Array(items) => {
+                    let index = segment.parse::<usize>().ok()?;
+                    items.get(index)?
+                }
+                ParsedJsonbValue::Null
+                | ParsedJsonbValue::Bool(_)
+                | ParsedJsonbValue::Number(_)
+                | ParsedJsonbValue::String(_) => return None,
+            };
+        }
+        Some(current)
+    }
+
+    fn visit_jsonb_gin_pairs<F>(
+        value: &ParsedJsonbValue,
+        current_path: &mut String,
+        indexed_paths: Option<&[String]>,
+        visitor: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&str, &str) -> bool,
+    {
+        match value {
+            ParsedJsonbValue::Object(object) => {
+                for (key, child) in object.iter() {
+                    let saved_len = current_path.len();
+                    Self::append_gin_path_segment(current_path, key);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        if let Some(value_str) = Self::jsonb_scalar_to_index_value(child) {
+                            if !visitor(current_path, value_str.as_str()) {
+                                return false;
+                            }
+                        }
+                        for (token_key, gram) in
+                            contains_trigram_pairs(current_path, &child.stringify_for_contains())
+                        {
+                            if !visitor(token_key.as_str(), gram.as_str()) {
+                                return false;
+                            }
+                        }
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path)
+                        && !Self::visit_jsonb_gin_pairs(child, current_path, indexed_paths, visitor)
+                    {
+                        return false;
+                    }
+                    current_path.truncate(saved_len);
+                }
+                true
+            }
+            ParsedJsonbValue::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    let saved_len = current_path.len();
+                    let segment = index.to_string();
+                    Self::append_gin_path_segment(current_path, &segment);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        if let Some(value_str) = Self::jsonb_scalar_to_index_value(child) {
+                            if !visitor(current_path, value_str.as_str()) {
+                                return false;
+                            }
+                        }
+                        for (token_key, gram) in
+                            contains_trigram_pairs(current_path, &child.stringify_for_contains())
+                        {
+                            if !visitor(token_key.as_str(), gram.as_str()) {
+                                return false;
+                            }
+                        }
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path)
+                        && !Self::visit_jsonb_gin_pairs(child, current_path, indexed_paths, visitor)
+                    {
+                        return false;
+                    }
+                    current_path.truncate(saved_len);
+                }
+                true
+            }
+            ParsedJsonbValue::Null
+            | ParsedJsonbValue::Bool(_)
+            | ParsedJsonbValue::Number(_)
+            | ParsedJsonbValue::String(_) => true,
+        }
+    }
+}
+
+fn decode_gin_path_segments(path: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = path.chars();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let Some(escaped) = chars.next() else {
+                    current.push('\\');
+                    break;
+                };
+                match escaped {
+                    '0' if current.is_empty() => {}
+                    other => current.push(other),
+                }
+            }
+            '.' => {
+                segments.push(current);
+                current = String::new();
+            }
+            other => current.push(other),
+        }
+    }
+
+    segments.push(current);
+    segments
 }
 
 fn parse_json_text(s: &str) -> Option<ParsedJsonbValue> {
@@ -2119,6 +2908,46 @@ mod tests {
     }
 
     #[test]
+    fn test_row_store_bulk_load_builds_scan_and_secondary_indexes() {
+        let mut store = RowStore::new(test_schema_with_index());
+        let rows = vec![
+            Row::new(10, vec![Value::Int64(1), Value::Int64(100)]),
+            Row::new(11, vec![Value::Int64(2), Value::Int64(200)]),
+            Row::new(12, vec![Value::Int64(3), Value::Int64(100)]),
+        ];
+
+        let loaded = store.bulk_load(rows).unwrap();
+        assert_eq!(loaded, 3);
+        assert_eq!(store.len(), 3);
+
+        let scan_ids: Vec<_> = store.scan().map(|row| row.id()).collect();
+        assert_eq!(scan_ids, vec![10, 11, 12]);
+
+        let pk_rows = store.get_by_pk(&Value::Int64(2));
+        assert_eq!(pk_rows.len(), 1);
+        assert_eq!(pk_rows[0].id(), 11);
+
+        let indexed = store.index_scan("idx_value", Some(&KeyRange::only(Value::Int64(100))));
+        assert_eq!(
+            indexed.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![10, 12]
+        );
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_rejects_duplicate_keys_without_leaking_state() {
+        let mut store = RowStore::new(test_schema());
+        let rows = vec![
+            Row::new(10, vec![Value::Int64(1), Value::String("Alice".into())]),
+            Row::new(11, vec![Value::Int64(1), Value::String("Bob".into())]),
+        ];
+
+        assert!(store.bulk_load(rows).is_err());
+        assert!(store.is_empty());
+        assert!(store.scan().next().is_none());
+    }
+
+    #[test]
     fn test_row_store_scan() {
         let mut store = RowStore::new(test_schema());
         store
@@ -2218,6 +3047,37 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id(), 2);
         assert_eq!(results[1].id(), 3);
+    }
+
+    #[test]
+    fn test_restricted_index_scan_subset_driven_reverse_preserves_subset_order() {
+        let mut store = RowStore::new(test_schema_with_index());
+        store
+            .insert(Row::new(1, vec![Value::Int64(1), Value::Int64(100)]))
+            .unwrap();
+        store
+            .insert(Row::new(2, vec![Value::Int64(2), Value::Int64(200)]))
+            .unwrap();
+        store
+            .insert(Row::new(3, vec![Value::Int64(3), Value::Int64(300)]))
+            .unwrap();
+
+        let mut row_ids = Vec::new();
+        store.visit_index_scan_with_options_restricted(
+            "idx_value",
+            None,
+            None,
+            0,
+            true,
+            &[1, 3],
+            true,
+            |row| {
+                row_ids.push(row.id());
+                true
+            },
+        );
+
+        assert_eq!(row_ids, vec![3, 1]);
     }
 
     #[test]
@@ -2988,6 +3848,39 @@ mod tests {
     }
 
     #[test]
+    fn test_gin_index_bulk_load_and_query() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+        let rows = vec![
+            Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"name":"Alice","status":"active"}"#),
+                ],
+            ),
+            Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    make_jsonb(r#"{"name":"Bob","status":"inactive"}"#),
+                ],
+            ),
+        ];
+
+        store.bulk_load(rows).unwrap();
+
+        assert_eq!(store.gin_index_get_by_key("idx_data_gin", "name").len(), 2);
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "status", "active")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn test_gin_index_visit_stops_early() {
         let mut store = RowStore::new(test_schema_with_gin_index());
         for row_id in 1..=5 {
@@ -3009,6 +3902,54 @@ mod tests {
         });
 
         assert_eq!(visited, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_gin_index_query_any_key_values() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"status":"active","type":"user"}"#),
+                ],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    make_jsonb(r#"{"status":"active","type":"admin"}"#),
+                ],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                3,
+                vec![
+                    Value::Int64(3),
+                    make_jsonb(r#"{"status":"inactive","type":"user"}"#),
+                ],
+            ))
+            .unwrap();
+
+        let any_results =
+            store.gin_index_get_by_key_values_any("idx_data_gin", &[("status", "active")]);
+        assert_eq!(
+            any_results.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let any_results = store.gin_index_get_by_key_values_any(
+            "idx_data_gin",
+            &[("status", "active"), ("type", "user")],
+        );
+        assert_eq!(
+            any_results.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]

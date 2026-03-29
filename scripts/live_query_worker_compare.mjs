@@ -4,6 +4,7 @@ import path from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { Worker } from 'node:worker_threads'
 import { fileURLToPath } from 'node:url'
+import { ResultSet } from '../js/packages/core/dist/index.js'
 import {
   API_REFRESH_COUNT,
   DATASET_CONFIG,
@@ -20,6 +21,7 @@ import {
   median,
   nowIso,
 } from './tanstack_db_benchmark_shared.mjs'
+import { materializeResultSetForScenario } from './cynos_benchmark_row_shape.mjs'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const ROOT_DIR = path.resolve(SCRIPT_DIR, '..')
@@ -27,6 +29,9 @@ const TMP_DIR = path.join(ROOT_DIR, 'tmp')
 const REPORT_PATH = path.join(TMP_DIR, 'live_query_worker_compare.md')
 const JSON_REPORT_PATH = path.join(TMP_DIR, 'live_query_worker_compare.json')
 const COMPARE_TIMEOUT_MS = Math.max(MESSAGE_TIMEOUT_MS, 120_000)
+const INCLUDE_ROWS = process.env.LIVE_QUERY_INCLUDE_ROWS !== '0'
+const SCENARIO_VARIANT = parseScenarioVariant()
+const ACTIVE_SCENARIO_ORDER = scenarioOrderForVariant(SCENARIO_VARIANT)
 
 const ENGINE_DEFS = {
   tanstack: {
@@ -54,12 +59,76 @@ const ENGINE_DEFS = {
     id: 'cynos-query',
     label: 'Cynos (Query Builder)',
     workerUrl: new URL('./cynos_worker_runtime.mjs', import.meta.url),
+    initMessage: {
+      queryMode: 'changes',
+    },
+    expectsMutationProfiles: true,
     notes: [
       'Worker initializes local Cynos WASM tables directly from the same synthetic server dataset.',
       'Socket patches and API refreshes are batched in a single transaction commit to mirror burst delivery.',
       'This is the low-level query-builder path using direct `changes()` subscriptions over explicit joins.',
     ],
   },
+  'cynos-query-binary': {
+    id: 'cynos-query-binary',
+    label: 'Cynos (Query Builder + binary)',
+    workerUrl: new URL('./cynos_worker_runtime.mjs', import.meta.url),
+    initMessage: {
+      queryMode: 'changes',
+      outputMode: 'binary',
+    },
+    expectsMutationProfiles: true,
+    notes: [
+      'Worker initializes local Cynos WASM tables directly from the same synthetic server dataset.',
+      'Query-builder subscriptions use `changes().subscribeBinary()` and transfer a standalone `Uint8Array` back to the host.',
+      'The benchmark host decodes `ResultSet` bytes and attempts to remap them into the same scenario row shapes as object mode, so host timings include real decode/materialization work.',
+      'Current multi-join `changes()` binary layouts are still provisional: the decoded snapshots do not yet match object-mode rows exactly, so treat these timings as transport-focused / pre-fix numbers rather than final correctness-validated results.',
+    ],
+  },
+  'cynos-trace': {
+    id: 'cynos-trace',
+    label: 'Cynos (trace)',
+    workerUrl: new URL('./cynos_worker_runtime.mjs', import.meta.url),
+    initMessage: {
+      queryMode: 'trace',
+    },
+    expectsMutationProfiles: true,
+    notes: [
+      'Worker initializes local Cynos WASM tables directly from the same synthetic server dataset.',
+      'The underlying query is compiled through query-builder `trace()` with no JS-side emulation of ORDER BY / LIMIT or top-N semantics.',
+      'Use the dedicated no-order/no-limit control scenarios for apples-to-apples comparisons of pure incremental join/filter maintenance against TanStack.',
+    ],
+  },
+}
+
+function parseScenarioVariant() {
+  const raw = String(process.env.LIVE_QUERY_BENCH_SCENARIO_VARIANT ?? '')
+    .trim()
+    .toLowerCase()
+
+  if (!raw || raw === 'default') {
+    return 'default'
+  }
+
+  if (raw === 'trace_aligned') {
+    return 'trace_aligned'
+  }
+
+  if (raw === 'trace_capability_aligned') {
+    return 'trace_capability_aligned'
+  }
+
+  throw new Error(
+    `Unknown LIVE_QUERY_BENCH_SCENARIO_VARIANT "${raw}". Expected "default", "trace_aligned", or "trace_capability_aligned".`,
+  )
+}
+
+function scenarioOrderForVariant(scenarioVariant) {
+  if (scenarioVariant === 'trace_capability_aligned') {
+    return ['issue_stream_all', 'project_board_stream_all']
+  }
+
+  return SCENARIO_ORDER
 }
 
 function parseEngines() {
@@ -90,6 +159,32 @@ function createDeferred() {
 function payloadBytes(rows) {
   if (!rows) return 0
   return Buffer.byteLength(JSON.stringify(rows), 'utf8')
+}
+
+function materializeSnapshotRows(message) {
+  if (message.payloadKind !== 'binary') {
+    return message.rows
+  }
+
+  if (!message.binaryBytes || !message.layout) {
+    return undefined
+  }
+
+  const resultSet = new ResultSet(message.binaryBytes, message.layout)
+  const rows = materializeResultSetForScenario(
+    message.scenarioId,
+    resultSet,
+  )
+  resultSet.free()
+  return rows
+}
+
+function snapshotPayloadBytes(message) {
+  if (message.payloadKind === 'binary') {
+    return message.binaryByteLength ?? 0
+  }
+
+  return payloadBytes(message.rows)
 }
 
 class BenchmarkWorkerClient {
@@ -171,15 +266,16 @@ async function ensureTmpDir() {
   }
 }
 
-async function runRound(client, scenarioId) {
+async function runRound(client, scenarioId, engineDef) {
   const initialSentAt = performance.now()
-  client.post({ type: 'subscribe', scenarioId, includeRows: true })
+  client.post({ type: 'subscribe', scenarioId, includeRows: INCLUDE_ROWS })
   const initial = await client.waitFor(
     (message) =>
       message.type === 'snapshot' &&
       message.scenarioId === scenarioId &&
       message.phase === 'initial',
   )
+  materializeSnapshotRows(initial)
   const initialHostMs = performance.now() - initialSentAt
 
   const socketSentAt = performance.now()
@@ -194,7 +290,11 @@ async function runRound(client, scenarioId) {
       message.scenarioId === scenarioId &&
       message.phase === 'socket',
   )
+  materializeSnapshotRows(socket)
   const socketHostMs = performance.now() - socketSentAt
+  const socketMutationProfile = engineDef.expectsMutationProfiles
+    ? await maybeWaitForMutationProfile(client, scenarioId, 'socket')
+    : null
 
   const apiSentAt = performance.now()
   client.post({
@@ -208,7 +308,11 @@ async function runRound(client, scenarioId) {
       message.scenarioId === scenarioId &&
       message.phase === 'api',
   )
+  materializeSnapshotRows(api)
   const apiHostMs = performance.now() - apiSentAt
+  const apiMutationProfile = engineDef.expectsMutationProfiles
+    ? await maybeWaitForMutationProfile(client, scenarioId, 'api')
+    : null
 
   client.post({ type: 'unsubscribe', scenarioId })
   await client.waitFor(
@@ -222,22 +326,42 @@ async function runRound(client, scenarioId) {
       hostMs: initialHostMs,
       rowCount: initial.rowCount,
       changeCount: initial.changeCount,
-      bytes: payloadBytes(initial.rows),
+      bytes: snapshotPayloadBytes(initial),
+      phaseProfile: initial.phaseProfile ?? null,
     },
     socket: {
       workerMs: socket.workerLatencyMs,
       hostMs: socketHostMs,
       rowCount: socket.rowCount,
       changeCount: socket.changeCount,
-      bytes: payloadBytes(socket.rows),
+      bytes: snapshotPayloadBytes(socket),
+      phaseProfile: socket.phaseProfile ?? null,
+      mutationProfile: socketMutationProfile,
     },
     api: {
       workerMs: api.workerLatencyMs,
       hostMs: apiHostMs,
       rowCount: api.rowCount,
       changeCount: api.changeCount,
-      bytes: payloadBytes(api.rows),
+      bytes: snapshotPayloadBytes(api),
+      phaseProfile: api.phaseProfile ?? null,
+      mutationProfile: apiMutationProfile,
     },
+  }
+}
+
+async function maybeWaitForMutationProfile(client, scenarioId, phase) {
+  try {
+    const message = await client.waitFor(
+      (candidate) =>
+        candidate.type === 'mutation-profile' &&
+        candidate.scenarioId === scenarioId &&
+        candidate.phase === phase,
+      1_000,
+    )
+    return message.mutationProfile ?? null
+  } catch {
+    return null
   }
 }
 
@@ -281,8 +405,17 @@ function buildMarkdownReport({ engineOrder, engineResults }) {
   lines.push(`- Engines: ${engineOrder.map((engineId) => ENGINE_DEFS[engineId].label).join(', ')}`)
   lines.push(`- Warmup rounds: ${WARMUP_ROUNDS}`)
   lines.push(`- Measured rounds: ${MEASURED_ROUNDS}`)
+  lines.push(`- Scenario variant: ${SCENARIO_VARIANT}`)
+  if (SCENARIO_VARIANT === 'trace_capability_aligned') {
+    lines.push(
+      '- Trace capability alignment: benchmark runs only non-blocking scenarios, and TanStack disables ORDER BY / LIMIT to match Cynos trace semantics.',
+    )
+  }
   lines.push(`- Socket patch count per round: ${SOCKET_PATCH_COUNT}`)
   lines.push(`- API refresh count per round: ${API_REFRESH_COUNT}`)
+  lines.push(
+    `- Host row payloads: ${INCLUDE_ROWS ? 'enabled (full snapshot rows are structured-cloned back to host)' : 'disabled (worker returns counts only)'}`,
+  )
   lines.push('')
   lines.push('## Results')
   lines.push('')
@@ -293,7 +426,7 @@ function buildMarkdownReport({ engineOrder, engineResults }) {
     '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   )
 
-  for (const scenarioId of SCENARIO_ORDER) {
+  for (const scenarioId of ACTIVE_SCENARIO_ORDER) {
     const scenario = SCENARIOS[scenarioId]
     for (const engineId of engineOrder) {
       const engineSummary = engineResults[engineId]
@@ -327,7 +460,7 @@ function buildMarkdownReport({ engineOrder, engineResults }) {
 
   lines.push('## Scenario Details')
   lines.push('')
-  for (const scenarioId of SCENARIO_ORDER) {
+  for (const scenarioId of ACTIVE_SCENARIO_ORDER) {
     const scenario = SCENARIOS[scenarioId]
     lines.push(`### ${scenario.label}`)
     lines.push('')
@@ -346,6 +479,7 @@ function buildMarkdownReport({ engineOrder, engineResults }) {
 
 async function runEngine(engineId) {
   const initSamples = []
+  const initProfiles = []
   let dataset = null
 
   async function runIsolatedRound(scenarioId) {
@@ -353,12 +487,16 @@ async function runEngine(engineId) {
     const client = new BenchmarkWorkerClient(engineDef.workerUrl)
 
     try {
-      client.post({ type: 'init' })
+      client.post({
+        type: 'init',
+        ...(engineDef.initMessage ?? {}),
+        scenarioVariant: SCENARIO_VARIANT,
+      })
       const readyMessage = await client.waitFor(
         (message) => message.type === 'ready',
         COMPARE_TIMEOUT_MS,
       )
-      const round = await runRound(client, scenarioId)
+      const round = await runRound(client, scenarioId, engineDef)
 
       client.post({ type: 'shutdown' })
       await client.waitFor(
@@ -376,11 +514,12 @@ async function runEngine(engineId) {
   }
 
   const scenarioResults = {}
-  for (const scenarioId of SCENARIO_ORDER) {
+  for (const scenarioId of ACTIVE_SCENARIO_ORDER) {
     const warmupRounds = []
     for (let index = 0; index < WARMUP_ROUNDS; index += 1) {
       const { readyMessage, round } = await runIsolatedRound(scenarioId)
       initSamples.push(readyMessage.initMs)
+      initProfiles.push(readyMessage.initProfile ?? null)
       dataset ??= readyMessage.dataset
       warmupRounds.push(round)
     }
@@ -389,6 +528,7 @@ async function runEngine(engineId) {
     for (let index = 0; index < MEASURED_ROUNDS; index += 1) {
       const { readyMessage, round } = await runIsolatedRound(scenarioId)
       initSamples.push(readyMessage.initMs)
+      initProfiles.push(readyMessage.initProfile ?? null)
       dataset ??= readyMessage.dataset
       measuredRounds.push(round)
     }
@@ -405,6 +545,7 @@ async function runEngine(engineId) {
     initMsMedian: median(initSamples),
     initMsMean: mean(initSamples),
     initSamples: initSamples.length,
+    initProfiles,
     scenarioResults,
   }
 }
@@ -428,6 +569,8 @@ async function main() {
       {
         generatedAt: nowIso(),
         datasetConfig: DATASET_CONFIG,
+        includeRows: INCLUDE_ROWS,
+        scenarioVariant: SCENARIO_VARIANT,
         engineOrder,
         engineResults,
       },

@@ -503,12 +503,17 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
         table: &str,
         index: &str,
         pairs: &[(&str, &str)],
+        match_all: bool,
     ) -> ExecutionResult<Vec<Rc<Row>>> {
         let store = self
             .cache
             .get_table(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
-        Ok(store.gin_index_get_by_key_values_all(index, pairs))
+        Ok(if match_all {
+            store.gin_index_get_by_key_values_all(index, pairs)
+        } else {
+            store.gin_index_get_by_key_values_any(index, pairs)
+        })
     }
 }
 

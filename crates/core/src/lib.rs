@@ -49,8 +49,8 @@ mod value;
 
 pub use error::{Error, Result};
 pub use row::{
-    next_row_id, reserve_row_ids, set_next_row_id, set_next_row_id_if_greater, Row, RowId,
-    DUMMY_ROW_ID,
+    aggregate_group_row_id, join_row_id, left_join_null_row_id, next_row_id, reserve_row_ids,
+    right_join_null_row_id, set_next_row_id, set_next_row_id_if_greater, Row, RowId, DUMMY_ROW_ID,
 };
 pub use types::DataType;
 pub use value::{JsonbValue, Value};

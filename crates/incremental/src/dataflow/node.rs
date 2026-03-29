@@ -5,7 +5,8 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use cynos_core::Row;
+use crate::trace::{TraceTupleArena, TraceTupleHandle};
+use cynos_core::{Row, Value};
 
 /// Type alias for table identifier.
 pub type TableId = u32;
@@ -16,11 +17,43 @@ pub type ColumnId = usize;
 /// Predicate for filtering rows.
 pub type PredicateFn = Box<dyn Fn(&Row) -> bool + Send + Sync>;
 
+/// Handle-aware predicate for trace tuple fast paths.
+pub type TracePredicateFn =
+    Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> bool + Send + Sync>;
+
 /// Mapper function for transforming rows.
 pub type MapperFn = Box<dyn Fn(&Row) -> Row + Send + Sync>;
 
+/// Handle-aware mapper for trace tuple fast paths.
+pub type TraceMapperFn =
+    Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> Row + Send + Sync>;
+
 /// Key extractor function for joins.
-pub type KeyExtractorFn = Box<dyn Fn(&Row) -> Vec<cynos_core::Value> + Send + Sync>;
+pub type KeyExtractorFn = Box<dyn Fn(&Row) -> Vec<Value> + Send + Sync>;
+
+/// Join key extraction strategy.
+///
+/// `Columns` is the fast path used for standard equi-joins compiled from SQL.
+/// `Dynamic` is the fallback for arbitrary key extractors.
+pub enum JoinKeySpec {
+    Columns(Vec<ColumnId>),
+    Constant(Vec<Value>),
+    Dynamic(KeyExtractorFn),
+}
+
+impl JoinKeySpec {
+    #[inline]
+    pub fn extract_owned(&self, row: &Row) -> Vec<Value> {
+        match self {
+            Self::Columns(indices) => indices
+                .iter()
+                .map(|&index| row.get(index).cloned().unwrap_or(Value::Null))
+                .collect(),
+            Self::Constant(values) => values.clone(),
+            Self::Dynamic(extractor) => extractor(row),
+        }
+    }
+}
 
 /// Aggregate function types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +87,7 @@ pub enum DataflowNode {
     Filter {
         input: Box<DataflowNode>,
         predicate: PredicateFn,
+        trace_predicate: Option<TracePredicateFn>,
     },
 
     /// Project operation - selects specific columns
@@ -66,6 +100,7 @@ pub enum DataflowNode {
     Map {
         input: Box<DataflowNode>,
         mapper: MapperFn,
+        trace_mapper: Option<TraceMapperFn>,
     },
 
     /// Join operation - combines two inputs.
@@ -74,9 +109,11 @@ pub enum DataflowNode {
     Join {
         left: Box<DataflowNode>,
         right: Box<DataflowNode>,
-        left_key: KeyExtractorFn,
-        right_key: KeyExtractorFn,
+        left_key: JoinKeySpec,
+        right_key: JoinKeySpec,
         join_type: JoinType,
+        left_width: usize,
+        right_width: usize,
     },
 
     /// Aggregate operation - computes aggregates per group.
@@ -103,6 +140,7 @@ impl DataflowNode {
         DataflowNode::Filter {
             input: Box::new(input),
             predicate: Box::new(predicate),
+            trace_predicate: None,
         }
     }
 
@@ -122,6 +160,7 @@ impl DataflowNode {
         DataflowNode::Map {
             input: Box::new(input),
             mapper: Box::new(mapper),
+            trace_mapper: None,
         }
     }
 
@@ -135,9 +174,11 @@ impl DataflowNode {
         DataflowNode::Join {
             left: Box::new(left),
             right: Box::new(right),
-            left_key,
-            right_key,
+            left_key: JoinKeySpec::Dynamic(left_key),
+            right_key: JoinKeySpec::Dynamic(right_key),
             join_type: JoinType::Inner,
+            left_width: 0,
+            right_width: 0,
         }
     }
 
@@ -152,9 +193,11 @@ impl DataflowNode {
         DataflowNode::Join {
             left: Box::new(left),
             right: Box::new(right),
-            left_key,
-            right_key,
+            left_key: JoinKeySpec::Dynamic(left_key),
+            right_key: JoinKeySpec::Dynamic(right_key),
             join_type,
+            left_width: 0,
+            right_width: 0,
         }
     }
 

@@ -50,16 +50,20 @@ pub mod dataflow;
 pub mod delta;
 pub mod materialize;
 pub mod operators;
+pub mod trace;
 
 pub use collection::{ConsolidatedCollection, DiffCollection};
 pub use dataflow::{
-    AggregateType, ColumnId, DataflowGraph, DataflowNode, JoinType, KeyExtractorFn, NodeId, TableId,
+    AggregateType, ColumnId, DataflowGraph, DataflowNode, JoinKeySpec, JoinType, KeyExtractorFn,
+    NodeId, TableId,
 };
 pub use delta::{Delta, DeltaBatch, DeltaBatchExt};
 pub use materialize::{
-    AggregateState, GroupAggregateState, JoinState, MaterializedView, MaterializedViewBuilder,
+    AggregateState, CompiledBootstrapPlan, CompiledIvmPlan, GroupAggregateState, JoinState,
+    MaterializedView, MaterializedViewBuilder,
 };
 pub use operators::{
     filter_incremental, map_incremental, project_incremental, IncrementalAvg, IncrementalCount,
     IncrementalHashJoin, IncrementalMax, IncrementalMin, IncrementalSum,
 };
+pub use trace::{TraceDeltaBatch, TraceTupleArena, TraceTupleHandle, VisibleResultStore};

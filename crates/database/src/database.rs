@@ -7,17 +7,22 @@ use crate::binary_protocol::SchemaLayoutCache;
 use crate::convert::{gql_response_to_js, js_to_gql_variables};
 use crate::dataflow_compiler::compile_to_dataflow;
 use crate::live_runtime::{LiveDependencySet, LivePlan, LiveRegistry};
+#[cfg(feature = "benchmark")]
+use crate::profiling::SnapshotInitProfile;
+use crate::profiling::{
+    DeltaFlushProfile, IvmBridgeProfile, SnapshotFlushProfile, TraceInitProfile,
+};
 use crate::query_builder::{DeleteBuilder, InsertBuilder, SelectBuilder, UpdateBuilder};
 use crate::reactive_bridge::JsGraphqlSubscription;
 use crate::table::{JsTable, JsTableBuilder};
-use crate::transaction::JsTransaction;
+use crate::transaction::{CommitProfile, JsTransaction};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use cynos_core::Row;
 use cynos_gql::{PreparedQuery as GqlPreparedQuery, SchemaCache as GraphqlSchemaCache};
-use cynos_incremental::Delta;
+use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, Delta};
 use cynos_query::plan_cache::PlanCache;
 use cynos_reactive::TableId;
 use cynos_storage::TableCache;
@@ -41,6 +46,7 @@ pub struct Database {
     plan_cache: Rc<RefCell<PlanCache>>,
     graphql_schema_cache: Rc<RefCell<GraphqlSchemaCache>>,
     schema_epoch: Rc<RefCell<u64>>,
+    last_commit_profile: Rc<RefCell<Option<CommitProfile>>>,
 }
 
 /// A prepared GraphQL query that reuses the parsed document across executions.
@@ -75,6 +81,7 @@ impl Database {
             plan_cache: Rc::new(RefCell::new(PlanCache::default_size())),
             graphql_schema_cache: Rc::new(RefCell::new(GraphqlSchemaCache::new())),
             schema_epoch: Rc::new(RefCell::new(0)),
+            last_commit_profile: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -207,7 +214,71 @@ impl Database {
             self.cache.clone(),
             self.query_registry.clone(),
             self.table_id_map.clone(),
+            self.last_commit_profile.clone(),
         )
+    }
+
+    #[wasm_bindgen(js_name = takeLastCommitProfile)]
+    pub fn take_last_commit_profile(&self) -> JsValue {
+        let Some(profile) = self.last_commit_profile.borrow_mut().take() else {
+            return JsValue::NULL;
+        };
+
+        commit_profile_to_js_value(profile)
+    }
+
+    #[wasm_bindgen(js_name = takeLastDeltaFlushProfile)]
+    pub fn take_last_delta_flush_profile(&self) -> JsValue {
+        let Some(profile) = self.query_registry.borrow().take_last_delta_flush_profile() else {
+            return JsValue::NULL;
+        };
+
+        delta_flush_profile_to_js_value(profile)
+    }
+
+    #[wasm_bindgen(js_name = takeLastIvmBridgeProfile)]
+    pub fn take_last_ivm_bridge_profile(&self) -> JsValue {
+        let Some(profile) = self.query_registry.borrow().take_last_ivm_bridge_profile() else {
+            return JsValue::NULL;
+        };
+
+        ivm_bridge_profile_to_js_value(profile)
+    }
+
+    #[wasm_bindgen(js_name = takeLastTraceInitProfile)]
+    pub fn take_last_trace_init_profile(&self) -> JsValue {
+        let Some(profile) = self.query_registry.borrow().take_last_trace_init_profile() else {
+            return JsValue::NULL;
+        };
+
+        trace_init_profile_to_js_value(profile)
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[wasm_bindgen(js_name = takeLastSnapshotInitProfile)]
+    pub fn take_last_snapshot_init_profile(&self) -> JsValue {
+        let Some(profile) = self
+            .query_registry
+            .borrow()
+            .take_last_snapshot_init_profile()
+        else {
+            return JsValue::NULL;
+        };
+
+        snapshot_init_profile_to_js_value(profile)
+    }
+
+    #[wasm_bindgen(js_name = takeLastSnapshotFlushProfile)]
+    pub fn take_last_snapshot_flush_profile(&self) -> JsValue {
+        let Some(profile) = self
+            .query_registry
+            .borrow()
+            .take_last_snapshot_flush_profile()
+        else {
+            return JsValue::NULL;
+        };
+
+        snapshot_flush_profile_to_js_value(profile)
     }
 
     /// Clears all data from all tables.
@@ -583,6 +654,487 @@ fn bind_graphql_operation(
     Ok((catalog, bound))
 }
 
+fn commit_profile_to_js_value(profile: CommitProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("storageCommitMs"),
+        &JsValue::from_f64(profile.storage_commit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("registryFlushMs"),
+        &JsValue::from_f64(profile.registry_flush_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalCommitMs"),
+        &JsValue::from_f64(profile.total_commit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("changedTableCount"),
+        &JsValue::from_f64(profile.changed_table_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("changedRowCount"),
+        &JsValue::from_f64(profile.changed_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("deltaRowCount"),
+        &JsValue::from_f64(profile.delta_row_count as f64),
+    )
+    .ok();
+    object.into()
+}
+
+fn delta_flush_profile_to_js_value(profile: DeltaFlushProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("deltaTableCount"),
+        &JsValue::from_f64(profile.delta_table_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("deltaQueryCount"),
+        &JsValue::from_f64(profile.delta_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowsQueryCount"),
+        &JsValue::from_f64(profile.rows_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlQueryCount"),
+        &JsValue::from_f64(profile.graphql_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("deltaRowCount"),
+        &JsValue::from_f64(profile.delta_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("cloneMs"),
+        &JsValue::from_f64(profile.clone_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("queryOnTableChangeMs"),
+        &JsValue::from_f64(profile.query_on_table_change_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    object.into()
+}
+
+fn trace_init_profile_to_js_value(profile: TraceInitProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compilePlanMs"),
+        &JsValue::from_f64(profile.compile_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compileToDataflowMs"),
+        &JsValue::from_f64(profile.compile_to_dataflow_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compileIvmPlanMs"),
+        &JsValue::from_f64(profile.compile_ivm_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compileTraceProgramMs"),
+        &JsValue::from_f64(profile.compile_trace_program_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialQueryMs"),
+        &JsValue::from_f64(profile.initial_query_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceBootstrapMs"),
+        &JsValue::from_f64(profile.source_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("bootstrapScanMs"),
+        &JsValue::from_f64(profile.bootstrap_scan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("bootstrapExecuteMs"),
+        &JsValue::from_f64(profile.bootstrap_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("materializedViewInitMs"),
+        &JsValue::from_f64(profile.materialized_view_init_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceTableCount"),
+        &JsValue::from_f64(profile.source_table_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialRowCount"),
+        &JsValue::from_f64(profile.initial_row_count as f64),
+    )
+    .ok();
+    object.into()
+}
+
+#[cfg(feature = "benchmark")]
+fn snapshot_init_profile_to_js_value(profile: SnapshotInitProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("logicalPlanMs"),
+        &JsValue::from_f64(profile.logical_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("describeOutputMs"),
+        &JsValue::from_f64(profile.describe_output_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("binaryLayoutMs"),
+        &JsValue::from_f64(profile.binary_layout_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshPlanMs"),
+        &JsValue::from_f64(profile.partial_refresh_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compileMainPlanMs"),
+        &JsValue::from_f64(profile.compile_main_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetPlanMs"),
+        &JsValue::from_f64(profile.root_subset_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialQueryMs"),
+        &JsValue::from_f64(profile.initial_query_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("dependencyBindingsMs"),
+        &JsValue::from_f64(profile.dependency_bindings_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialResultAdaptMs"),
+        &JsValue::from_f64(profile.initial_result_adapt_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("observableInitMs"),
+        &JsValue::from_f64(profile.observable_init_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialRowCount"),
+        &JsValue::from_f64(profile.initial_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("visibleRowCount"),
+        &JsValue::from_f64(profile.visible_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshEnabled"),
+        &JsValue::from_bool(profile.partial_refresh_enabled),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetEnabled"),
+        &JsValue::from_bool(profile.root_subset_enabled),
+    )
+    .ok();
+    object.into()
+}
+
+fn snapshot_flush_profile_to_js_value(profile: SnapshotFlushProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("changedTableCount"),
+        &JsValue::from_f64(profile.changed_table_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowsQueryCount"),
+        &JsValue::from_f64(profile.rows_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlQueryCount"),
+        &JsValue::from_f64(profile.graphql_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("invalidationMergeMs"),
+        &JsValue::from_f64(profile.invalidation_merge_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowsQueryOnChangeMs"),
+        &JsValue::from_f64(profile.rows_query_on_change_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlQueryOnChangeMs"),
+        &JsValue::from_f64(profile.graphql_query_on_change_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("reactivePatchAttemptCount"),
+        &JsValue::from_f64(profile.reactive_patch_attempt_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("reactivePatchHitCount"),
+        &JsValue::from_f64(profile.reactive_patch_hit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("reactivePatchMs"),
+        &JsValue::from_f64(profile.reactive_patch_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshAttemptCount"),
+        &JsValue::from_f64(profile.partial_refresh_attempt_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshHitCount"),
+        &JsValue::from_f64(profile.partial_refresh_hit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshCollectMs"),
+        &JsValue::from_f64(profile.partial_refresh_collect_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshRequeryMs"),
+        &JsValue::from_f64(profile.partial_refresh_requery_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshApplyMs"),
+        &JsValue::from_f64(profile.partial_refresh_apply_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshCompareMs"),
+        &JsValue::from_f64(profile.partial_refresh_compare_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetAttemptCount"),
+        &JsValue::from_f64(profile.root_subset_attempt_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetHitCount"),
+        &JsValue::from_f64(profile.root_subset_hit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetCollectMs"),
+        &JsValue::from_f64(profile.root_subset_collect_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetRequeryMs"),
+        &JsValue::from_f64(profile.root_subset_requery_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetApplyMs"),
+        &JsValue::from_f64(profile.root_subset_apply_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetCompareMs"),
+        &JsValue::from_f64(profile.root_subset_compare_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("fullRequeryCount"),
+        &JsValue::from_f64(profile.full_requery_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("fullRequeryMs"),
+        &JsValue::from_f64(profile.full_requery_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("fullRequeryCompareMs"),
+        &JsValue::from_f64(profile.full_requery_compare_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("callbackMs"),
+        &JsValue::from_f64(profile.callback_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    object.into()
+}
+
+fn ivm_bridge_profile_to_js_value(profile: IvmBridgeProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("callbackCount"),
+        &JsValue::from_f64(profile.callback_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("addedRowCount"),
+        &JsValue::from_f64(profile.added_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("removedRowCount"),
+        &JsValue::from_f64(profile.removed_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("serializeAddedMs"),
+        &JsValue::from_f64(profile.serialize_added_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("serializeRemovedMs"),
+        &JsValue::from_f64(profile.serialize_removed_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("assembleDeltaMs"),
+        &JsValue::from_f64(profile.assemble_delta_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("callbackCallMs"),
+        &JsValue::from_f64(profile.callback_call_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    object.into()
+}
+
 fn execute_graphql_bound_operation(
     cache: Rc<RefCell<TableCache>>,
     query_registry: Rc<RefCell<LiveRegistry>>,
@@ -785,17 +1337,32 @@ fn build_graphql_delta_live_plan(
     else {
         return Ok(None);
     };
+    let compiled_ivm_plan = CompiledIvmPlan::compile(&compile_result.dataflow);
+    let compiled_bootstrap_plan = CompiledBootstrapPlan::compile(&compile_result.dataflow);
 
     let initial_rows =
         crate::query_engine::execute_physical_plan(cache, &physical_plan).map_err(|error| {
             JsValue::from_str(&alloc::format!("Query execution error: {:?}", error))
         })?;
-    let initial_owned = initial_rows.iter().map(|row| (**row).clone()).collect();
+    let mut source_table_bindings: Vec<(TableId, String)> = compile_result
+        .table_ids
+        .iter()
+        .map(|(table_name, table_id)| (*table_id, table_name.clone()))
+        .collect();
+    source_table_bindings.sort_unstable_by(|(left_id, left_name), (right_id, right_name)| {
+        left_id
+            .cmp(right_id)
+            .then_with(|| left_name.cmp(right_name))
+    });
+    source_table_bindings.dedup_by(|left, right| left.0 == right.0);
 
     Ok(Some(LivePlan::graphql_delta(
         dependency_set,
         compile_result.dataflow,
-        initial_owned,
+        compiled_ivm_plan,
+        compiled_bootstrap_plan,
+        initial_rows,
+        source_table_bindings,
         catalog,
         field,
         dependency_table_bindings,

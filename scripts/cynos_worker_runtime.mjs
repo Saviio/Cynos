@@ -10,7 +10,21 @@ import initWasm, {
   ColumnOptions,
   col,
 } from '../js/packages/core/dist/wasm.js'
-import { DATASET_CONFIG } from './tanstack_db_benchmark_shared.mjs'
+import {
+  ResultSet,
+  snapshotSchemaLayout,
+} from '../js/packages/core/dist/index.js'
+import {
+  API_REFRESH_COUNT,
+  DATASET_CONFIG,
+  SOCKET_PATCH_COUNT,
+} from './tanstack_db_benchmark_shared.mjs'
+import {
+  extractProjectIds,
+  extractProjectIdsFromResultSet,
+  scenarioRowKey,
+  snapshotRowsForScenario,
+} from './cynos_benchmark_row_shape.mjs'
 import {
   buildServerDataset,
   summarizeDataset,
@@ -23,12 +37,36 @@ if (!parentPort) {
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const ROOT_DIR = path.resolve(SCRIPT_DIR, '..')
 const WASM_PATH = path.join(ROOT_DIR, 'js', 'packages', 'core', 'dist', 'cynos.wasm')
+const MAX_TRACKED_PROJECT_IDS = Math.max(
+  256,
+  SOCKET_PATCH_COUNT,
+  API_REFRESH_COUNT,
+)
 
 const runtime = {
   initialized: false,
   db: null,
   server: null,
   active: null,
+  queryMode: 'changes',
+  scenarioVariant: 'default',
+  outputMode: 'object',
+}
+
+function usesAlignedFilters(scenarioVariant) {
+  return scenarioVariant === 'trace_aligned'
+}
+
+function normalizeScenarioVariant(scenarioVariant) {
+  if (scenarioVariant === 'trace_aligned') {
+    return 'trace_aligned'
+  }
+
+  if (scenarioVariant === 'trace_capability_aligned') {
+    return 'trace_capability_aligned'
+  }
+
+  return 'default'
 }
 
 function pkOptions() {
@@ -39,15 +77,8 @@ function nullableOptions() {
   return new ColumnOptions().setNullable(true)
 }
 
-function post(message) {
-  parentPort.postMessage(message)
-}
-
-function rowValue(row, ...keys) {
-  for (const key of keys) {
-    if (key in row) return row[key]
-  }
-  return undefined
+function post(message, transferList) {
+  parentPort.postMessage(message, transferList)
 }
 
 function createTables(db) {
@@ -178,8 +209,9 @@ async function insertTableInBatches(db, tableName, rows) {
   }
 }
 
-function buildIssueWindowStream(limit) {
-  return runtime.db
+function buildIssueWindowQuery(queryMode, limit, scenarioVariant) {
+  const alignedFilters = usesAlignedFilters(scenarioVariant)
+  const query = runtime.db
     .select([
       'issues.id',
       'project.id',
@@ -224,33 +256,55 @@ function buildIssueWindowStream(limit) {
       col('project.id').eq(col('snapshot.projectId')),
     )
     .where(
-      col('issues.status')
-        .eq('open')
-        .or(col('issues.status').eq('in_progress'))
-        .and(col('issues.estimate').gte(3))
-        .and(
-          col('issues.metadata')
-            .get('$.customer.tier')
-            .eq('enterprise')
-            .or(col('issues.metadata').get('$.customer.tier').eq('mid_market')),
-        )
-        .and(col('project.healthScore').gte(45))
-        .and(
-          col('project.metadata')
-            .get('$.risk.bucket')
-            .eq('high')
-            .or(col('project.metadata').get('$.risk.bucket').eq('critical')),
-        )
-        .and(col('counter.openIssueCount').gte(5))
-        .and(col('snapshot.velocity').gte(18)),
+      alignedFilters
+        ? col('issues.status')
+            .eq('open')
+            .or(col('issues.status').eq('in_progress'))
+            .and(col('issues.estimate').gte(3))
+            .and(
+              col('issues.metadata')
+                .get('$.customer.tier')
+                .eq('enterprise')
+                .or(col('issues.metadata').get('$.customer.tier').eq('mid_market')),
+            )
+        : col('issues.status')
+            .eq('open')
+            .or(col('issues.status').eq('in_progress'))
+            .and(col('issues.estimate').gte(3))
+            .and(
+              col('issues.metadata')
+                .get('$.customer.tier')
+                .eq('enterprise')
+                .or(col('issues.metadata').get('$.customer.tier').eq('mid_market')),
+            )
+            .and(col('project.healthScore').gte(45))
+            .and(
+              col('project.metadata')
+                .get('$.risk.bucket')
+                .eq('high')
+                .or(col('project.metadata').get('$.risk.bucket').eq('critical')),
+            )
+            .and(col('counter.openIssueCount').gte(5))
+            .and(col('snapshot.velocity').gte(18)),
     )
+
+  if (queryMode === 'trace') {
+    return query.trace()
+  }
+
+  if (!Number.isFinite(limit)) {
+    return query.changes()
+  }
+
+  return query
     .orderBy('issues.updatedAt', JsSortOrder.Desc)
     .limit(limit)
     .changes()
 }
 
-function buildProjectBoardStream() {
-  return runtime.db
+function buildProjectBoardQuery(queryMode, limit, scenarioVariant) {
+  const alignedFilters = usesAlignedFilters(scenarioVariant)
+  const query = runtime.db
     .select([
       'projects.id',
       'projects.name',
@@ -291,142 +345,131 @@ function buildProjectBoardStream() {
       col('projects.id').eq(col('milestone.projectId')),
     )
     .where(
-      col('projects.state')
-        .eq('active')
-        .or(col('projects.state').eq('at_risk'))
-        .and(col('projects.healthScore').gte(45))
-        .and(
-          col('projects.metadata')
-            .get('$.risk.bucket')
-            .eq('high')
-            .or(col('projects.metadata').get('$.risk.bucket').eq('critical')),
-        )
-        .and(col('counter.openIssueCount').gte(4))
-        .and(col('snapshot.velocity').gte(20)),
+      alignedFilters
+        ? col('projects.state')
+            .eq('active')
+            .or(col('projects.state').eq('at_risk'))
+            .and(col('projects.healthScore').gte(45))
+            .and(
+              col('projects.metadata')
+                .get('$.risk.bucket')
+                .eq('high')
+                .or(col('projects.metadata').get('$.risk.bucket').eq('critical')),
+            )
+        : col('projects.state')
+            .eq('active')
+            .or(col('projects.state').eq('at_risk'))
+            .and(col('projects.healthScore').gte(45))
+            .and(
+              col('projects.metadata')
+                .get('$.risk.bucket')
+                .eq('high')
+                .or(col('projects.metadata').get('$.risk.bucket').eq('critical')),
+            )
+            .and(col('counter.openIssueCount').gte(4))
+            .and(col('snapshot.velocity').gte(20)),
     )
+
+  if (queryMode === 'trace') {
+    return query.trace()
+  }
+
+  if (!Number.isFinite(limit)) {
+    return query.changes()
+  }
+
+  return query
     .orderBy('projects.healthScore', JsSortOrder.Desc)
-    .limit(2_000)
+    .limit(limit)
     .changes()
 }
 
-function buildScenarioStream(scenarioId) {
+function buildScenarioStream(scenarioId, queryMode, scenarioVariant) {
   if (scenarioId === 'issue_window_500') {
-    return buildIssueWindowStream(500)
+    return buildIssueWindowQuery(queryMode, 500, scenarioVariant)
   }
 
   if (scenarioId === 'issue_window_5000') {
-    return buildIssueWindowStream(5_000)
+    return buildIssueWindowQuery(queryMode, 5_000, scenarioVariant)
+  }
+
+  if (scenarioId === 'issue_stream_all') {
+    return buildIssueWindowQuery(queryMode, Number.NaN, scenarioVariant)
   }
 
   if (scenarioId === 'project_board_2000') {
-    return buildProjectBoardStream()
+    return buildProjectBoardQuery(queryMode, 2_000, scenarioVariant)
+  }
+
+  if (scenarioId === 'project_board_stream_all') {
+    return buildProjectBoardQuery(queryMode, Number.NaN, scenarioVariant)
   }
 
   throw new Error(`Unknown scenario: ${scenarioId}`)
 }
 
-function mapIssueRow(row) {
-  const issueMetadata = rowValue(row, 'issues.metadata', 'metadata') ?? {}
-  const projectMetadata = row['project.metadata'] ?? {}
-
-  return {
-    issueId: rowValue(row, 'issues.id', 'id'),
-    projectId: rowValue(row, 'project.id'),
-    issueTitle: rowValue(row, 'title', 'issues.title'),
-    issueStatus: rowValue(row, 'status', 'issues.status'),
-    issuePriority: rowValue(row, 'priority', 'issues.priority'),
-    issueSeverityRank: issueMetadata.severityRank ?? null,
-    issueCustomerTier: issueMetadata.customer?.tier ?? null,
-    projectName: rowValue(row, 'project.name', 'name'),
-    projectState: rowValue(row, 'state', 'project.state'),
-    projectHealth: rowValue(row, 'healthScore', 'project.healthScore'),
-    projectRiskScore: projectMetadata.risk?.score ?? null,
-    projectStrategic: projectMetadata.flags?.strategic ?? null,
-    organizationName: row['org.name'] ?? null,
-    teamName: row['team.name'] ?? null,
-    assigneeName: row['assignee.name'] ?? null,
-    milestoneName: row['milestone.name'] ?? null,
-    openIssueCount: rowValue(row, 'openIssueCount', 'counter.openIssueCount') ?? 0,
-    blockerCount: rowValue(row, 'blockerCount', 'counter.blockerCount') ?? 0,
-    velocity: rowValue(row, 'velocity', 'snapshot.velocity') ?? 0,
-    updatedAt: rowValue(row, 'updatedAt', 'issues.updatedAt'),
-  }
-}
-
-function mapProjectBoardRow(row) {
-  const projectMetadata = rowValue(row, 'projects.metadata', 'metadata') ?? {}
-
-  return {
-    projectId: rowValue(row, 'projects.id', 'id'),
-    projectName: row['projects.name'] ?? null,
-    projectState: rowValue(row, 'state', 'projects.state'),
-    projectHealth: rowValue(row, 'healthScore', 'projects.healthScore'),
-    projectRiskScore: projectMetadata.risk?.score ?? null,
-    projectStrategic: projectMetadata.flags?.strategic ?? null,
-    region: rowValue(row, 'region', 'org.region') ?? null,
-    organizationName: row['org.name'] ?? null,
-    teamName: row['team.name'] ?? null,
-    leadName: row['lead.name'] ?? null,
-    leadRole: rowValue(row, 'role', 'lead.role') ?? null,
-    milestoneName: row['milestone.name'] ?? null,
-    milestoneStatus: rowValue(row, 'status', 'milestone.status') ?? null,
-    openIssueCount: rowValue(row, 'openIssueCount', 'counter.openIssueCount') ?? 0,
-    blockerCount: rowValue(row, 'blockerCount', 'counter.blockerCount') ?? 0,
-    staleIssueCount:
-      rowValue(row, 'staleIssueCount', 'counter.staleIssueCount') ?? 0,
-    velocity: rowValue(row, 'velocity', 'snapshot.velocity') ?? 0,
-    blockedRatio: rowValue(row, 'blockedRatio', 'snapshot.blockedRatio') ?? 0,
-    updatedAt: rowValue(row, 'updatedAt', 'projects.updatedAt'),
-  }
-}
-
-function mapRowsForScenario(scenarioId, rows) {
-  if (scenarioId === 'issue_window_500' || scenarioId === 'issue_window_5000') {
-    return rows.map(mapIssueRow)
-  }
-
-  if (scenarioId === 'project_board_2000') {
-    return rows.map(mapProjectBoardRow)
-  }
-
-  throw new Error(`Unknown scenario: ${scenarioId}`)
-}
-
-function extractProjectIds(rows, maxCount) {
-  const result = []
-  const seen = new Set()
-  for (const row of rows) {
-    if (row.projectId == null || seen.has(row.projectId)) continue
-    seen.add(row.projectId)
-    result.push(row.projectId)
-    if (result.length >= maxCount) break
-  }
-  return result
-}
-
-async function initRuntime() {
+async function initRuntime(message = {}) {
   if (runtime.initialized) {
     return {
       type: 'ready',
+      queryMode: runtime.queryMode,
+      scenarioVariant: runtime.scenarioVariant,
+      outputMode: runtime.outputMode,
       dataset: summarizeDataset(runtime.server.tables),
     }
   }
 
   const startedAt = performance.now()
-  await initWasm({ module_or_path: await fs.readFile(WASM_PATH) })
-
-  runtime.server = buildServerDataset(DATASET_CONFIG)
-  runtime.db = new Database(`cynos_bench_${Date.now()}`)
-  createTables(runtime.db)
-
-  for (const [tableName, rows] of Object.entries(runtime.server.tables)) {
-    await insertTableInBatches(runtime.db, tableName, rows)
+  const initProfile = {
+    wasmFileReadMs: 0,
+    wasmInitMs: 0,
+    datasetBuildMs: 0,
+    databaseCreateMs: 0,
+    schemaRegistrationMs: 0,
+    insertTotalMs: 0,
+    insertByTableMs: {},
   }
+  runtime.queryMode = message.queryMode === 'trace' ? 'trace' : 'changes'
+  runtime.scenarioVariant = normalizeScenarioVariant(message.scenarioVariant)
+  runtime.outputMode =
+    runtime.queryMode === 'changes' && message.outputMode === 'binary'
+      ? 'binary'
+      : 'object'
+  const wasmReadStartedAt = performance.now()
+  const wasmBytes = await fs.readFile(WASM_PATH)
+  initProfile.wasmFileReadMs = performance.now() - wasmReadStartedAt
+  const wasmInitStartedAt = performance.now()
+  await initWasm({ module_or_path: wasmBytes })
+  initProfile.wasmInitMs = performance.now() - wasmInitStartedAt
+
+  const datasetBuildStartedAt = performance.now()
+  runtime.server = buildServerDataset(DATASET_CONFIG)
+  initProfile.datasetBuildMs = performance.now() - datasetBuildStartedAt
+  const databaseCreateStartedAt = performance.now()
+  runtime.db = new Database(`cynos_bench_${Date.now()}`)
+  initProfile.databaseCreateMs = performance.now() - databaseCreateStartedAt
+  const schemaRegistrationStartedAt = performance.now()
+  createTables(runtime.db)
+  initProfile.schemaRegistrationMs =
+    performance.now() - schemaRegistrationStartedAt
+
+  const insertStartedAt = performance.now()
+  for (const [tableName, rows] of Object.entries(runtime.server.tables)) {
+    const tableInsertStartedAt = performance.now()
+    await insertTableInBatches(runtime.db, tableName, rows)
+    initProfile.insertByTableMs[tableName] =
+      performance.now() - tableInsertStartedAt
+  }
+  initProfile.insertTotalMs = performance.now() - insertStartedAt
 
   runtime.initialized = true
   return {
     type: 'ready',
     initMs: performance.now() - startedAt,
+    initProfile,
+    queryMode: runtime.queryMode,
+    scenarioVariant: runtime.scenarioVariant,
+    outputMode: runtime.outputMode,
     dataset: summarizeDataset(runtime.server.tables),
   }
 }
@@ -440,18 +483,201 @@ function ensureInitialized() {
 function unsubscribeActive() {
   if (!runtime.active) return
   runtime.active.unsubscribe?.()
+  runtime.active.stream?.free?.()
   runtime.active = null
 }
 
-function createSnapshotMessage(active, phase, rows) {
+function createSnapshotMessage(
+  active,
+  phase,
+  rows,
+  changeCount = 1,
+  phaseProfile = undefined,
+) {
   return {
     type: 'snapshot',
     scenarioId: active.scenarioId,
     phase,
+    queryMode: active.queryMode,
+    payloadKind: 'object',
     workerLatencyMs: performance.now() - active.pending.startedAt,
     rowCount: rows.length,
-    changeCount: 1,
+    changeCount,
+    phaseProfile,
     rows: active.includeRows ? rows : undefined,
+  }
+}
+
+function createBinarySnapshotMessage(active, phase, payload) {
+  return {
+    type: 'snapshot',
+    scenarioId: active.scenarioId,
+    phase,
+    queryMode: active.queryMode,
+    payloadKind: 'binary',
+    workerLatencyMs: performance.now() - payload.startedAt,
+    rowCount: payload.rowCount,
+    changeCount: payload.changeCount,
+    layout: payload.layout,
+    binaryBytes: active.includeRows ? payload.binaryBytes : undefined,
+    binaryByteLength: payload.binaryByteLength,
+  }
+}
+
+function updateTrackedProjectIds(active, projectIds) {
+  if (projectIds.length > 0) {
+    active.lastProjectIds = projectIds
+  }
+}
+
+function postMutationProfile(active, phase, mutationProfile) {
+  post({
+    type: 'mutation-profile',
+    scenarioId: active.scenarioId,
+    phase,
+    queryMode: active.queryMode,
+    mutationProfile,
+  })
+}
+
+function takeCommitProfile() {
+  const profile = runtime.db?.takeLastCommitProfile?.()
+  return profile && typeof profile === 'object' ? profile : null
+}
+
+function takeTraceInitProfile() {
+  const profile = runtime.db?.takeLastTraceInitProfile?.()
+  return profile && typeof profile === 'object' ? profile : null
+}
+
+function takeSnapshotInitProfile() {
+  const profile = runtime.db?.takeLastSnapshotInitProfile?.()
+  return profile && typeof profile === 'object' ? profile : null
+}
+
+function takeDeltaFlushProfile() {
+  const profile = runtime.db?.takeLastDeltaFlushProfile?.()
+  return profile && typeof profile === 'object' ? profile : null
+}
+
+function takeSnapshotFlushProfile() {
+  const profile = runtime.db?.takeLastSnapshotFlushProfile?.()
+  return profile && typeof profile === 'object' ? profile : null
+}
+
+function takeIvmBridgeProfile() {
+  const profile = runtime.db?.takeLastIvmBridgeProfile?.()
+  return profile && typeof profile === 'object' ? profile : null
+}
+
+function buildCommitProfiles() {
+  const commitProfile = takeCommitProfile()
+  const traceInitProfile = takeTraceInitProfile()
+  const deltaFlushProfile = takeDeltaFlushProfile()
+  const snapshotFlushProfile = takeSnapshotFlushProfile()
+  const ivmBridgeProfile = takeIvmBridgeProfile()
+
+  let observableInternalMs = null
+  let registryNonDeltaMs = null
+  let deltaFlushOverheadMs = null
+
+  if (deltaFlushProfile && ivmBridgeProfile) {
+    observableInternalMs = Math.max(
+      0,
+      Number(deltaFlushProfile.queryOnTableChangeMs ?? 0) -
+        Number(ivmBridgeProfile.totalMs ?? 0),
+    )
+    deltaFlushOverheadMs = Math.max(
+      0,
+      Number(deltaFlushProfile.totalMs ?? 0) -
+        Number(deltaFlushProfile.cloneMs ?? 0) -
+        Number(deltaFlushProfile.queryOnTableChangeMs ?? 0),
+    )
+  }
+
+  if (commitProfile && deltaFlushProfile) {
+    registryNonDeltaMs = Math.max(
+      0,
+      Number(commitProfile.registryFlushMs ?? 0) -
+        Number(deltaFlushProfile.totalMs ?? 0),
+    )
+  }
+
+  return {
+    commitProfile,
+    traceInitProfile,
+    deltaFlushProfile,
+    snapshotFlushProfile,
+    ivmBridgeProfile,
+    observableInternalMs,
+    registryNonDeltaMs,
+    deltaFlushOverheadMs,
+  }
+}
+
+function syncTrackedProjectIdsFromBinary(active, binary) {
+  const resultSet = new ResultSet(binary, active.layoutSnapshot)
+  updateTrackedProjectIds(
+    active,
+    extractProjectIdsFromResultSet(
+      active.scenarioId,
+      resultSet,
+      MAX_TRACKED_PROJECT_IDS,
+    ),
+  )
+  resultSet.free()
+}
+
+function buildBinarySnapshotPayload(
+  active,
+  phase,
+  startedAt,
+  binary,
+  changeCount = 1,
+) {
+  const layout = active.layoutSnapshot
+
+  if (active.includeRows) {
+    const binaryBytes = binary.intoTransferable()
+    const resultSet = new ResultSet(binaryBytes, layout)
+    const rowCount = resultSet.length
+    updateTrackedProjectIds(
+      active,
+      extractProjectIdsFromResultSet(active.scenarioId, resultSet, MAX_TRACKED_PROJECT_IDS),
+    )
+    resultSet.free()
+
+    return {
+      message: createBinarySnapshotMessage(active, phase, {
+        startedAt,
+        rowCount,
+        changeCount,
+        layout,
+        binaryBytes,
+        binaryByteLength: binaryBytes.byteLength,
+      }),
+      transferList: [binaryBytes.buffer],
+    }
+  }
+
+  const binaryByteLength = binary.len()
+  const resultSet = new ResultSet(binary, layout)
+  const rowCount = resultSet.length
+    updateTrackedProjectIds(
+      active,
+      extractProjectIdsFromResultSet(active.scenarioId, resultSet, MAX_TRACKED_PROJECT_IDS),
+    )
+  resultSet.free()
+
+  return {
+    message: createBinarySnapshotMessage(active, phase, {
+      startedAt,
+      rowCount,
+      changeCount,
+      layout,
+      binaryByteLength,
+    }),
+    transferList: undefined,
   }
 }
 
@@ -462,8 +688,12 @@ function subscribeScenario(message) {
   const active = {
     scenarioId: message.scenarioId,
     includeRows: message.includeRows !== false,
+    queryMode: runtime.queryMode,
+    outputMode: runtime.outputMode,
     stream: null,
+    layoutSnapshot: null,
     currentRows: [],
+    rawRowsByKey: null,
     lastProjectIds: [],
     pending: {
       phase: 'initial',
@@ -473,20 +703,218 @@ function subscribeScenario(message) {
   }
 
   runtime.active = active
-  active.stream = buildScenarioStream(message.scenarioId)
+  const buildStreamStartedAt = performance.now()
+  active.stream = buildScenarioStream(
+    message.scenarioId,
+    runtime.queryMode,
+    runtime.scenarioVariant,
+  )
+  const buildStreamMs = performance.now() - buildStreamStartedAt
+  const traceInitProfile =
+    runtime.queryMode === 'trace' ? takeTraceInitProfile() : null
+  const snapshotInitProfile =
+    runtime.queryMode === 'trace' ? null : takeSnapshotInitProfile()
 
+  if (runtime.queryMode === 'trace') {
+    active.rawRowsByKey = new Map()
+
+    const getResultStartedAt = performance.now()
+    const initialRawRows = active.stream.getResult()
+    const getResultMs = performance.now() - getResultStartedAt
+    for (const rawRow of initialRawRows) {
+      const key = scenarioRowKey(active.scenarioId, rawRow)
+      if (key == null) continue
+      active.rawRowsByKey.set(String(key), rawRow)
+    }
+
+    const materializeStartedAt = performance.now()
+    const initialRows = snapshotRowsForScenario(
+      active.scenarioId,
+      Array.from(active.rawRowsByKey.values()),
+    )
+    const materializeRowsMs = performance.now() - materializeStartedAt
+    active.currentRows = initialRows
+
+    const trackedIdsStartedAt = performance.now()
+    updateTrackedProjectIds(
+      active,
+      extractProjectIds(initialRows, MAX_TRACKED_PROJECT_IDS),
+    )
+    const trackedProjectIdsMs = performance.now() - trackedIdsStartedAt
+
+    const initialPending = active.pending
+    if (initialPending) {
+      post(
+        createSnapshotMessage(
+          active,
+          initialPending.phase,
+          initialRows,
+          initialRows.length,
+          {
+            traceInitProfile,
+            getResultMs,
+            materializeRowsMs,
+            trackedProjectIdsMs,
+          },
+        ),
+      )
+      active.pending = null
+    }
+
+    active.unsubscribe = active.stream.subscribe((delta) => {
+      const pending = active.pending
+      const removed = delta?.removed ?? []
+      const added = delta?.added ?? []
+      const callbackStartedAt = performance.now()
+      const mergeStartedAt = callbackStartedAt
+
+      for (const rawRow of removed) {
+        const key = scenarioRowKey(active.scenarioId, rawRow)
+        if (key == null) continue
+        active.rawRowsByKey.delete(String(key))
+      }
+
+      for (const rawRow of added) {
+        const key = scenarioRowKey(active.scenarioId, rawRow)
+        if (key == null) continue
+        active.rawRowsByKey.set(String(key), rawRow)
+      }
+      const mergeDeltaMs = performance.now() - mergeStartedAt
+
+      const materializeStartedAt = performance.now()
+      const rows = snapshotRowsForScenario(
+        active.scenarioId,
+        Array.from(active.rawRowsByKey.values()),
+      )
+      const materializeRowsMs = performance.now() - materializeStartedAt
+      active.currentRows = rows
+
+      const trackedIdsStartedAt = performance.now()
+      updateTrackedProjectIds(
+        active,
+        extractProjectIds(rows, MAX_TRACKED_PROJECT_IDS),
+      )
+      const trackedProjectIdsMs = performance.now() - trackedIdsStartedAt
+      const callbackTotalMs = performance.now() - callbackStartedAt
+
+      if (!pending) return
+      post(
+        createSnapshotMessage(
+          active,
+          pending.phase,
+          rows,
+          added.length + removed.length,
+          {
+            deltaAddedCount: added.length,
+            deltaRemovedCount: removed.length,
+            mergeDeltaMs,
+            materializeRowsMs,
+            trackedProjectIdsMs,
+            callbackTotalMs,
+          },
+        ),
+      )
+      active.pending = null
+    })
+    return
+  }
+
+  if (runtime.outputMode === 'binary') {
+    active.layoutSnapshot = snapshotSchemaLayout(active.stream.getSchemaLayout())
+    active.unsubscribe = active.stream.subscribeBinary((binary) => {
+      try {
+        const pending = active.pending
+        if (!pending) {
+          syncTrackedProjectIdsFromBinary(active, binary)
+          return
+        }
+
+        const payload = buildBinarySnapshotPayload(
+          active,
+          pending.phase,
+          pending.startedAt,
+          binary,
+          1,
+        )
+        post(payload.message, payload.transferList)
+        active.pending = null
+      } catch (error) {
+        handleError(error, 'subscribe-binary')
+      }
+    })
+    return
+  }
+
+  const captureInitialSubscribeProfile = snapshotInitProfile != null
+  const subscribeStartedAt = captureInitialSubscribeProfile
+    ? performance.now()
+    : 0
+  let initialEmission = null
   active.unsubscribe = active.stream.subscribe((rawRows) => {
     const pending = active.pending
-    const rows = mapRowsForScenario(active.scenarioId, rawRows)
+    const subscribeBeforeCallbackMs =
+      captureInitialSubscribeProfile && pending?.phase === 'initial'
+        ? performance.now() - subscribeStartedAt
+        : undefined
+    const materializeStartedAt = performance.now()
+    const rows = snapshotRowsForScenario(
+      active.scenarioId,
+      rawRows,
+    )
+    const materializeRowsMs = performance.now() - materializeStartedAt
     active.currentRows = rows
-    const nextProjectIds = extractProjectIds(rows, Number.POSITIVE_INFINITY)
-    if (nextProjectIds.length > 0) {
-      active.lastProjectIds = nextProjectIds
-    }
+    const trackedIdsStartedAt = performance.now()
+    updateTrackedProjectIds(
+      active,
+      extractProjectIds(rows, MAX_TRACKED_PROJECT_IDS),
+    )
+    const trackedProjectIdsMs = performance.now() - trackedIdsStartedAt
     if (!pending) return
-    post(createSnapshotMessage(active, pending.phase, rows))
+    if (pending.phase === 'initial' && !captureInitialSubscribeProfile) {
+      post(
+        createSnapshotMessage(active, pending.phase, rows, 1, {
+          materializeRowsMs,
+          trackedProjectIdsMs,
+        }),
+      )
+      active.pending = null
+      return
+    }
+
+    const phaseProfile = {
+      snapshotInitProfile,
+      buildStreamMs,
+      subscribeBeforeCallbackMs,
+      materializeRowsMs,
+      trackedProjectIdsMs,
+    }
+
+    if (pending.phase === 'initial') {
+      initialEmission = {
+        rows,
+        changeCount: 1,
+        phaseProfile,
+      }
+      return
+    }
+
+    post(createSnapshotMessage(active, pending.phase, rows, 1, phaseProfile))
     active.pending = null
   })
+  if (captureInitialSubscribeProfile && initialEmission) {
+    const subscribeReturnMs = performance.now() - subscribeStartedAt
+    initialEmission.phaseProfile.subscribeReturnMs = subscribeReturnMs
+    post(
+      createSnapshotMessage(
+        active,
+        'initial',
+        initialEmission.rows,
+        initialEmission.changeCount,
+        initialEmission.phaseProfile,
+      ),
+    )
+    active.pending = null
+  }
 }
 
 function collectActiveProjectIds(maxCount) {
@@ -498,7 +926,20 @@ function collectActiveProjectIds(maxCount) {
   if (currentIds.length > 0) return currentIds
 
   if (runtime.active.lastProjectIds.length > 0) {
-    return runtime.active.lastProjectIds.slice(0, maxCount)
+    const result = runtime.active.lastProjectIds.slice(0, maxCount)
+    if (result.length >= maxCount) {
+      return result
+    }
+
+    const seen = new Set(result)
+    for (const row of runtime.server.tables.projects) {
+      if (seen.has(row.id)) continue
+      seen.add(row.id)
+      result.push(row.id)
+      if (result.length >= maxCount) break
+    }
+
+    return result
   }
 
   return runtime.server.tables.projects.slice(0, maxCount).map((row) => row.id)
@@ -521,13 +962,16 @@ function runSocketPatchBurst(message) {
     throw new Error('Subscribe before running socket patches.')
   }
 
-  const projectIds = collectActiveProjectIds(message.patchCount)
-  runtime.active.pending = {
+  const pending = {
     phase: 'socket',
     startedAt: performance.now(),
   }
+  runtime.active.pending = pending
+  const projectIds = collectActiveProjectIds(message.patchCount)
+  const projectIdsCollectedAt = performance.now()
 
   const tx = runtime.db.transaction()
+  const patchLoopStartedAt = performance.now()
   for (const projectId of projectIds) {
     const next = applyProjectPatch(projectId, (current) => {
       const healthScore = current.healthScore >= 45 ? 24 : 82
@@ -549,7 +993,18 @@ function runSocketPatchBurst(message) {
       col('id').eq(next.id),
     )
   }
+  const patchLoopCompletedAt = performance.now()
+  const commitStartedAt = performance.now()
   tx.commit()
+  const commitCompletedAt = performance.now()
+
+  postMutationProfile(runtime.active, 'socket', {
+    projectIdsCount: projectIds.length,
+    collectProjectIdsMs: projectIdsCollectedAt - pending.startedAt,
+    patchLoopMs: patchLoopCompletedAt - patchLoopStartedAt,
+    commitCallMs: commitCompletedAt - commitStartedAt,
+    ...buildCommitProfiles(),
+  })
 }
 
 function runApiRefresh(message) {
@@ -558,13 +1013,16 @@ function runApiRefresh(message) {
     throw new Error('Subscribe before running API refresh.')
   }
 
-  const projectIds = collectActiveProjectIds(message.patchCount)
-  runtime.active.pending = {
+  const pending = {
     phase: 'api',
     startedAt: performance.now(),
   }
+  runtime.active.pending = pending
+  const projectIds = collectActiveProjectIds(message.patchCount)
+  const projectIdsCollectedAt = performance.now()
 
   const tx = runtime.db.transaction()
+  const patchLoopStartedAt = performance.now()
   for (const projectId of projectIds) {
     const next = applyProjectPatch(projectId, (current) => {
       const nextRisk = current.healthScore >= 45 ? 18 : 76
@@ -598,7 +1056,18 @@ function runApiRefresh(message) {
       col('id').eq(next.id),
     )
   }
+  const patchLoopCompletedAt = performance.now()
+  const commitStartedAt = performance.now()
   tx.commit()
+  const commitCompletedAt = performance.now()
+
+  postMutationProfile(runtime.active, 'api', {
+    projectIdsCount: projectIds.length,
+    collectProjectIdsMs: projectIdsCollectedAt - pending.startedAt,
+    patchLoopMs: patchLoopCompletedAt - patchLoopStartedAt,
+    commitCallMs: commitCompletedAt - commitStartedAt,
+    ...buildCommitProfiles(),
+  })
 }
 
 function handleError(error, context) {
@@ -614,7 +1083,7 @@ parentPort.on('message', async (message) => {
   try {
     switch (message.type) {
       case 'init':
-        post(await initRuntime())
+        post(await initRuntime(message))
         return
       case 'subscribe':
         subscribeScenario(message)

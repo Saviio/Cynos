@@ -42,6 +42,11 @@ impl<K: Eq + core::hash::Hash + Clone> HashIndex<K> {
         &self.stats
     }
 
+    /// Returns the number of distinct keys currently stored in the index.
+    pub fn distinct_key_count(&self) -> usize {
+        self.map.len()
+    }
+
     /// Returns all row IDs in the index.
     pub fn get_all_row_ids(&self) -> Vec<RowId> {
         self.map.values().flatten().copied().collect()

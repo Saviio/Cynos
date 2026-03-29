@@ -7,10 +7,16 @@
 //! that yields the initial result followed by incremental changes.
 
 use crate::change_set::ChangeSet;
-use crate::subscription::{SubscriptionId, SubscriptionManager};
+use crate::subscription::{
+    RawDeltaSubscriptionManager, SubscriptionId, SubscriptionManager, TraceBatchSubscriptionManager,
+};
 use alloc::vec::Vec;
 use cynos_core::{Row, Value};
-use cynos_incremental::{DataflowNode, Delta, MaterializedView, TableId};
+use cynos_incremental::{
+    CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta, MaterializedView, TableId,
+    TraceDeltaBatch,
+};
+use hashbrown::HashMap;
 
 /// An observable query that tracks changes and notifies subscribers.
 ///
@@ -43,6 +49,10 @@ pub struct ObservableQuery {
     view: MaterializedView,
     /// Subscription manager for change notifications
     subscriptions: SubscriptionManager,
+    /// Raw delta subscribers used by low-level bridge paths.
+    raw_delta_subscriptions: RawDeltaSubscriptionManager,
+    /// Trace batch subscribers used by JS delta bridge paths.
+    trace_batch_subscriptions: TraceBatchSubscriptionManager,
     /// Whether initial value has been emitted
     initialized: bool,
 }
@@ -53,6 +63,8 @@ impl ObservableQuery {
         Self {
             view: MaterializedView::new(dataflow),
             subscriptions: SubscriptionManager::new(),
+            raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
+            trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
             initialized: false,
         }
     }
@@ -62,6 +74,75 @@ impl ObservableQuery {
         Self {
             view: MaterializedView::with_initial(dataflow, initial),
             subscriptions: SubscriptionManager::new(),
+            raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
+            trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+            initialized: true,
+        }
+    }
+
+    /// Creates an observable query with an initial result set and bootstrapped source state.
+    pub fn with_sources(
+        dataflow: DataflowNode,
+        initial: Vec<Row>,
+        source_rows: &HashMap<TableId, Vec<Row>>,
+    ) -> Self {
+        Self {
+            view: MaterializedView::with_sources(dataflow, initial, source_rows),
+            subscriptions: SubscriptionManager::new(),
+            raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
+            trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+            initialized: true,
+        }
+    }
+
+    /// Creates an observable query with precompiled IVM metadata and lazy source loading.
+    pub fn with_compiled_loader<F>(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<alloc::rc::Rc<Row>>,
+        load_source_rows: F,
+    ) -> Self
+    where
+        F: FnMut(TableId) -> Vec<alloc::rc::Rc<Row>>,
+    {
+        Self {
+            view: MaterializedView::with_compiled_loader_and_bootstrap(
+                dataflow,
+                compiled_plan,
+                compiled_bootstrap_plan,
+                initial,
+                load_source_rows,
+            ),
+            subscriptions: SubscriptionManager::new(),
+            raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
+            trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+            initialized: true,
+        }
+    }
+
+    /// Creates an observable query with store-backed bootstrap streaming.
+    pub fn with_compiled_source_visitor<F>(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<alloc::rc::Rc<Row>>,
+        visit_source_rows: F,
+    ) -> Self
+    where
+        F: FnMut(TableId, &mut dyn FnMut(alloc::rc::Rc<Row>)),
+    {
+        Self {
+            view: MaterializedView::with_compiled_source_visitor_and_bootstrap(
+                dataflow,
+                compiled_plan,
+                compiled_bootstrap_plan,
+                initial,
+                visit_source_rows,
+            ),
+            subscriptions: SubscriptionManager::new(),
+            raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
+            trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
             initialized: true,
         }
     }
@@ -83,6 +164,18 @@ impl ObservableQuery {
     #[inline]
     pub fn result(&self) -> Vec<Row> {
         self.view.result()
+    }
+
+    /// Returns the current result as shared rows for bridge/binary paths.
+    #[inline]
+    pub fn result_rc(&self) -> Vec<alloc::rc::Rc<Row>> {
+        self.view.result_rc()
+    }
+
+    /// Returns shared row references without cloning the current result vector.
+    #[inline]
+    pub fn result_row_refs(&self) -> impl Iterator<Item = &alloc::rc::Rc<Row>> + '_ {
+        self.view.result_row_refs()
     }
 
     /// Returns the number of rows in the result.
@@ -120,17 +213,37 @@ impl ObservableQuery {
         self.subscriptions.subscribe(callback)
     }
 
+    /// Subscribes to raw deltas without constructing a `ChangeSet`.
+    pub fn subscribe_raw_deltas<F>(&mut self, callback: F) -> SubscriptionId
+    where
+        F: Fn(&[Delta<Row>]) + 'static,
+    {
+        self.raw_delta_subscriptions.subscribe(callback)
+    }
+
+    /// Subscribes to internal trace batches without materializing full rows.
+    pub fn subscribe_trace_batches<F>(&mut self, callback: F) -> SubscriptionId
+    where
+        F: Fn(&TraceDeltaBatch) + 'static,
+    {
+        self.trace_batch_subscriptions.subscribe(callback)
+    }
+
     /// Unsubscribes by ID.
     ///
     /// Returns true if the subscription was found and removed.
     pub fn unsubscribe(&mut self, id: SubscriptionId) -> bool {
         self.subscriptions.unsubscribe(id)
+            || self.raw_delta_subscriptions.unsubscribe(id)
+            || self.trace_batch_subscriptions.unsubscribe(id)
     }
 
     /// Returns the number of active subscriptions.
     #[inline]
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.len()
+            + self.raw_delta_subscriptions.len()
+            + self.trace_batch_subscriptions.len()
     }
 
     /// Handles changes to a source table.
@@ -145,15 +258,38 @@ impl ObservableQuery {
         // Skip dataflow propagation entirely when no one is listening.
         // The result_map will be stale, but getResult() is only called
         // right after subscribe, at which point we re-initialize anyway.
-        if self.subscriptions.is_empty() {
+        if self.subscriptions.is_empty()
+            && self.raw_delta_subscriptions.is_empty()
+            && self.trace_batch_subscriptions.is_empty()
+        {
             return;
         }
 
-        let output_deltas = self.view.on_table_change(table_id, deltas);
+        let output_batch = self.view.on_table_change_batch(table_id, deltas);
 
-        if !output_deltas.is_empty() {
-            let changes = ChangeSet::from_deltas_only(&output_deltas);
-            self.subscriptions.notify_all(&changes);
+        if !output_batch.is_empty() {
+            if !self.trace_batch_subscriptions.is_empty() {
+                self.trace_batch_subscriptions.notify_all(&output_batch);
+            }
+
+            let materialized = if self.raw_delta_subscriptions.is_empty() && self.subscriptions.is_empty()
+            {
+                None
+            } else {
+                Some(output_batch.materialize_rows())
+            };
+
+            if !self.raw_delta_subscriptions.is_empty() {
+                if let Some(ref output_deltas) = materialized {
+                    self.raw_delta_subscriptions.notify_all(output_deltas);
+                }
+            }
+            if !self.subscriptions.is_empty() {
+                if let Some(ref output_deltas) = materialized {
+                    let changes = ChangeSet::from_deltas_only(output_deltas);
+                    self.subscriptions.notify_all(&changes);
+                }
+            }
         }
     }
 

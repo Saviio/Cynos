@@ -43,6 +43,7 @@ pub mod database;
 pub mod dataflow_compiler;
 pub mod expr;
 pub mod live_runtime;
+mod profiling;
 pub mod query_builder;
 pub mod query_engine;
 pub mod reactive_bridge;

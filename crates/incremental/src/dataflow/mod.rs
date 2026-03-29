@@ -7,4 +7,6 @@ mod graph;
 pub mod node;
 
 pub use graph::{DataflowGraph, NodeId};
-pub use node::{AggregateType, ColumnId, DataflowNode, JoinType, KeyExtractorFn, TableId};
+pub use node::{
+    AggregateType, ColumnId, DataflowNode, JoinKeySpec, JoinType, KeyExtractorFn, TableId,
+};

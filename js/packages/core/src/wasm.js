@@ -39,6 +39,18 @@ export class BinaryResult {
         wasm.binaryresult_free(ptr);
     }
     /**
+     * Copy the buffer into a standalone Uint8Array suitable for `postMessage`
+     * transfer lists and other ownership-taking APIs.
+     *
+     * Unlike `asView()`, the returned bytes are no longer tied to WASM memory.
+     * @returns {Uint8Array}
+     */
+    intoTransferable() {
+        const ptr = this.__destroy_into_raw();
+        const ret = wasm.binaryresult_intoTransferable(ptr);
+        return takeObject(ret);
+    }
+    /**
      * Check if buffer is empty
      * @returns {boolean}
      */
@@ -889,6 +901,48 @@ export class Database {
         return takeObject(ret);
     }
     /**
+     * @returns {any}
+     */
+    takeLastCommitProfile() {
+        const ret = wasm.database_takeLastCommitProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * @returns {any}
+     */
+    takeLastDeltaFlushProfile() {
+        const ret = wasm.database_takeLastDeltaFlushProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * @returns {any}
+     */
+    takeLastIvmBridgeProfile() {
+        const ret = wasm.database_takeLastIvmBridgeProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * @returns {any}
+     */
+    takeLastSnapshotFlushProfile() {
+        const ret = wasm.database_takeLastSnapshotFlushProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * @returns {any}
+     */
+    takeLastSnapshotInitProfile() {
+        const ret = wasm.database_takeLastSnapshotInitProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * @returns {any}
+     */
+    takeLastTraceInitProfile() {
+        const ret = wasm.database_takeLastTraceInitProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
      * Returns the total row count across all tables.
      * @returns {number}
      */
@@ -1176,6 +1230,21 @@ export class JsChangesStream {
         const ret = wasm.jschangesstream_subscribe(this.__wbg_ptr, addHeapObject(callback));
         return takeObject(ret);
     }
+    /**
+     * Subscribes to the changes stream using binary snapshots.
+     *
+     * The callback receives a `BinaryResult` for the full current result set.
+     * It is called immediately with the initial data, and again whenever data changes.
+     * Use `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+     *
+     * Returns an unsubscribe function.
+     * @param {Function} callback
+     * @returns {Function}
+     */
+    subscribeBinary(callback) {
+        const ret = wasm.jschangesstream_subscribeBinary(this.__wbg_ptr, addHeapObject(callback));
+        return takeObject(ret);
+    }
 }
 if (Symbol.dispose) JsChangesStream.prototype[Symbol.dispose] = JsChangesStream.prototype.free;
 
@@ -1409,6 +1478,22 @@ export class JsObservableQuery {
      */
     subscribe(callback) {
         const ret = wasm.jsobservablequery_subscribe(this.__wbg_ptr, addHeapObject(callback));
+        return takeObject(ret);
+    }
+    /**
+     * Subscribes to query changes using binary snapshots.
+     *
+     * The callback receives a `BinaryResult` for the complete current result set.
+     * This avoids per-update JS object materialization inside the WASM bridge.
+     * Call `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+     *
+     * It is called whenever data changes (not immediately - use getResultBinary for initial data).
+     * Returns an unsubscribe function.
+     * @param {Function} callback
+     * @returns {Function}
+     */
+    subscribeBinary(callback) {
+        const ret = wasm.jsobservablequery_subscribeBinary(this.__wbg_ptr, addHeapObject(callback));
         return takeObject(ret);
     }
     /**
@@ -2815,7 +2900,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_6882(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_8227(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -2920,12 +3005,12 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [], shim_idx: 2, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_84, __wasm_bindgen_func_elem_1138);
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_84, __wasm_bindgen_func_elem_1527);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 243, function: Function { arguments: [Externref], shim_idx: 244, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_2524, __wasm_bindgen_func_elem_2531);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 297, function: Function { arguments: [Externref], shim_idx: 298, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_3444, __wasm_bindgen_func_elem_3451);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000003: function(arg0) {
@@ -2956,16 +3041,16 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1138(arg0, arg1) {
-    wasm.__wasm_bindgen_func_elem_1138(arg0, arg1);
+function __wasm_bindgen_func_elem_1527(arg0, arg1) {
+    wasm.__wasm_bindgen_func_elem_1527(arg0, arg1);
 }
 
-function __wasm_bindgen_func_elem_2531(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_2531(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_3451(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_3451(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_6882(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_6882(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_8227(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_8227(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const BinaryResultFinalization = (typeof FinalizationRegistry === 'undefined')

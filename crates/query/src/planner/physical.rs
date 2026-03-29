@@ -71,13 +71,14 @@ pub enum PhysicalPlan {
         recheck: Option<Expr>,
     },
 
-    /// GIN index scan for multiple JSONB predicates (AND combination).
-    /// More efficient than multiple single GIN scans followed by intersection.
+    /// GIN index scan for multiple JSONB predicates.
     GinIndexScanMulti {
         table: String,
         index: String,
-        /// Multiple key-value pairs to match (all must match - AND semantics).
+        /// Multiple key-value pairs to match.
         pairs: Vec<(String, String)>,
+        /// `true` for AND semantics, `false` for OR semantics.
+        match_all: bool,
         /// Optional recheck predicate preserved for later physical rewrites.
         recheck: Option<Expr>,
     },
@@ -321,17 +322,19 @@ impl PhysicalPlan {
         }
     }
 
-    /// Creates a GIN index scan plan for multiple key-value pairs (AND combination).
+    /// Creates a GIN index scan plan for multiple key-value pairs.
     pub fn gin_index_scan_multi(
         table: impl Into<String>,
         index: impl Into<String>,
         pairs: Vec<(String, String)>,
+        match_all: bool,
         recheck: Option<Expr>,
     ) -> Self {
         PhysicalPlan::GinIndexScanMulti {
             table: table.into(),
             index: index.into(),
             pairs,
+            match_all,
             recheck,
         }
     }

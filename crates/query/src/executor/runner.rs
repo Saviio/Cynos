@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
-use cynos_core::{Row, Value, DUMMY_ROW_ID};
+use cynos_core::{join_row_id, left_join_null_row_id, right_join_null_row_id, Row, Value};
 use cynos_index::KeyRange;
 use cynos_jsonb::{JsonPath, JsonbObject, JsonbValue};
 
@@ -443,6 +443,14 @@ impl<'a> JoinRowSource<'a> {
             JoinRowSource::View(view) => view.row_version(),
         }
     }
+
+    #[inline]
+    fn row_id(self) -> u64 {
+        match self {
+            JoinRowSource::Entry(entry) => entry.row.id(),
+            JoinRowSource::View(view) => view.row_id(),
+        }
+    }
 }
 
 impl<'a> JoinedRowView<'a> {
@@ -482,6 +490,16 @@ impl<'a> JoinedRowView<'a> {
         }
     }
 
+    #[inline]
+    fn row_id(&self) -> u64 {
+        match (self.left, self.right) {
+            (Some(left), Some(right)) => join_row_id(left.row_id(), right.row_id()),
+            (Some(left), None) => left_join_null_row_id(left.row_id()),
+            (None, Some(right)) => right_join_null_row_id(right.row_id()),
+            (None, None) => 0,
+        }
+    }
+
     fn materialize_row(&self) -> Rc<Row> {
         let mut values = Vec::with_capacity(self.layout.total_width);
         for segment in &self.layout.segments {
@@ -504,7 +522,7 @@ impl<'a> JoinedRowView<'a> {
             }
         }
 
-        Rc::new(Row::dummy_with_version(self.version(), values))
+        Rc::new(Row::new_with_version(self.row_id(), self.version(), values))
     }
 
     #[inline]
@@ -516,10 +534,10 @@ impl<'a> JoinedRowView<'a> {
                 JoinMaterializationPattern::LeftThenRight,
             ) => RelationEntry::combine_fast(left, right, shared_tables),
             (
-                Some(JoinRowSource::Entry(left)),
-                Some(JoinRowSource::Entry(right)),
+                Some(JoinRowSource::Entry(_)),
+                Some(JoinRowSource::Entry(_)),
                 JoinMaterializationPattern::RightThenLeft,
-            ) => RelationEntry::combine_fast(right, left, shared_tables),
+            ) => RelationEntry::new_combined(self.materialize_row(), shared_tables),
             (Some(JoinRowSource::Entry(left)), None, JoinMaterializationPattern::LeftThenRight) => {
                 RelationEntry::combine_with_null_fast(
                     left,
@@ -527,12 +545,8 @@ impl<'a> JoinedRowView<'a> {
                     shared_tables,
                 )
             }
-            (Some(JoinRowSource::Entry(left)), None, JoinMaterializationPattern::RightThenLeft) => {
-                RelationEntry::combine_null_with_fast(
-                    self.layout.right_total_width,
-                    left,
-                    shared_tables,
-                )
+            (Some(JoinRowSource::Entry(_)), None, JoinMaterializationPattern::RightThenLeft) => {
+                RelationEntry::new_combined(self.materialize_row(), shared_tables)
             }
             (
                 None,
@@ -543,15 +557,9 @@ impl<'a> JoinedRowView<'a> {
                 right,
                 shared_tables,
             ),
-            (
-                None,
-                Some(JoinRowSource::Entry(right)),
-                JoinMaterializationPattern::RightThenLeft,
-            ) => RelationEntry::combine_with_null_fast(
-                right,
-                self.layout.left_total_width,
-                shared_tables,
-            ),
+            (None, Some(JoinRowSource::Entry(_)), JoinMaterializationPattern::RightThenLeft) => {
+                RelationEntry::new_combined(self.materialize_row(), shared_tables)
+            }
             _ => RelationEntry::new_combined(self.materialize_row(), shared_tables),
         }
     }
@@ -590,7 +598,7 @@ impl RowAccessor for JoinedRowView<'_> {
 impl ExecRowView for JoinedRowView<'_> {
     #[inline]
     fn row_id(&self) -> u64 {
-        DUMMY_ROW_ID
+        JoinedRowView::row_id(self)
     }
 
     #[inline]
@@ -988,6 +996,7 @@ enum CompiledSourcePlan {
         table: String,
         index: String,
         pairs: Vec<(String, String)>,
+        match_all: bool,
     },
 }
 
@@ -1591,16 +1600,16 @@ pub trait DataSource {
         Ok(())
     }
 
-    /// Returns rows from a GIN index lookup by multiple key-value pairs (AND query).
-    /// Used for combined JSONB path equality queries like `$.category = 'A' AND $.status = 'active'`.
+    /// Returns rows from a GIN index lookup by multiple key-value pairs.
     fn get_gin_index_rows_multi(
         &self,
         table: &str,
         index: &str,
         pairs: &[(&str, &str)],
+        match_all: bool,
     ) -> ExecutionResult<Vec<Rc<Row>>> {
         // Default implementation: fall back to table scan (no GIN index support)
-        let _ = (index, pairs);
+        let _ = (index, pairs, match_all);
         self.get_table_rows(table)
     }
 
@@ -1611,12 +1620,13 @@ pub trait DataSource {
         table: &str,
         index: &str,
         pairs: &[(&str, &str)],
+        match_all: bool,
         mut visitor: F,
     ) -> ExecutionResult<()>
     where
         F: FnMut(&Rc<Row>) -> bool,
     {
-        for row in self.get_gin_index_rows_multi(table, index, pairs)? {
+        for row in self.get_gin_index_rows_multi(table, index, pairs, match_all)? {
             if !visitor(&row) {
                 break;
             }
@@ -1801,6 +1811,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         })
     }
 
+    #[inline]
+    fn estimate_single_table_upper_bound(&self, table: &str) -> ExecutionResult<Option<usize>> {
+        Ok(Some(self.data_source.get_table_row_count(table)?))
+    }
+
     fn compile_exec_plan(&self, plan: &PhysicalPlan) -> ExecutionResult<CompiledExecPlan> {
         let plan = Self::strip_noop(plan);
         match plan {
@@ -1846,7 +1861,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 limit,
             } => Ok(CompiledExecPlan {
                 meta: self.compile_single_table_meta(table)?,
-                estimated_rows: *limit,
+                estimated_rows: Some(limit.unwrap_or(1)),
                 kind: CompiledExecPlanKind::Source(CompiledSourcePlan::IndexGet {
                     table: table.clone(),
                     index: index.clone(),
@@ -1856,7 +1871,10 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             }),
             PhysicalPlan::IndexInGet { table, index, keys } => Ok(CompiledExecPlan {
                 meta: self.compile_single_table_meta(table)?,
-                estimated_rows: None,
+                // Multi-point lookups can still fan out heavily on non-unique indexes.
+                // Keep a finite upper bound so downstream join planning does not fall
+                // back to arbitrary build-side choices.
+                estimated_rows: self.estimate_single_table_upper_bound(table)?,
                 kind: CompiledExecPlanKind::Source(CompiledSourcePlan::IndexInGet {
                     table: table.clone(),
                     index: index.clone(),
@@ -1872,7 +1890,9 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 ..
             } => Ok(CompiledExecPlan {
                 meta: self.compile_single_table_meta(table)?,
-                estimated_rows: None,
+                // JSON-path sources do not expose exact selectivity at compile time, but
+                // hash join build-side selection still needs a stable size signal.
+                estimated_rows: self.estimate_single_table_upper_bound(table)?,
                 kind: CompiledExecPlanKind::Source(CompiledSourcePlan::GinIndexScan {
                     table: table.clone(),
                     index: index.clone(),
@@ -1885,14 +1905,16 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 table,
                 index,
                 pairs,
+                match_all,
                 ..
             } => Ok(CompiledExecPlan {
                 meta: self.compile_single_table_meta(table)?,
-                estimated_rows: None,
+                estimated_rows: self.estimate_single_table_upper_bound(table)?,
                 kind: CompiledExecPlanKind::Source(CompiledSourcePlan::GinIndexScanMulti {
                     table: table.clone(),
                     index: index.clone(),
                     pairs: pairs.clone(),
+                    match_all: *match_all,
                 }),
             }),
             PhysicalPlan::Filter { input, predicate } => {
@@ -2084,6 +2106,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                     estimated_rows: Self::estimate_index_join_output_rows(
                         outer.estimated_rows,
                         *join_type,
+                        *outer_is_left,
                     ),
                     kind: CompiledExecPlanKind::IndexNestedLoopJoin {
                         outer: Box::new(outer),
@@ -2234,12 +2257,26 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
     fn estimate_index_join_output_rows(
         outer_rows: Option<usize>,
         join_type: crate::ast::JoinType,
+        outer_is_left: bool,
     ) -> Option<usize> {
         match join_type {
-            crate::ast::JoinType::LeftOuter | crate::ast::JoinType::Inner => outer_rows,
-            crate::ast::JoinType::RightOuter
-            | crate::ast::JoinType::FullOuter
-            | crate::ast::JoinType::Cross => None,
+            crate::ast::JoinType::Inner => outer_rows,
+            crate::ast::JoinType::LeftOuter => outer_is_left.then_some(outer_rows).flatten(),
+            crate::ast::JoinType::RightOuter => (!outer_is_left).then_some(outer_rows).flatten(),
+            crate::ast::JoinType::FullOuter | crate::ast::JoinType::Cross => None,
+        }
+    }
+
+    #[inline]
+    fn index_join_emits_unmatched_outer(
+        join_type: crate::ast::JoinType,
+        outer_is_left: bool,
+    ) -> bool {
+        match join_type {
+            crate::ast::JoinType::Inner | crate::ast::JoinType::Cross => false,
+            crate::ast::JoinType::LeftOuter => outer_is_left,
+            crate::ast::JoinType::RightOuter => !outer_is_left,
+            crate::ast::JoinType::FullOuter => true,
         }
     }
 
@@ -2504,8 +2541,9 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 table,
                 index,
                 pairs,
+                match_all,
                 ..
-            } => self.execute_gin_index_scan_multi(table, index, pairs),
+            } => self.execute_gin_index_scan_multi(table, index, pairs, *match_all),
 
             PhysicalPlan::Filter { input, predicate } => {
                 let input_rel = self.execute(input)?;
@@ -2865,10 +2903,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         output_tables: &[String],
         emit: &mut ExecRowEmitter<'_>,
     ) -> ExecutionResult<bool> {
-        let is_outer = matches!(
-            join_type,
-            crate::ast::JoinType::LeftOuter | crate::ast::JoinType::FullOuter
-        );
+        let emit_unmatched_outer = Self::index_join_emits_unmatched_outer(join_type, outer_is_left);
         let inner_col_count = self.data_source.get_column_count(inner_table)?;
         let layout = Self::index_join_output_layout_from_meta(
             &outer.meta,
@@ -2922,7 +2957,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 return Ok(false);
             }
 
-            if is_outer && !matched {
+            if emit_unmatched_outer && !matched {
                 let view = Self::index_nested_loop_view(&outer_row, None, &layout, outer_is_left);
                 if !emit(ExecRowRef::Joined(view))? {
                     return Ok(false);
@@ -3196,6 +3231,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 table,
                 index,
                 pairs,
+                match_all,
             } => {
                 let pair_refs: Vec<(&str, &str)> = pairs
                     .iter()
@@ -3203,7 +3239,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                     .collect();
                 self.visit_compiled_source_rows(emit, |visit| {
                     self.data_source
-                        .visit_gin_index_rows_multi(table, index, &pair_refs, visit)
+                        .visit_gin_index_rows_multi(table, index, &pair_refs, *match_all, visit)
                 })
             }
         }
@@ -4163,6 +4199,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         table: &str,
         index: &str,
         pairs: &[(String, String)],
+        match_all: bool,
     ) -> ExecutionResult<Relation> {
         // Convert to slice of references for the DataSource trait
         let pair_refs: Vec<(&str, &str)> = pairs
@@ -4171,7 +4208,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             .collect();
         let rows = self
             .data_source
-            .get_gin_index_rows_multi(table, index, &pair_refs)?;
+            .get_gin_index_rows_multi(table, index, &pair_refs, match_all)?;
         let column_count = self.data_source.get_column_count(table)?;
         Ok(Relation::from_rows_with_column_count(
             rows,
@@ -4260,6 +4297,9 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 op: BinaryOp::Or,
                 right,
             } => {
+                if let Some(compiled) = Self::compile_or_equality_chain(predicate) {
+                    return compiled;
+                }
                 let mut predicates = Vec::new();
                 Self::push_compiled_logical_terms(left, BinaryOp::Or, &mut predicates);
                 Self::push_compiled_logical_terms(right, BinaryOp::Or, &mut predicates);
@@ -4381,6 +4421,48 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         }
     }
 
+    fn compile_or_equality_chain(predicate: &Expr) -> Option<CompiledRowPredicate> {
+        let mut terms = Vec::new();
+        Self::collect_logical_terms(predicate, BinaryOp::Or, &mut terms);
+        if terms.len() < 2 {
+            return None;
+        }
+
+        let mut column_index = None;
+        let mut literals = Vec::with_capacity(terms.len());
+
+        for term in terms {
+            let predicate = Self::simple_binary_predicate(term)?;
+            if Self::normalize_comparison_op(predicate.op, predicate.column_on_left)?
+                != ComparisonOp::Eq
+            {
+                return None;
+            }
+            if predicate.literal.is_null() {
+                return None;
+            }
+
+            match column_index {
+                Some(existing) if existing != predicate.column_index => return None,
+                Some(_) => {}
+                None => column_index = Some(predicate.column_index),
+            }
+
+            if !literals
+                .iter()
+                .any(|existing| existing == &predicate.literal)
+            {
+                literals.push(predicate.literal);
+            }
+        }
+
+        Some(CompiledRowPredicate::InList {
+            column_index: column_index?,
+            kernel: Self::compile_in_list_predicate_kernel(literals),
+            negated: false,
+        })
+    }
+
     fn compile_json_row_predicate(name: &str, args: &[Expr]) -> Option<CompiledRowPredicate> {
         let func = name.to_ascii_uppercase();
         match func.as_str() {
@@ -4488,6 +4570,27 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         }
 
         predicates.push(Self::compile_row_predicate(predicate));
+    }
+
+    fn collect_logical_terms<'expr>(
+        predicate: &'expr Expr,
+        op: BinaryOp,
+        predicates: &mut Vec<&'expr Expr>,
+    ) {
+        if let Expr::BinaryOp {
+            left,
+            op: inner_op,
+            right,
+        } = predicate
+        {
+            if *inner_op == op {
+                Self::collect_logical_terms(left, op, predicates);
+                Self::collect_logical_terms(right, op, predicates);
+                return;
+            }
+        }
+
+        predicates.push(predicate);
     }
 
     #[inline]
@@ -5956,10 +6059,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         output_tables: &[String],
         emit: &mut dyn FnMut(RelationEntry) -> ExecutionResult<bool>,
     ) -> ExecutionResult<bool> {
-        let is_outer = matches!(
-            join_type,
-            crate::ast::JoinType::LeftOuter | crate::ast::JoinType::FullOuter
-        );
+        let emit_unmatched_outer = Self::index_join_emits_unmatched_outer(join_type, outer_is_left);
         let outer_key_idx = self.extract_outer_key_index(condition, outer)?;
         let inner_col_count = self.data_source.get_column_count(inner_table)?;
         let layout = Self::index_join_output_layout(
@@ -6015,7 +6115,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 return Ok(false);
             }
 
-            if is_outer && !matched {
+            if emit_unmatched_outer && !matched {
                 let view = Self::index_nested_loop_view(outer_entry, None, &layout, outer_is_left);
                 if !self.emit_join_view(&view, &shared_tables, emit)? {
                     return Ok(false);
@@ -7523,11 +7623,12 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             let right_col = self.extract_column_ref(right_expr)?;
 
             let outer_tables = outer.tables();
+            let outer_ctx = EvalContext::new(outer_tables, outer.table_column_counts());
 
             if outer_tables.contains(&left_col.table) {
-                Ok(left_col.index)
+                Ok(outer_ctx.resolve_column_index(&left_col.table, left_col.index))
             } else if outer_tables.contains(&right_col.table) {
-                Ok(right_col.index)
+                Ok(outer_ctx.resolve_column_index(&right_col.table, right_col.index))
             } else {
                 Err(ExecutionError::InvalidOperation(
                     "Outer key column not found in outer relation".into(),
@@ -8085,6 +8186,74 @@ mod tests {
         }
     }
 
+    struct CardinalityOnlyDataSource {
+        tables: Vec<(&'static str, usize, usize)>,
+    }
+
+    impl CardinalityOnlyDataSource {
+        fn new(tables: Vec<(&'static str, usize, usize)>) -> Self {
+            Self { tables }
+        }
+
+        fn lookup(&self, table: &str) -> ExecutionResult<(usize, usize)> {
+            self.tables
+                .iter()
+                .find(|(name, _, _)| *name == table)
+                .map(|(_, row_count, column_count)| (*row_count, *column_count))
+                .ok_or_else(|| ExecutionError::TableNotFound(table.into()))
+        }
+    }
+
+    impl DataSource for CardinalityOnlyDataSource {
+        fn get_table_rows(&self, _table: &str) -> ExecutionResult<Vec<Rc<Row>>> {
+            unreachable!("cardinality-only data source should not materialize rows in tests")
+        }
+
+        fn get_index_range_with_limit(
+            &self,
+            _table: &str,
+            _index: &str,
+            _range_start: Option<&Value>,
+            _range_end: Option<&Value>,
+            _include_start: bool,
+            _include_end: bool,
+            _limit: Option<usize>,
+            _offset: usize,
+            _reverse: bool,
+        ) -> ExecutionResult<Vec<Rc<Row>>> {
+            unreachable!("cardinality-only data source should not scan indexes in tests")
+        }
+
+        fn get_index_range_composite_with_limit(
+            &self,
+            _table: &str,
+            _index: &str,
+            _range: Option<&KeyRange<Vec<Value>>>,
+            _limit: Option<usize>,
+            _offset: usize,
+            _reverse: bool,
+        ) -> ExecutionResult<Vec<Rc<Row>>> {
+            unreachable!("cardinality-only data source should not scan composite indexes in tests")
+        }
+
+        fn get_index_point(
+            &self,
+            _table: &str,
+            _index: &str,
+            _key: &Value,
+        ) -> ExecutionResult<Vec<Rc<Row>>> {
+            unreachable!("cardinality-only data source should not perform point lookups in tests")
+        }
+
+        fn get_column_count(&self, table: &str) -> ExecutionResult<usize> {
+            self.lookup(table).map(|(_, column_count)| column_count)
+        }
+
+        fn get_table_row_count(&self, table: &str) -> ExecutionResult<usize> {
+            self.lookup(table).map(|(row_count, _)| row_count)
+        }
+    }
+
     fn create_test_data_source() -> InMemoryDataSource {
         let mut ds = InMemoryDataSource::new();
 
@@ -8452,6 +8621,114 @@ mod tests {
             }
             other => panic!("expected string IN-list kernel, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_compile_row_predicate_compiles_or_equality_chain_into_in_list() {
+        let predicate = Expr::and(
+            Expr::gte(Expr::column("issues", "estimate", 7), Expr::literal(3i64)),
+            Expr::or(
+                Expr::eq(
+                    Expr::column("issues", "status", 5),
+                    Expr::literal(Value::String("open".into())),
+                ),
+                Expr::eq(
+                    Expr::column("issues", "status", 5),
+                    Expr::literal(Value::String("in_progress".into())),
+                ),
+            ),
+        );
+
+        let compiled = PhysicalPlanRunner::<InMemoryDataSource>::compile_row_predicate(&predicate);
+        match compiled {
+            CompiledRowPredicate::And(predicates) => {
+                assert_eq!(predicates.len(), 2);
+                assert!(predicates.iter().any(|predicate| {
+                    matches!(
+                        predicate,
+                        CompiledRowPredicate::Comparison(SimpleBinaryPredicate {
+                            column_index: 7,
+                            ..
+                        })
+                    )
+                }));
+                assert!(predicates.iter().any(|predicate| {
+                    matches!(
+                        predicate,
+                        CompiledRowPredicate::InList {
+                            column_index: 5,
+                            kernel:
+                                InListPredicateKernel::String {
+                                    literals,
+                                    contains_null: false,
+                                },
+                            negated: false,
+                        } if literals == &vec![
+                            String::from("open"),
+                            String::from("in_progress"),
+                        ]
+                    )
+                }));
+            }
+            other => panic!("expected AND predicate with compiled IN-list branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_filtered_table_scan_compiles_or_chain_into_in_list_and_preserves_results() {
+        let mut ds = InMemoryDataSource::new();
+        ds.add_table(
+            "issues",
+            vec![
+                Row::new(1, vec![Value::String("open".into())]),
+                Row::new(2, vec![Value::String("in_progress".into())]),
+                Row::new(3, vec![Value::String("closed".into())]),
+                Row::new(4, vec![Value::Null]),
+            ],
+            1,
+        );
+
+        let runner = PhysicalPlanRunner::new(&ds);
+        let plan = PhysicalPlan::filter(
+            PhysicalPlan::table_scan("issues"),
+            Expr::or(
+                Expr::eq(
+                    Expr::column("issues", "status", 0),
+                    Expr::literal(Value::String("open".into())),
+                ),
+                Expr::eq(
+                    Expr::column("issues", "status", 0),
+                    Expr::literal(Value::String("in_progress".into())),
+                ),
+            ),
+        );
+
+        let expected = relation_snapshot(runner.execute(&plan).unwrap());
+        let artifact = PhysicalPlanRunner::<InMemoryDataSource>::compile_execution_artifact(&plan);
+
+        match &artifact.kind {
+            PlanExecutionArtifactKind::FilteredTableScan { predicate, .. } => {
+                assert!(matches!(
+                    predicate,
+                    CompiledRowPredicate::InList {
+                        column_index: 0,
+                        kernel:
+                            InListPredicateKernel::String {
+                                literals,
+                                contains_null: false,
+                            },
+                        negated: false,
+                    } if literals == &vec![
+                        String::from("open"),
+                        String::from("in_progress"),
+                    ]
+                ));
+            }
+            _ => panic!("expected filtered table scan artifact"),
+        }
+
+        let actual = relation_snapshot(runner.execute_with_artifact(&plan, &artifact).unwrap());
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -9308,6 +9585,56 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_hash_join_uses_table_upper_bound_for_gin_filtered_inputs() {
+        let ds = CardinalityOnlyDataSource::new(vec![("small", 128, 2), ("large", 50_000, 2)]);
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::filter(
+                PhysicalPlan::GinIndexScanMulti {
+                    table: "small".into(),
+                    index: "idx_small_metadata_gin".into(),
+                    pairs: vec![("priority".into(), "p1".into())],
+                    match_all: true,
+                    recheck: None,
+                },
+                Expr::eq(
+                    Expr::column("small", "flag", 1),
+                    Expr::literal(Value::Boolean(true)),
+                ),
+            ),
+            PhysicalPlan::filter(
+                PhysicalPlan::GinIndexScanMulti {
+                    table: "large".into(),
+                    index: "idx_large_metadata_gin".into(),
+                    pairs: vec![("tier".into(), "enterprise".into())],
+                    match_all: true,
+                    recheck: None,
+                },
+                Expr::eq(
+                    Expr::column("large", "flag", 1),
+                    Expr::literal(Value::Boolean(true)),
+                ),
+            ),
+            Expr::eq(
+                Expr::column("small", "id", 0),
+                Expr::column("large", "id", 0),
+            ),
+            JoinType::Inner,
+        );
+
+        let artifact = runner.compile_execution_artifact_with_data_source(&plan);
+        let PlanExecutionArtifactKind::CompiledExecPlan(exec_plan) = artifact.kind else {
+            panic!("expected compiled exec plan artifact");
+        };
+        let CompiledExecPlanKind::HashJoin { build_side, .. } = exec_plan.kind else {
+            panic!("expected compiled hash join");
+        };
+
+        assert!(matches!(build_side, HashJoinBuildSide::Left));
+    }
+
+    #[test]
     fn test_nested_loop_join_with_predicate() {
         let mut ds = InMemoryDataSource::new();
 
@@ -9402,6 +9729,193 @@ mod tests {
         let expected = relation_snapshot(runner.execute(&plan).unwrap());
         let artifact = runner.compile_execution_artifact_with_data_source(&plan);
         let actual = relation_snapshot(runner.execute_with_artifact(&plan, &artifact).unwrap());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_index_nested_loop_left_outer_emits_unmatched_outer_rows() {
+        let mut ds = InMemoryDataSource::new();
+        ds.add_table(
+            "left",
+            vec![
+                Row::new(1, vec![Value::Int64(1)]),
+                Row::new(2, vec![Value::Int64(2)]),
+                Row::new(3, vec![Value::Int64(3)]),
+            ],
+            1,
+        );
+        ds.add_table("right", vec![Row::new(10, vec![Value::Int64(1)])], 1);
+        ds.create_index("right", "idx_id", 0).unwrap();
+
+        let runner = PhysicalPlanRunner::new(&ds);
+        let plan = PhysicalPlan::IndexNestedLoopJoin {
+            outer: Box::new(PhysicalPlan::table_scan("left")),
+            inner_table: "right".into(),
+            inner_index: "idx_id".into(),
+            condition: Expr::eq(
+                Expr::column("left", "id", 0),
+                Expr::column("right", "id", 0),
+            ),
+            join_type: JoinType::LeftOuter,
+            outer_is_left: true,
+            output_tables: alloc::vec!["left".into(), "right".into()],
+        };
+
+        let result = runner.execute(&plan).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(
+            result.entries[0].row.values(),
+            &[Value::Int64(1), Value::Int64(1)]
+        );
+        assert_eq!(
+            result.entries[1].row.values(),
+            &[Value::Int64(2), Value::Null]
+        );
+        assert_eq!(
+            result.entries[2].row.values(),
+            &[Value::Int64(3), Value::Null]
+        );
+
+        let artifact = runner.compile_execution_artifact_with_data_source(&plan);
+        let actual = relation_snapshot(runner.execute_with_artifact(&plan, &artifact).unwrap());
+        let expected = relation_snapshot(result);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_index_nested_loop_right_outer_emits_unmatched_outer_rows() {
+        let mut ds = InMemoryDataSource::new();
+        ds.add_table(
+            "left",
+            vec![
+                Row::new(1, vec![Value::Int64(1)]),
+                Row::new(2, vec![Value::Int64(2)]),
+            ],
+            1,
+        );
+        ds.add_table(
+            "right",
+            vec![
+                Row::new(10, vec![Value::Int64(1)]),
+                Row::new(11, vec![Value::Int64(3)]),
+            ],
+            1,
+        );
+        ds.create_index("left", "idx_id", 0).unwrap();
+
+        let runner = PhysicalPlanRunner::new(&ds);
+        let plan = PhysicalPlan::IndexNestedLoopJoin {
+            outer: Box::new(PhysicalPlan::table_scan("right")),
+            inner_table: "left".into(),
+            inner_index: "idx_id".into(),
+            condition: Expr::eq(
+                Expr::column("left", "id", 0),
+                Expr::column("right", "id", 0),
+            ),
+            join_type: JoinType::RightOuter,
+            outer_is_left: false,
+            output_tables: alloc::vec!["left".into(), "right".into()],
+        };
+
+        let result = runner.execute(&plan).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.entries[0].row.values(),
+            &[Value::Int64(1), Value::Int64(1)]
+        );
+        assert_eq!(
+            result.entries[1].row.values(),
+            &[Value::Null, Value::Int64(3)]
+        );
+
+        let artifact = runner.compile_execution_artifact_with_data_source(&plan);
+        let actual = relation_snapshot(runner.execute_with_artifact(&plan, &artifact).unwrap());
+        let expected = relation_snapshot(result);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_index_nested_loop_join_resolves_probe_key_from_multi_table_outer() {
+        let mut ds = InMemoryDataSource::new();
+        ds.add_table(
+            "issues",
+            vec![
+                Row::new(100, vec![Value::Int64(100), Value::Int64(1)]),
+                Row::new(101, vec![Value::Int64(101), Value::Int64(2)]),
+            ],
+            2,
+        );
+        ds.add_table(
+            "projects",
+            vec![
+                Row::new(1, vec![Value::Int64(1)]),
+                Row::new(2, vec![Value::Int64(2)]),
+            ],
+            1,
+        );
+        ds.add_table(
+            "project_counters",
+            vec![
+                Row::new(1, vec![Value::Int64(1), Value::Int64(10)]),
+                Row::new(2, vec![Value::Int64(2), Value::Int64(20)]),
+            ],
+            2,
+        );
+        ds.create_index("project_counters", "idx_project_id", 0)
+            .unwrap();
+
+        let runner = PhysicalPlanRunner::new(&ds);
+        let plan = PhysicalPlan::IndexNestedLoopJoin {
+            outer: Box::new(PhysicalPlan::hash_join(
+                PhysicalPlan::table_scan("issues"),
+                PhysicalPlan::table_scan("projects"),
+                Expr::eq(
+                    Expr::column("issues", "project_id", 1),
+                    Expr::column("projects", "id", 0),
+                ),
+                JoinType::Inner,
+            )),
+            inner_table: "project_counters".into(),
+            inner_index: "idx_project_id".into(),
+            condition: Expr::eq(
+                Expr::column("projects", "id", 0),
+                Expr::column("project_counters", "project_id", 0),
+            ),
+            join_type: JoinType::Inner,
+            outer_is_left: true,
+            output_tables: alloc::vec![
+                "issues".into(),
+                "projects".into(),
+                "project_counters".into(),
+            ],
+        };
+
+        let result = runner.execute(&plan).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.entries[0].row.values(),
+            &[
+                Value::Int64(100),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(10),
+            ]
+        );
+        assert_eq!(
+            result.entries[1].row.values(),
+            &[
+                Value::Int64(101),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(20),
+            ]
+        );
+
+        let artifact = runner.compile_execution_artifact_with_data_source(&plan);
+        let actual = relation_snapshot(runner.execute_with_artifact(&plan, &artifact).unwrap());
+        let expected = relation_snapshot(result);
         assert_eq!(actual, expected);
     }
 

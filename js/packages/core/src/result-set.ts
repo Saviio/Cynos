@@ -7,6 +7,22 @@
 
 import type { BinaryResult, SchemaLayout } from './wasm.js';
 
+type SchemaLayoutMethods = Pick<
+  SchemaLayout,
+  'columnCount' | 'columnName' | 'columnOffset' | 'columnType' | 'nullMaskSize' | 'rowStride'
+>;
+
+export interface ResultSetLayoutSnapshot {
+  columnNames: string[];
+  columnOffsets: number[];
+  columnTypes: number[];
+  nullMaskSize: number;
+  rowStride: number;
+}
+
+export type ResultSetLayoutInput = SchemaLayoutMethods | ResultSetLayoutSnapshot;
+export type ResultSetBufferInput = BinaryResult | Uint8Array | ArrayBuffer;
+
 // Data type constants (must match Rust BinaryDataType)
 const DataType = {
   Boolean: 0,
@@ -25,13 +41,69 @@ const HEADER_SIZE = 16;
 // Shared TextDecoder instance for performance
 const textDecoder = new TextDecoder();
 
+function isLayoutSnapshot(layout: ResultSetLayoutInput): layout is ResultSetLayoutSnapshot {
+  return 'columnNames' in layout;
+}
+
+function normalizeLayout(layout: ResultSetLayoutInput): ResultSetLayoutSnapshot {
+  if (isLayoutSnapshot(layout)) {
+    return {
+      columnNames: [...layout.columnNames],
+      columnOffsets: [...layout.columnOffsets],
+      columnTypes: [...layout.columnTypes],
+      nullMaskSize: layout.nullMaskSize,
+      rowStride: layout.rowStride,
+    };
+  }
+
+  const columnCount = layout.columnCount();
+  const columnNames: string[] = new Array(columnCount);
+  const columnOffsets: number[] = new Array(columnCount);
+  const columnTypes: number[] = new Array(columnCount);
+
+  for (let i = 0; i < columnCount; i++) {
+    columnNames[i] = layout.columnName(i) ?? '';
+    columnOffsets[i] = layout.columnOffset(i) ?? 0;
+    columnTypes[i] = layout.columnType(i) ?? 0;
+  }
+
+  return {
+    columnNames,
+    columnOffsets,
+    columnTypes,
+    nullMaskSize: layout.nullMaskSize(),
+    rowStride: layout.rowStride(),
+  };
+}
+
+function normalizeBuffer(
+  buffer: ResultSetBufferInput
+): { view: Uint8Array; release: () => void } {
+  if (buffer instanceof Uint8Array) {
+    return { view: buffer, release: () => {} };
+  }
+
+  if (buffer instanceof ArrayBuffer) {
+    return { view: new Uint8Array(buffer), release: () => {} };
+  }
+
+  return {
+    view: (buffer as any).asView(),
+    release: () => buffer.free(),
+  };
+}
+
+export function snapshotSchemaLayout(layout: SchemaLayoutMethods): ResultSetLayoutSnapshot {
+  return normalizeLayout(layout);
+}
+
 /**
  * Zero-copy result set for binary protocol queries.
  * Provides lazy decoding of values directly from WASM linear memory.
  */
 export class ResultSet<T = Record<string, unknown>> implements Iterable<T> {
-  private readonly buffer: BinaryResult;
-  private readonly layout: SchemaLayout;
+  private readonly releaseBuffer: () => void;
+  private readonly layout: ResultSetLayoutSnapshot;
   private readonly uint8Array: Uint8Array;
   private readonly dataView: DataView;
 
@@ -53,16 +125,15 @@ export class ResultSet<T = Record<string, unknown>> implements Iterable<T> {
   /**
    * Create a ResultSet from a binary buffer and schema layout.
    *
-   * @param buffer - Binary result from execBinary()
-   * @param layout - Schema layout from getSchemaLayout()
+   * @param buffer - Binary result from execBinary(), or a transferred Uint8Array / ArrayBuffer
+   * @param layout - Schema layout from getSchemaLayout(), or a serialized layout snapshot
    */
-  constructor(buffer: BinaryResult, layout: SchemaLayout) {
-    this.buffer = buffer;
-    this.layout = layout;
+  constructor(buffer: ResultSetBufferInput, layout: ResultSetLayoutInput) {
+    this.layout = normalizeLayout(layout);
 
-    // Zero-copy: get a view directly into WASM linear memory
-    // WARNING: This view becomes invalid if WASM memory grows or buffer is freed
-    this.uint8Array = (buffer as any).asView();
+    const normalizedBuffer = normalizeBuffer(buffer);
+    this.releaseBuffer = normalizedBuffer.release;
+    this.uint8Array = normalizedBuffer.view;
     this.dataView = new DataView(
       this.uint8Array.buffer,
       this.uint8Array.byteOffset,
@@ -74,19 +145,12 @@ export class ResultSet<T = Record<string, unknown>> implements Iterable<T> {
     this._rowStride = this.dataView.getUint32(4, true);
     this._varOffset = this.dataView.getUint32(8, true);
     this._flags = this.dataView.getUint32(12, true);
-    this._nullMaskSize = layout.nullMaskSize();
+    this._nullMaskSize = this.layout.nullMaskSize;
 
     // Cache column info
-    const colCount = layout.columnCount();
-    this._columnNames = [];
-    this._columnTypes = [];
-    this._columnOffsets = [];
-
-    for (let i = 0; i < colCount; i++) {
-      this._columnNames.push(layout.columnName(i) ?? '');
-      this._columnTypes.push(layout.columnType(i) ?? 0);
-      this._columnOffsets.push(layout.columnOffset(i) ?? 0);
-    }
+    this._columnNames = [...this.layout.columnNames];
+    this._columnTypes = [...this.layout.columnTypes];
+    this._columnOffsets = [...this.layout.columnOffsets];
 
     // Compile a specialized row decoder function for this schema.
     // This generates code with literal property names and inlined offsets,
@@ -494,7 +558,7 @@ export class ResultSet<T = Record<string, unknown>> implements Iterable<T> {
    * Free the underlying WASM memory.
    */
   free(): void {
-    this.buffer.free();
+    this.releaseBuffer();
   }
 
   /**

@@ -4,6 +4,7 @@
 
 use crate::value::Value;
 use alloc::vec::Vec;
+use core::hash::{Hash, Hasher};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Unique identifier for a row.
@@ -13,8 +14,62 @@ pub type RowId = u64;
 /// (e.g., the result of joining two rows).
 pub const DUMMY_ROW_ID: RowId = u64::MAX;
 
+const ROW_ID_HASH_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+const ROW_ID_HASH_PRIME: u64 = 0x0000_0001_0000_01B3;
+const JOIN_ROW_ID_DOMAIN: u64 = 0x4A4F_494E_5F49_4E4E;
+const LEFT_JOIN_NULL_ROW_ID_DOMAIN: u64 = 0x4A4F_494E_5F4C_4E55;
+const RIGHT_JOIN_NULL_ROW_ID_DOMAIN: u64 = 0x4A4F_494E_5F52_4E55;
+const AGGREGATE_GROUP_ROW_ID_DOMAIN: u64 = 0x4147_475F_4752_4F55;
+
 /// Global row ID counter for generating unique row IDs.
 static NEXT_ROW_ID: AtomicU64 = AtomicU64::new(0);
+
+struct RowIdHasher {
+    state: u64,
+}
+
+impl RowIdHasher {
+    #[inline]
+    fn new(domain: u64) -> Self {
+        Self {
+            state: ROW_ID_HASH_OFFSET ^ domain.rotate_left(7),
+        }
+    }
+}
+
+impl Hasher for RowIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.state ^= u64::from(byte);
+            self.state = self.state.wrapping_mul(ROW_ID_HASH_PRIME);
+        }
+    }
+}
+
+#[inline]
+fn finalize_derived_row_id(id: u64) -> RowId {
+    if id == DUMMY_ROW_ID {
+        DUMMY_ROW_ID.wrapping_sub(1)
+    } else {
+        id
+    }
+}
+
+#[inline]
+fn hash_row_id<F>(domain: u64, feed: F) -> RowId
+where
+    F: FnOnce(&mut RowIdHasher),
+{
+    let mut hasher = RowIdHasher::new(domain);
+    feed(&mut hasher);
+    finalize_derived_row_id(hasher.finish())
+}
 
 /// Gets the next unique row ID.
 pub fn next_row_id() -> RowId {
@@ -35,6 +90,42 @@ pub fn set_next_row_id(id: RowId) {
 /// Sets the next row ID only if it's greater than the current value.
 pub fn set_next_row_id_if_greater(id: RowId) {
     NEXT_ROW_ID.fetch_max(id, Ordering::SeqCst);
+}
+
+/// Derives a deterministic row ID for an inner join row.
+#[inline]
+pub fn join_row_id(left_id: RowId, right_id: RowId) -> RowId {
+    hash_row_id(JOIN_ROW_ID_DOMAIN, |hasher| {
+        left_id.hash(hasher);
+        right_id.hash(hasher);
+    })
+}
+
+/// Derives a deterministic row ID for a left/full outer join row with a NULL right side.
+#[inline]
+pub fn left_join_null_row_id(left_id: RowId) -> RowId {
+    hash_row_id(LEFT_JOIN_NULL_ROW_ID_DOMAIN, |hasher| {
+        left_id.hash(hasher);
+    })
+}
+
+/// Derives a deterministic row ID for a right/full outer join row with a NULL left side.
+#[inline]
+pub fn right_join_null_row_id(right_id: RowId) -> RowId {
+    hash_row_id(RIGHT_JOIN_NULL_ROW_ID_DOMAIN, |hasher| {
+        right_id.hash(hasher);
+    })
+}
+
+/// Derives a deterministic row ID for an aggregate group row from its group key.
+#[inline]
+pub fn aggregate_group_row_id(group_key: &[Value]) -> RowId {
+    hash_row_id(AGGREGATE_GROUP_ROW_ID_DOMAIN, |hasher| {
+        group_key.len().hash(hasher);
+        for value in group_key {
+            value.hash(hasher);
+        }
+    })
 }
 
 /// A row in a database table.
@@ -242,5 +333,30 @@ mod tests {
         let row = Row::dummy_with_version(5, vec![Value::Int32(1)]);
         assert!(row.is_dummy());
         assert_eq!(row.version(), 5);
+    }
+
+    #[test]
+    fn test_join_row_id_is_deterministic() {
+        assert_eq!(join_row_id(1, 2), join_row_id(1, 2));
+        assert_ne!(join_row_id(1, 2), join_row_id(2, 1));
+    }
+
+    #[test]
+    fn test_derived_row_id_domains_do_not_collide_for_same_input() {
+        let base = 42;
+        assert_ne!(join_row_id(base, 7), left_join_null_row_id(base));
+        assert_ne!(left_join_null_row_id(base), right_join_null_row_id(base));
+    }
+
+    #[test]
+    fn test_aggregate_group_row_id_depends_on_group_key() {
+        assert_eq!(
+            aggregate_group_row_id(&[Value::Int64(1), Value::String("A".into())]),
+            aggregate_group_row_id(&[Value::Int64(1), Value::String("A".into())]),
+        );
+        assert_ne!(
+            aggregate_group_row_id(&[Value::Int64(1)]),
+            aggregate_group_row_id(&[Value::Int64(2)]),
+        );
     }
 }

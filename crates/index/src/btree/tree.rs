@@ -56,6 +56,15 @@ impl<K: Clone + Ord> BTreeIndex<K> {
         &self.stats
     }
 
+    /// Returns the number of distinct keys currently stored in the tree.
+    pub fn distinct_key_count(&self) -> usize {
+        self.arena
+            .iter()
+            .filter(|node| node.is_leaf)
+            .map(Node::key_count)
+            .sum()
+    }
+
     /// Returns whether this is a unique index.
     pub fn is_unique(&self) -> bool {
         self.unique

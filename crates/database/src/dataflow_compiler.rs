@@ -16,9 +16,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use cynos_core::{schema::Table, Row, Value};
 use cynos_incremental::{
-    AggregateType, DataflowNode, JoinType as IvmJoinType, KeyExtractorFn, TableId,
+    AggregateType, DataflowNode, JoinKeySpec, JoinType as IvmJoinType, TableId,
+    TraceTupleArena, TraceTupleHandle,
 };
 use cynos_index::KeyRange;
+use cynos_jsonb::{JsonPath, JsonbObject, JsonbValue};
 use cynos_query::ast::JoinType as QueryJoinType;
 use cynos_query::ast::{AggregateFunc, BinaryOp, Expr, UnaryOp};
 use cynos_query::planner::{IndexBounds, PhysicalPlan};
@@ -28,7 +30,7 @@ use hashbrown::HashMap;
 pub struct CompileResult {
     /// The dataflow node graph for incremental maintenance
     pub dataflow: DataflowNode,
-    /// Mapping from table name → table ID used in the dataflow
+    /// Mapping from table name → table ID used by this dataflow graph
     pub table_ids: HashMap<String, TableId>,
 }
 
@@ -113,6 +115,10 @@ impl CompileLayout {
         }
         indices
     }
+
+    fn total_width(&self) -> usize {
+        self.table_column_counts.iter().sum()
+    }
 }
 
 struct CompiledNode {
@@ -124,6 +130,46 @@ struct CompiledNode {
 struct IndexedColumnRef {
     name: String,
     index: usize,
+}
+
+struct TableIdResolver<'a> {
+    existing: &'a HashMap<String, TableId>,
+    used: HashMap<String, TableId>,
+    next_id: TableId,
+}
+
+impl<'a> TableIdResolver<'a> {
+    fn new(existing: &'a HashMap<String, TableId>) -> Self {
+        let next_id = existing
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        Self {
+            existing,
+            used: HashMap::new(),
+            next_id,
+        }
+    }
+
+    fn resolve(&mut self, table: &str) -> TableId {
+        if let Some(existing) = self.used.get(table) {
+            return *existing;
+        }
+
+        let table_id = self.existing.get(table).copied().unwrap_or_else(|| {
+            let allocated = self.next_id;
+            self.next_id = self.next_id.saturating_add(1);
+            allocated
+        });
+        self.used.insert(table.into(), table_id);
+        table_id
+    }
+
+    fn into_used(self) -> HashMap<String, TableId> {
+        self.used
+    }
 }
 
 /// Compiles a PhysicalPlan into a DataflowNode for IVM.
@@ -139,20 +185,20 @@ pub fn compile_to_dataflow(
         return None;
     }
 
-    let mut table_ids = table_id_map.clone();
+    let mut table_ids = TableIdResolver::new(table_id_map);
     let compiled = compile_node(plan, &mut table_ids, table_schemas)?;
     Some(CompileResult {
         dataflow: compiled.dataflow,
-        table_ids,
+        table_ids: table_ids.into_used(),
     })
 }
 
 fn compile_source_node(
     table: &str,
-    table_ids: &mut HashMap<String, TableId>,
+    table_ids: &mut TableIdResolver<'_>,
     table_schemas: &HashMap<String, Table>,
 ) -> Option<CompiledNode> {
-    let table_id = get_or_assign_table_id(table, table_ids);
+    let table_id = table_ids.resolve(table);
     let column_count = table_schemas.get(table)?.columns().len();
     Some(CompiledNode {
         dataflow: DataflowNode::source(table_id),
@@ -163,17 +209,19 @@ fn compile_source_node(
 fn compile_filtered_source(
     table: &str,
     predicate: Option<Expr>,
-    table_ids: &mut HashMap<String, TableId>,
+    table_ids: &mut TableIdResolver<'_>,
     table_schemas: &HashMap<String, Table>,
 ) -> Option<CompiledNode> {
     let source = compile_source_node(table, table_ids, table_schemas)?;
     if let Some(predicate) = predicate {
         let bound_predicate = bind_expr_to_layout(&predicate, &source.layout);
         let pred_fn = compile_predicate(&bound_predicate);
+        let trace_pred_fn = compile_trace_predicate(&bound_predicate);
         return Some(CompiledNode {
             dataflow: DataflowNode::Filter {
                 input: Box::new(source.dataflow),
                 predicate: pred_fn,
+                trace_predicate: Some(trace_pred_fn),
             },
             layout: source.layout,
         });
@@ -324,7 +372,7 @@ fn build_index_scan_predicate(
 
 fn compile_node(
     plan: &PhysicalPlan,
-    table_ids: &mut HashMap<String, TableId>,
+    table_ids: &mut TableIdResolver<'_>,
     table_schemas: &HashMap<String, Table>,
 ) -> Option<CompiledNode> {
     match plan {
@@ -387,10 +435,12 @@ fn compile_node(
             let input_node = compile_node(input, table_ids, table_schemas)?;
             let bound_predicate = bind_expr_to_layout(predicate, &input_node.layout);
             let pred_fn = compile_predicate(&bound_predicate);
+            let trace_pred_fn = compile_trace_predicate(&bound_predicate);
             Some(CompiledNode {
                 dataflow: DataflowNode::Filter {
                     input: Box::new(input_node.dataflow),
                     predicate: pred_fn,
+                    trace_predicate: Some(trace_pred_fn),
                 },
                 layout: input_node.layout,
             })
@@ -417,14 +467,19 @@ fn compile_node(
             } else {
                 // Has computed expressions — use Map node
                 let exprs = bound_columns;
+                let trace_mapper = compile_trace_mapper(&exprs);
+                let row_exprs = exprs.clone();
                 Some(CompiledNode {
                     dataflow: DataflowNode::Map {
                         input: Box::new(input_node.dataflow),
                         mapper: Box::new(move |row: &Row| {
-                            let values: Vec<Value> =
-                                exprs.iter().map(|expr| eval_expr(expr, row)).collect();
-                            Row::dummy(values)
+                            let values: Vec<Value> = row_exprs
+                                .iter()
+                                .map(|expr| eval_expr(expr, row))
+                                .collect();
+                            Row::new_with_version(row.id(), row.version(), values)
                         }),
+                        trace_mapper: Some(trace_mapper),
                     },
                     layout: input_node.layout.projected(columns.len()),
                 })
@@ -465,6 +520,8 @@ fn compile_node(
                 left_key,
                 right_key,
                 join_type: ivm_join_type,
+                left_width: left_node.layout.total_width(),
+                right_width: right_node.layout.total_width(),
             };
             Some(reorder_join_output(join_node, raw_layout, output_tables))
         }
@@ -479,7 +536,7 @@ fn compile_node(
             ..
         } => {
             let outer_node = compile_node(outer, table_ids, table_schemas)?;
-            let inner_table_id = get_or_assign_table_id(inner_table, table_ids);
+            let inner_table_id = table_ids.resolve(inner_table);
             let inner_column_count = table_schemas.get(inner_table)?.columns().len();
             let inner_layout = CompileLayout::table(inner_table, inner_column_count);
             let inner_node = CompiledNode {
@@ -502,6 +559,8 @@ fn compile_node(
                 left_key,
                 right_key,
                 join_type: ivm_join_type,
+                left_width: left_node.layout.total_width(),
+                right_width: right_node.layout.total_width(),
             };
 
             Some(reorder_join_output(join_node, raw_layout, output_tables))
@@ -516,9 +575,11 @@ fn compile_node(
                 dataflow: DataflowNode::Join {
                     left: Box::new(left_node.dataflow),
                     right: Box::new(right_node.dataflow),
-                    left_key: Box::new(|_| vec![Value::Int64(0)]),
-                    right_key: Box::new(|_| vec![Value::Int64(0)]),
+                    left_key: JoinKeySpec::Constant(alloc::vec![Value::Int64(0)]),
+                    right_key: JoinKeySpec::Constant(alloc::vec![Value::Int64(0)]),
                     join_type: IvmJoinType::Inner,
+                    left_width: left_node.layout.total_width(),
+                    right_width: right_node.layout.total_width(),
                 },
                 layout: raw_layout,
             })
@@ -594,50 +655,91 @@ fn compile_node(
 /// Compiles an Expr predicate into a closure for DataflowNode::Filter.
 fn compile_predicate(expr: &Expr) -> Box<dyn Fn(&Row) -> bool + Send + Sync> {
     let expr = expr.clone();
-    Box::new(move |row: &Row| match eval_expr(&expr, row) {
-        Value::Boolean(b) => b,
-        _ => false,
+    Box::new(move |row: &Row| {
+        let mut value_at = |index: usize| row.get(index).cloned();
+        matches!(eval_expr_with(&expr, &mut value_at), Value::Boolean(true))
+    })
+}
+
+fn compile_trace_predicate(
+    expr: &Expr,
+) -> Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> bool + Send + Sync> {
+    let expr = expr.clone();
+    Box::new(move |arena: &TraceTupleArena, handle: &TraceTupleHandle| {
+        let mut value_at = |index: usize| arena.value_at(handle, index);
+        matches!(eval_expr_with(&expr, &mut value_at), Value::Boolean(true))
+    })
+}
+
+fn compile_trace_mapper(
+    exprs: &[Expr],
+) -> Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> Row + Send + Sync> {
+    let exprs = exprs.to_vec();
+    Box::new(move |arena: &TraceTupleArena, handle: &TraceTupleHandle| {
+        let values = exprs
+            .iter()
+            .map(|expr| {
+                let mut value_at = |index: usize| arena.value_at(handle, index);
+                eval_expr_with(expr, &mut value_at)
+            })
+            .collect();
+        Row::new_with_version(arena.row_id(handle), arena.version(handle), values)
     })
 }
 
 /// Evaluates an expression against a row.
 fn eval_expr(expr: &Expr, row: &Row) -> Value {
+    let mut value_at = |index: usize| row.get(index).cloned();
+    eval_expr_with(expr, &mut value_at)
+}
+
+fn eval_expr_with<F>(expr: &Expr, value_at: &mut F) -> Value
+where
+    F: FnMut(usize) -> Option<Value>,
+{
     match expr {
-        Expr::Column(col_ref) => row.get(col_ref.index).cloned().unwrap_or(Value::Null),
+        Expr::Column(col_ref) => value_at(col_ref.index).unwrap_or(Value::Null),
         Expr::Literal(val) => val.clone(),
         Expr::BinaryOp { left, op, right } => {
-            let lval = eval_expr(left, row);
-            let rval = eval_expr(right, row);
+            let lval = eval_expr_with(left, value_at);
+            let rval = eval_expr_with(right, value_at);
             eval_binary_op(&lval, op, &rval)
         }
         Expr::UnaryOp { op, expr: inner } => {
-            let val = eval_expr(inner, row);
+            let val = eval_expr_with(inner, value_at);
             eval_unary_op(op, &val)
         }
+        Expr::Function { name, args } => {
+            let arg_values: Vec<Value> = args
+                .iter()
+                .map(|arg| eval_expr_with(arg, value_at))
+                .collect();
+            eval_function(name, &arg_values)
+        }
         Expr::In { expr, list } => {
-            let val = eval_expr(expr, row);
-            let found = list.iter().any(|item| eval_expr(item, row) == val);
+            let val = eval_expr_with(expr, value_at);
+            let found = list.iter().any(|item| eval_expr_with(item, value_at) == val);
             Value::Boolean(found)
         }
         Expr::NotIn { expr, list } => {
-            let val = eval_expr(expr, row);
-            let found = list.iter().any(|item| eval_expr(item, row) == val);
+            let val = eval_expr_with(expr, value_at);
+            let found = list.iter().any(|item| eval_expr_with(item, value_at) == val);
             Value::Boolean(!found)
         }
         Expr::Between { expr, low, high } => {
-            let val = eval_expr(expr, row);
-            let lo = eval_expr(low, row);
-            let hi = eval_expr(high, row);
+            let val = eval_expr_with(expr, value_at);
+            let lo = eval_expr_with(low, value_at);
+            let hi = eval_expr_with(high, value_at);
             Value::Boolean(val >= lo && val <= hi)
         }
         Expr::NotBetween { expr, low, high } => {
-            let val = eval_expr(expr, row);
-            let lo = eval_expr(low, row);
-            let hi = eval_expr(high, row);
+            let val = eval_expr_with(expr, value_at);
+            let lo = eval_expr_with(low, value_at);
+            let hi = eval_expr_with(high, value_at);
             Value::Boolean(val < lo || val > hi)
         }
         Expr::Like { expr, pattern } => {
-            let val = eval_expr(expr, row);
+            let val = eval_expr_with(expr, value_at);
             if let Value::String(s) = val {
                 Value::Boolean(cynos_core::pattern_match::like(&s, pattern))
             } else {
@@ -645,7 +747,7 @@ fn eval_expr(expr: &Expr, row: &Row) -> Value {
             }
         }
         Expr::NotLike { expr, pattern } => {
-            let val = eval_expr(expr, row);
+            let val = eval_expr_with(expr, value_at);
             if let Value::String(s) = val {
                 Value::Boolean(!cynos_core::pattern_match::like(&s, pattern))
             } else {
@@ -653,7 +755,7 @@ fn eval_expr(expr: &Expr, row: &Row) -> Value {
             }
         }
         Expr::Match { expr, pattern } => {
-            let val = eval_expr(expr, row);
+            let val = eval_expr_with(expr, value_at);
             if let Value::String(s) = val {
                 Value::Boolean(cynos_core::pattern_match::regex(&s, pattern))
             } else {
@@ -661,15 +763,341 @@ fn eval_expr(expr: &Expr, row: &Row) -> Value {
             }
         }
         Expr::NotMatch { expr, pattern } => {
-            let val = eval_expr(expr, row);
+            let val = eval_expr_with(expr, value_at);
             if let Value::String(s) = val {
                 Value::Boolean(!cynos_core::pattern_match::regex(&s, pattern))
             } else {
                 Value::Boolean(true)
             }
         }
-        // Function and Aggregate are not expected in filter predicates
+        // Aggregate expressions are not expected in row-level evaluation.
         _ => Value::Null,
+    }
+}
+
+fn eval_function(name: &str, args: &[Value]) -> Value {
+    if name.eq_ignore_ascii_case("ABS") {
+        return match args.first() {
+            Some(Value::Int32(value)) => Value::Int32(value.abs()),
+            Some(Value::Int64(value)) => Value::Int64(value.abs()),
+            Some(Value::Float64(value)) => Value::Float64(value.abs()),
+            _ => Value::Null,
+        };
+    }
+
+    if name.eq_ignore_ascii_case("UPPER") {
+        return match args.first() {
+            Some(Value::String(value)) => Value::String(value.to_uppercase().into()),
+            _ => Value::Null,
+        };
+    }
+
+    if name.eq_ignore_ascii_case("LOWER") {
+        return match args.first() {
+            Some(Value::String(value)) => Value::String(value.to_lowercase().into()),
+            _ => Value::Null,
+        };
+    }
+
+    if name.eq_ignore_ascii_case("LENGTH") {
+        return match args.first() {
+            Some(Value::String(value)) => Value::Int64(value.len() as i64),
+            _ => Value::Null,
+        };
+    }
+
+    if name.eq_ignore_ascii_case("COALESCE") {
+        for value in args {
+            if !value.is_null() {
+                return value.clone();
+            }
+        }
+        return Value::Null;
+    }
+
+    if name.eq_ignore_ascii_case("JSONB_PATH_EQ") {
+        return match (args.first(), args.get(1), args.get(2)) {
+            (Some(Value::Jsonb(jsonb)), Some(Value::String(path)), Some(expected)) => {
+                jsonb_path_eq(jsonb, path, expected)
+            }
+            _ => Value::Boolean(false),
+        };
+    }
+
+    if name.eq_ignore_ascii_case("JSONB_CONTAINS") {
+        return match (args.first(), args.get(1), args.get(2)) {
+            (Some(Value::Jsonb(jsonb)), Some(Value::String(path)), Some(expected)) => {
+                jsonb_contains(jsonb, path, expected)
+            }
+            _ => Value::Boolean(false),
+        };
+    }
+
+    if name.eq_ignore_ascii_case("JSONB_EXISTS") {
+        return match (args.first(), args.get(1)) {
+            (Some(Value::Jsonb(jsonb)), Some(Value::String(path))) => {
+                jsonb_path_exists(jsonb, path)
+            }
+            _ => Value::Boolean(false),
+        };
+    }
+
+    Value::Null
+}
+
+fn jsonb_path_eq(jsonb: &cynos_core::JsonbValue, path: &str, expected: &Value) -> Value {
+    let json_value = match parse_json_bytes(&jsonb.0) {
+        Some(value) => value,
+        None => return Value::Boolean(false),
+    };
+
+    let json_path = match JsonPath::parse(path) {
+        Ok(path) => path,
+        Err(_) => return Value::Boolean(false),
+    };
+
+    let results = json_value.query(&json_path);
+    match results.first() {
+        Some(actual) => Value::Boolean(compare_jsonb_with_value(actual, expected)),
+        None => Value::Boolean(false),
+    }
+}
+
+fn jsonb_path_exists(jsonb: &cynos_core::JsonbValue, path: &str) -> Value {
+    let json_value = match parse_json_bytes(&jsonb.0) {
+        Some(value) => value,
+        None => return Value::Boolean(false),
+    };
+
+    let json_path = match JsonPath::parse(path) {
+        Ok(path) => path,
+        Err(_) => return Value::Boolean(false),
+    };
+
+    Value::Boolean(!json_value.query(&json_path).is_empty())
+}
+
+fn jsonb_contains(jsonb: &cynos_core::JsonbValue, path: &str, expected: &Value) -> Value {
+    let json_value = match parse_json_bytes(&jsonb.0) {
+        Some(value) => value,
+        None => return Value::Boolean(false),
+    };
+
+    let json_path = match JsonPath::parse(path) {
+        Ok(path) => path,
+        Err(_) => return Value::Boolean(false),
+    };
+
+    let results = json_value.query(&json_path);
+    let Some(actual) = results.first() else {
+        return Value::Boolean(false);
+    };
+
+    let contains = match expected {
+        Value::String(expected_string) => {
+            jsonb_value_to_string(actual).contains(expected_string.as_str())
+        }
+        _ => compare_jsonb_with_value(actual, expected),
+    };
+
+    Value::Boolean(contains)
+}
+
+fn parse_json_bytes(bytes: &[u8]) -> Option<JsonbValue> {
+    let json_str = core::str::from_utf8(bytes).ok()?;
+    parse_json_text(json_str)
+}
+
+fn parse_json_text(s: &str) -> Option<JsonbValue> {
+    let s = s.trim();
+    if s == "null" {
+        return Some(JsonbValue::Null);
+    }
+    if s == "true" {
+        return Some(JsonbValue::Bool(true));
+    }
+    if s == "false" {
+        return Some(JsonbValue::Bool(false));
+    }
+    if let Ok(number) = s.parse::<f64>() {
+        return Some(JsonbValue::Number(number));
+    }
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let inner = &s[1..s.len() - 1];
+        return Some(JsonbValue::String(unescape_json(inner)));
+    }
+    if s.starts_with('{') {
+        return parse_json_object(s);
+    }
+    if s.starts_with('[') {
+        return parse_json_array(s);
+    }
+    None
+}
+
+fn unescape_json(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('/') => result.push('/'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn parse_json_object(s: &str) -> Option<JsonbValue> {
+    let s = s.trim();
+    if !s.starts_with('{') || !s.ends_with('}') {
+        return None;
+    }
+
+    let inner = s[1..s.len() - 1].trim();
+    if inner.is_empty() {
+        return Some(JsonbValue::Object(JsonbObject::new()));
+    }
+
+    let mut obj = JsonbObject::new();
+    for pair in split_json_top_level(inner, ',') {
+        let pair = pair.trim();
+        let colon_pos = find_json_colon(pair)?;
+        let key_str = pair[..colon_pos].trim();
+        let val_str = pair[colon_pos + 1..].trim();
+        if key_str.starts_with('"') && key_str.ends_with('"') && key_str.len() >= 2 {
+            let key = unescape_json(&key_str[1..key_str.len() - 1]);
+            let value = parse_json_text(val_str)?;
+            obj.insert(key, value);
+        } else {
+            return None;
+        }
+    }
+
+    Some(JsonbValue::Object(obj))
+}
+
+fn parse_json_array(s: &str) -> Option<JsonbValue> {
+    let s = s.trim();
+    if !s.starts_with('[') || !s.ends_with(']') {
+        return None;
+    }
+
+    let inner = s[1..s.len() - 1].trim();
+    if inner.is_empty() {
+        return Some(JsonbValue::Array(Vec::new()));
+    }
+
+    let mut arr = Vec::new();
+    for elem in split_json_top_level(inner, ',') {
+        arr.push(parse_json_text(elem.trim())?);
+    }
+    Some(JsonbValue::Array(arr))
+}
+
+fn split_json_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut start = 0usize;
+
+    for (index, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if c == '{' || c == '[' {
+            depth += 1;
+        } else if c == '}' || c == ']' {
+            depth -= 1;
+        } else if c == sep && depth == 0 {
+            parts.push(&s[start..index]);
+            start = index + c.len_utf8();
+        }
+    }
+
+    if start <= s.len() {
+        parts.push(&s[start..]);
+    }
+    parts
+}
+
+fn find_json_colon(s: &str) -> Option<usize> {
+    let mut in_string = false;
+    let mut escape = false;
+    for (index, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string && c == ':' {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn compare_jsonb_with_value(jsonb: &JsonbValue, value: &Value) -> bool {
+    match (jsonb, value) {
+        (JsonbValue::Null, Value::Null) => true,
+        (JsonbValue::Bool(left), Value::Boolean(right)) => left == right,
+        (JsonbValue::Number(left), Value::Int32(right)) => {
+            (*left - *right as f64).abs() < f64::EPSILON
+        }
+        (JsonbValue::Number(left), Value::Int64(right)) => {
+            (*left - *right as f64).abs() < f64::EPSILON
+        }
+        (JsonbValue::Number(left), Value::Float64(right)) => (*left - *right).abs() < f64::EPSILON,
+        (JsonbValue::String(left), Value::String(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn jsonb_value_to_string(value: &JsonbValue) -> String {
+    match value {
+        JsonbValue::Null => String::from("null"),
+        JsonbValue::Bool(boolean) => {
+            if *boolean {
+                String::from("true")
+            } else {
+                String::from("false")
+            }
+        }
+        JsonbValue::Number(number) => alloc::format!("{}", number),
+        JsonbValue::String(string) => string.clone(),
+        _ => alloc::format!("{:?}", value),
     }
 }
 
@@ -774,7 +1202,7 @@ fn extract_join_keys(
     condition: &Expr,
     left_layout: &CompileLayout,
     right_layout: &CompileLayout,
-) -> (KeyExtractorFn, KeyExtractorFn) {
+) -> (JoinKeySpec, JoinKeySpec) {
     let mut left_indices = Vec::new();
     let mut right_indices = Vec::new();
     collect_equi_join_keys(
@@ -787,24 +1215,14 @@ fn extract_join_keys(
 
     if left_indices.is_empty() || right_indices.is_empty() {
         return (
-            Box::new(|row: &Row| row.values().to_vec()),
-            Box::new(|row: &Row| row.values().to_vec()),
+            JoinKeySpec::Dynamic(Box::new(|row: &Row| row.values().to_vec())),
+            JoinKeySpec::Dynamic(Box::new(|row: &Row| row.values().to_vec())),
         );
     }
 
     (
-        Box::new(move |row: &Row| {
-            left_indices
-                .iter()
-                .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
-                .collect()
-        }),
-        Box::new(move |row: &Row| {
-            right_indices
-                .iter()
-                .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
-                .collect()
-        }),
+        JoinKeySpec::Columns(left_indices),
+        JoinKeySpec::Columns(right_indices),
     )
 }
 
@@ -955,11 +1373,6 @@ fn extract_column_ref(expr: &Expr) -> Option<&cynos_query::ast::ColumnRef> {
     }
 }
 
-fn get_or_assign_table_id(table: &str, table_ids: &mut HashMap<String, TableId>) -> TableId {
-    let next_id = table_ids.len() as TableId;
-    *table_ids.entry(table.into()).or_insert(next_id)
-}
-
 fn convert_join_type(jt: &QueryJoinType) -> IvmJoinType {
     match jt {
         QueryJoinType::Inner | QueryJoinType::Cross => IvmJoinType::Inner,
@@ -1000,6 +1413,10 @@ mod tests {
             .collect()
     }
 
+    fn jsonb_value(json: &str) -> Value {
+        Value::Jsonb(cynos_core::JsonbValue::new(json.as_bytes().to_vec()))
+    }
+
     #[test]
     fn test_compile_table_scan() {
         let plan = PhysicalPlan::table_scan("users");
@@ -1025,7 +1442,12 @@ mod tests {
         let table_schemas = table_schemas(&[("users", &["id", "age"])]);
 
         let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
-        assert!(matches!(result.dataflow, DataflowNode::Filter { .. }));
+        match result.dataflow {
+            DataflowNode::Filter {
+                trace_predicate, ..
+            } => assert!(trace_predicate.is_some()),
+            _ => panic!("Expected Filter node"),
+        }
     }
 
     #[test]
@@ -1141,6 +1563,29 @@ mod tests {
                 assert_eq!(*join_type, IvmJoinType::LeftOuter);
             }
             _ => panic!("Expected Join node"),
+        }
+    }
+
+    #[test]
+    fn test_compile_computed_project_includes_trace_mapper() {
+        let plan = PhysicalPlan::project(
+            PhysicalPlan::table_scan("users"),
+            alloc::vec![
+                Expr::column("users", "id", 0),
+                Expr::Function {
+                    name: "UPPER".into(),
+                    args: alloc::vec![Expr::column("users", "name", 1)],
+                },
+            ],
+        );
+        let mut table_ids = HashMap::new();
+        table_ids.insert("users".into(), 1u32);
+        let table_schemas = table_schemas(&[("users", &["id", "name"])]);
+
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
+        match result.dataflow {
+            DataflowNode::Map { trace_mapper, .. } => assert!(trace_mapper.is_some()),
+            _ => panic!("Expected Map node"),
         }
     }
 
@@ -1407,5 +1852,265 @@ mod tests {
         assert_eq!(rows[0].get(0), Some(&Value::Int64(1)));
         assert_eq!(rows[0].get(2), Some(&Value::Int64(10)));
         assert_eq!(rows[0].get(3), Some(&Value::String("Engineering".into())));
+    }
+
+    #[test]
+    fn test_filter_with_json_function_propagates_updates() {
+        use cynos_incremental::{Delta, MaterializedView};
+
+        let projects = TableBuilder::new("projects")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("healthScore", DataType::Int32)
+            .unwrap()
+            .add_column("metadata", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert("projects".into(), projects);
+
+        let plan = PhysicalPlan::filter(
+            PhysicalPlan::table_scan("projects"),
+            Expr::and(
+                Expr::ge(
+                    Expr::column("projects", "healthScore", 1),
+                    Expr::Literal(Value::Int32(45)),
+                ),
+                Expr::jsonb_path_eq(
+                    Expr::column("projects", "metadata", 2),
+                    "$.risk.bucket",
+                    Value::String("high".into()),
+                ),
+            ),
+        );
+
+        let mut table_ids = HashMap::new();
+        table_ids.insert("projects".into(), 1u32);
+
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
+        let mut view = MaterializedView::new(result.dataflow);
+
+        let initial_row = Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                Value::Int32(61),
+                jsonb_value(r#"{"risk":{"bucket":"high"}}"#),
+            ],
+        );
+        let updated_row = Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                Value::Int32(12),
+                jsonb_value(r#"{"risk":{"bucket":"high"}}"#),
+            ],
+        );
+
+        let initial_deltas =
+            view.on_table_change(1, alloc::vec![Delta::insert(initial_row.clone())]);
+        assert_eq!(initial_deltas.len(), 1);
+        assert!(initial_deltas[0].is_insert());
+        assert_eq!(view.len(), 1);
+
+        let update_deltas = view.on_table_change(
+            1,
+            alloc::vec![Delta::delete(initial_row), Delta::insert(updated_row)],
+        );
+        assert_eq!(update_deltas.len(), 1);
+        assert!(update_deltas[0].is_delete());
+        assert_eq!(view.len(), 0);
+    }
+
+    #[test]
+    fn test_filter_with_json_function_over_multi_join_propagates_updates() {
+        use cynos_incremental::{Delta, MaterializedView};
+        use cynos_query::ast::JoinType;
+
+        let projects = TableBuilder::new("projects")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("organizationId", DataType::Int64)
+            .unwrap()
+            .add_column("healthScore", DataType::Int32)
+            .unwrap()
+            .add_column("metadata", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let organizations = TableBuilder::new("organizations")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let counters = TableBuilder::new("projectCounters")
+            .unwrap()
+            .add_column("projectId", DataType::Int64)
+            .unwrap()
+            .add_column("openIssueCount", DataType::Int32)
+            .unwrap()
+            .add_primary_key(&["projectId"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let snapshots = TableBuilder::new("projectSnapshots")
+            .unwrap()
+            .add_column("projectId", DataType::Int64)
+            .unwrap()
+            .add_column("velocity", DataType::Int32)
+            .unwrap()
+            .add_primary_key(&["projectId"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert("projects".into(), projects);
+        table_schemas.insert("organizations".into(), organizations);
+        table_schemas.insert("projectCounters".into(), counters);
+        table_schemas.insert("projectSnapshots".into(), snapshots);
+
+        let project_org_join = PhysicalPlan::hash_join_with_output_tables(
+            PhysicalPlan::table_scan("projects"),
+            PhysicalPlan::table_scan("organizations"),
+            Expr::eq(
+                Expr::column("projects", "organizationId", 1),
+                Expr::column("organizations", "id", 0),
+            ),
+            JoinType::LeftOuter,
+            alloc::vec!["projects".into(), "organizations".into()],
+        );
+        let with_counters = PhysicalPlan::hash_join_with_output_tables(
+            project_org_join,
+            PhysicalPlan::table_scan("projectCounters"),
+            Expr::eq(
+                Expr::column("projects", "id", 0),
+                Expr::column("projectCounters", "projectId", 0),
+            ),
+            JoinType::LeftOuter,
+            alloc::vec![
+                "projects".into(),
+                "organizations".into(),
+                "projectCounters".into(),
+            ],
+        );
+        let with_snapshots = PhysicalPlan::hash_join_with_output_tables(
+            with_counters,
+            PhysicalPlan::table_scan("projectSnapshots"),
+            Expr::eq(
+                Expr::column("projects", "id", 0),
+                Expr::column("projectSnapshots", "projectId", 0),
+            ),
+            JoinType::LeftOuter,
+            alloc::vec![
+                "projects".into(),
+                "organizations".into(),
+                "projectCounters".into(),
+                "projectSnapshots".into(),
+            ],
+        );
+        let plan = PhysicalPlan::filter(
+            with_snapshots,
+            Expr::and(
+                Expr::and(
+                    Expr::and(
+                        Expr::ge(
+                            Expr::column("projects", "healthScore", 2),
+                            Expr::Literal(Value::Int32(45)),
+                        ),
+                        Expr::jsonb_path_eq(
+                            Expr::column("projects", "metadata", 3),
+                            "$.risk.bucket",
+                            Value::String("high".into()),
+                        ),
+                    ),
+                    Expr::ge(
+                        Expr::column("projectCounters", "openIssueCount", 1),
+                        Expr::Literal(Value::Int32(4)),
+                    ),
+                ),
+                Expr::ge(
+                    Expr::column("projectSnapshots", "velocity", 1),
+                    Expr::Literal(Value::Int32(20)),
+                ),
+            ),
+        );
+
+        let mut table_ids = HashMap::new();
+        table_ids.insert("projects".into(), 1u32);
+        table_ids.insert("organizations".into(), 2u32);
+        table_ids.insert("projectCounters".into(), 3u32);
+        table_ids.insert("projectSnapshots".into(), 4u32);
+
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
+        let mut view = MaterializedView::new(result.dataflow);
+
+        view.on_table_change(
+            2,
+            alloc::vec![Delta::insert(Row::new(
+                10,
+                vec![Value::Int64(10), Value::String("Org".into())],
+            ))],
+        );
+        view.on_table_change(
+            3,
+            alloc::vec![Delta::insert(Row::new(
+                1,
+                vec![Value::Int64(1), Value::Int32(7)],
+            ))],
+        );
+        view.on_table_change(
+            4,
+            alloc::vec![Delta::insert(Row::new(
+                1,
+                vec![Value::Int64(1), Value::Int32(35)],
+            ))],
+        );
+
+        let initial_row = Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                Value::Int64(10),
+                Value::Int32(61),
+                jsonb_value(r#"{"risk":{"bucket":"high"}}"#),
+            ],
+        );
+        let updated_row = Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                Value::Int64(10),
+                Value::Int32(12),
+                jsonb_value(r#"{"risk":{"bucket":"high"}}"#),
+            ],
+        );
+
+        let initial_deltas =
+            view.on_table_change(1, alloc::vec![Delta::insert(initial_row.clone())]);
+        assert_eq!(initial_deltas.len(), 1);
+        assert!(initial_deltas[0].is_insert());
+        assert_eq!(view.len(), 1);
+
+        let update_deltas = view.on_table_change(
+            1,
+            alloc::vec![Delta::delete(initial_row), Delta::insert(updated_row)],
+        );
+        assert_eq!(update_deltas.len(), 1);
+        assert!(update_deltas[0].is_delete());
+        assert_eq!(view.len(), 0);
     }
 }

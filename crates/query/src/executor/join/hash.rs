@@ -4,7 +4,7 @@ use crate::executor::{Relation, RelationEntry, SharedTables, SqlValueRef};
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use cynos_core::{Row, Value};
+use cynos_core::{join_row_id, left_join_null_row_id, Row, Value};
 use hashbrown::HashMap;
 
 /// Hash Join executor.
@@ -146,7 +146,15 @@ impl HashJoin {
                             };
 
                             result_entries.push(RelationEntry::new_combined(
-                                Rc::new(Row::dummy_with_version(combined_version, values)),
+                                Rc::new(Row::new_with_version(
+                                    if swap {
+                                        join_row_id(probe_entry.row.id(), build_entry.row.id())
+                                    } else {
+                                        join_row_id(build_entry.row.id(), probe_entry.row.id())
+                                    },
+                                    combined_version,
+                                    values,
+                                )),
                                 Arc::clone(&combined_tables),
                             ));
                         }
@@ -163,7 +171,11 @@ impl HashJoin {
                 let combined_version = probe_entry.row.version();
 
                 result_entries.push(RelationEntry::new_combined(
-                    Rc::new(Row::dummy_with_version(combined_version, values)),
+                    Rc::new(Row::new_with_version(
+                        left_join_null_row_id(probe_entry.row.id()),
+                        combined_version,
+                        values,
+                    )),
                     Arc::clone(&combined_tables),
                 ));
             }
