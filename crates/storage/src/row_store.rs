@@ -33,13 +33,53 @@ struct RowSlot {
 struct GinIndexConfig {
     column_idx: usize,
     indexed_paths: Option<Vec<String>>,
+    compiled_indexed_paths: Option<Vec<CompiledGinPath>>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledGinPath {
+    encoded_path: String,
+    contains_key: String,
+    segments: Vec<CompiledGinPathSegment>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledGinPathSegment {
+    key: String,
+    array_index: Option<usize>,
 }
 
 impl GinIndexConfig {
     fn new(column_idx: usize, indexed_paths: Option<Vec<String>>) -> Self {
+        let indexed_paths = indexed_paths.filter(|paths| !paths.is_empty());
+        let compiled_indexed_paths = indexed_paths.as_ref().map(|paths| {
+            paths
+                .iter()
+                .cloned()
+                .map(CompiledGinPath::new)
+                .collect()
+        });
         Self {
             column_idx,
-            indexed_paths: indexed_paths.filter(|paths| !paths.is_empty()),
+            indexed_paths,
+            compiled_indexed_paths,
+        }
+    }
+}
+
+impl CompiledGinPath {
+    fn new(encoded_path: String) -> Self {
+        let segments = decode_gin_path_segments(&encoded_path)
+            .into_iter()
+            .map(|key| CompiledGinPathSegment {
+                array_index: key.parse::<usize>().ok(),
+                key,
+            })
+            .collect();
+        Self {
+            contains_key: cynos_index::contains_trigram_key(&encoded_path),
+            encoded_path,
+            segments,
         }
     }
 }
@@ -899,7 +939,7 @@ impl RowStore {
                         &mut builder,
                         value,
                         row.id(),
-                        config.indexed_paths.as_deref(),
+                        config.compiled_indexed_paths.as_deref(),
                     );
                 }
             }
@@ -952,6 +992,8 @@ impl RowStore {
             .iter()
             .map(|(name, config)| (name.clone(), config.clone()))
             .collect();
+        let mut gin_builders: Vec<GinBulkBuilder> =
+            gin_defs.iter().map(|_| GinBulkBuilder::new()).collect();
 
         self.row_slots.reserve(rows.len());
         self.scan_order.reserve(rows.len());
@@ -962,6 +1004,7 @@ impl RowStore {
             let row_id = row.id();
 
             if self.rows.contains_key(&row_id) {
+                Self::flush_gin_bulk_builders(&mut self.gin_indices, &gin_defs, &mut gin_builders);
                 return Err(Error::invalid_operation("Row ID already exists"));
             }
 
@@ -969,6 +1012,11 @@ impl RowStore {
                 let pk = extract_key(&row, &self.pk_columns);
                 if let Some(ref pk_index) = self.primary_index {
                     if pk_index.contains_index_key(&pk) {
+                        Self::flush_gin_bulk_builders(
+                            &mut self.gin_indices,
+                            &gin_defs,
+                            &mut gin_builders,
+                        );
                         return Err(Error::UniqueConstraint {
                             column: "primary_key".into(),
                             value: pk.to_error_value(),
@@ -986,6 +1034,11 @@ impl RowStore {
                 if def.unique {
                     if let Some(idx) = self.secondary_indices.get(&def.name) {
                         if idx.contains_index_key(&key) {
+                            Self::flush_gin_bulk_builders(
+                                &mut self.gin_indices,
+                                &gin_defs,
+                                &mut gin_builders,
+                            );
                             return Err(Error::UniqueConstraint {
                                 column: def.name.clone(),
                                 value: key.to_error_value(),
@@ -996,15 +1049,25 @@ impl RowStore {
                 secondary_keys.push(key);
             }
 
-            self.row_id_index
+            if self
+                .row_id_index
                 .add(Value::Int64(row_id as i64), row_id)
-                .map_err(|_| Error::invalid_operation("Failed to add to row ID index"))?;
+                .is_err()
+            {
+                Self::flush_gin_bulk_builders(&mut self.gin_indices, &gin_defs, &mut gin_builders);
+                return Err(Error::invalid_operation("Failed to add to row ID index"));
+            }
 
             if let (Some(ref mut pk_index), Some(pk)) = (&mut self.primary_index, pk_value.clone())
             {
                 if pk_index.add_index_key(pk.clone(), row_id).is_err() {
                     self.row_id_index
                         .remove(&Value::Int64(row_id as i64), Some(row_id));
+                    Self::flush_gin_bulk_builders(
+                        &mut self.gin_indices,
+                        &gin_defs,
+                        &mut gin_builders,
+                    );
                     return Err(Error::UniqueConstraint {
                         column: "primary_key".into(),
                         value: pk.to_error_value(),
@@ -1033,6 +1096,11 @@ impl RowStore {
                         }
                         self.row_id_index
                             .remove(&Value::Int64(row_id as i64), Some(row_id));
+                        Self::flush_gin_bulk_builders(
+                            &mut self.gin_indices,
+                            &gin_defs,
+                            &mut gin_builders,
+                        );
                         return Err(Error::UniqueConstraint {
                             column: def.name.clone(),
                             value: key.to_error_value(),
@@ -1041,16 +1109,13 @@ impl RowStore {
                 }
             }
 
-            for (idx_name, config) in &gin_defs {
-                let Some(gin_idx) = self.gin_indices.get_mut(idx_name) else {
-                    continue;
-                };
+            for ((_, config), builder) in gin_defs.iter().zip(gin_builders.iter_mut()) {
                 if let Some(value) = row.get(config.column_idx) {
-                    Self::index_jsonb_value(
-                        gin_idx,
+                    Self::collect_jsonb_value_into_builder(
+                        builder,
                         value,
                         row_id,
-                        config.indexed_paths.as_deref(),
+                        config.compiled_indexed_paths.as_deref(),
                     );
                 }
             }
@@ -1059,7 +1124,21 @@ impl RowStore {
             inserted += 1;
         }
 
+        Self::flush_gin_bulk_builders(&mut self.gin_indices, &gin_defs, &mut gin_builders);
         Ok(inserted)
+    }
+
+    fn flush_gin_bulk_builders(
+        gin_indices: &mut BTreeMap<String, GinIndex>,
+        gin_defs: &[(String, GinIndexConfig)],
+        gin_builders: &mut [GinBulkBuilder],
+    ) {
+        for ((idx_name, _), builder) in gin_defs.iter().zip(gin_builders.iter_mut()) {
+            let Some(gin_idx) = gin_indices.get_mut(idx_name) else {
+                continue;
+            };
+            gin_idx.apply_bulk_builder(core::mem::take(builder));
+        }
     }
 
     fn can_use_bulk_insert_fast_path(
@@ -1177,7 +1256,7 @@ impl RowStore {
                         gin_idx,
                         value,
                         row_id,
-                        config.indexed_paths.as_deref(),
+                        config.compiled_indexed_paths.as_deref(),
                     );
                 }
             }
@@ -1217,7 +1296,7 @@ impl RowStore {
                         gin_idx,
                         value,
                         row_id,
-                        config.indexed_paths.as_deref(),
+                        config.compiled_indexed_paths.as_deref(),
                     );
                 }
             }
@@ -1301,7 +1380,7 @@ impl RowStore {
                             gin_idx,
                             old_val,
                             row_id,
-                            config.indexed_paths.as_deref(),
+                            config.compiled_indexed_paths.as_deref(),
                         );
                     }
                     if let Some(new_val) = new_value {
@@ -1309,7 +1388,7 @@ impl RowStore {
                             gin_idx,
                             new_val,
                             row_id,
-                            config.indexed_paths.as_deref(),
+                            config.compiled_indexed_paths.as_deref(),
                         );
                     }
                 }
@@ -1357,7 +1436,7 @@ impl RowStore {
                         gin_idx,
                         value,
                         row_id,
-                        config.indexed_paths.as_deref(),
+                        config.compiled_indexed_paths.as_deref(),
                     );
                 }
             }
@@ -1430,7 +1509,7 @@ impl RowStore {
                             gin_idx,
                             value,
                             row.id(),
-                            config.indexed_paths.as_deref(),
+                            config.compiled_indexed_paths.as_deref(),
                         );
                     }
                 }
@@ -2127,7 +2206,7 @@ impl RowStore {
         gin_idx: &mut GinIndex,
         value: &Value,
         row_id: RowId,
-        indexed_paths: Option<&[String]>,
+        indexed_paths: Option<&[CompiledGinPath]>,
     ) {
         let Some(parsed) = Self::parse_jsonb_value(value) else {
             return;
@@ -2146,7 +2225,7 @@ impl RowStore {
         builder: &mut GinBulkBuilder,
         value: &Value,
         row_id: RowId,
-        indexed_paths: Option<&[String]>,
+        indexed_paths: Option<&[CompiledGinPath]>,
     ) {
         let Some(parsed) = Self::parse_jsonb_value(value) else {
             return;
@@ -2225,6 +2304,18 @@ impl RowStore {
         gin_idx.add_contains_trigrams(current_path, &value_str, row_id);
     }
 
+    fn index_jsonb_contains_prefilter_for_key(
+        gin_idx: &mut GinIndex,
+        contains_key: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        let value_str = value.stringify_for_contains();
+        for gram in cynos_index::contains_trigrams(&value_str) {
+            gin_idx.add_key_value(contains_key.into(), gram, row_id);
+        }
+    }
+
     fn collect_jsonb_node_into_builder(
         builder: &mut GinBulkBuilder,
         value: &ParsedJsonbValue,
@@ -2238,7 +2329,7 @@ impl RowStore {
                     let saved_len = current_path.len();
                     Self::append_gin_path_segment(current_path, key);
                     if Self::should_index_gin_path(indexed_paths, current_path) {
-                        builder.add_key(current_path.clone(), row_id);
+                        builder.add_key_ref(current_path, row_id);
                         Self::collect_jsonb_scalar_into_builder(
                             builder,
                             current_path,
@@ -2270,7 +2361,7 @@ impl RowStore {
                     let segment = idx.to_string();
                     Self::append_gin_path_segment(current_path, &segment);
                     if Self::should_index_gin_path(indexed_paths, current_path) {
-                        builder.add_key(current_path.clone(), row_id);
+                        builder.add_key_ref(current_path, row_id);
                         Self::collect_jsonb_scalar_into_builder(
                             builder,
                             current_path,
@@ -2307,7 +2398,7 @@ impl RowStore {
         row_id: RowId,
     ) {
         if let Some(value_str) = Self::jsonb_scalar_to_index_value(value) {
-            builder.add_key_value(current_path.into(), value_str, row_id);
+            builder.add_key_value_ref(current_path, &value_str, row_id);
         }
     }
 
@@ -2325,15 +2416,20 @@ impl RowStore {
         gin_idx: &mut GinIndex,
         value: &ParsedJsonbValue,
         row_id: RowId,
-        indexed_paths: &[String],
+        indexed_paths: &[CompiledGinPath],
     ) {
         for path in indexed_paths {
-            let Some(selected) = Self::jsonb_value_at_encoded_gin_path(value, path) else {
+            let Some(selected) = Self::jsonb_value_at_compiled_gin_path(value, path) else {
                 continue;
             };
-            gin_idx.add_key(path.clone(), row_id);
-            Self::index_jsonb_scalar(gin_idx, path, selected, row_id);
-            Self::index_jsonb_contains_prefilter(gin_idx, path, selected, row_id);
+            gin_idx.add_key(path.encoded_path.clone(), row_id);
+            Self::index_jsonb_scalar(gin_idx, &path.encoded_path, selected, row_id);
+            Self::index_jsonb_contains_prefilter_for_key(
+                gin_idx,
+                &path.contains_key,
+                selected,
+                row_id,
+            );
         }
     }
 
@@ -2341,16 +2437,31 @@ impl RowStore {
         builder: &mut GinBulkBuilder,
         value: &ParsedJsonbValue,
         row_id: RowId,
-        indexed_paths: &[String],
+        indexed_paths: &[CompiledGinPath],
     ) {
         for path in indexed_paths {
-            let Some(selected) = Self::jsonb_value_at_encoded_gin_path(value, path) else {
+            let Some(selected) = Self::jsonb_value_at_compiled_gin_path(value, path) else {
                 continue;
             };
-            builder.add_key(path.clone(), row_id);
-            Self::collect_jsonb_scalar_into_builder(builder, path, selected, row_id);
-            Self::collect_jsonb_contains_prefilter_into_builder(builder, path, selected, row_id);
+            builder.add_key_ref(&path.encoded_path, row_id);
+            Self::collect_jsonb_scalar_into_builder(builder, &path.encoded_path, selected, row_id);
+            Self::collect_jsonb_contains_prefilter_into_builder_for_key(
+                builder,
+                &path.contains_key,
+                selected,
+                row_id,
+            );
         }
+    }
+
+    fn collect_jsonb_contains_prefilter_into_builder_for_key(
+        builder: &mut GinBulkBuilder,
+        contains_key: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        let value_str = value.stringify_for_contains();
+        builder.add_contains_trigrams_for_key(contains_key, &value_str, row_id);
     }
 
     /// Removes JSONB value from the GIN index.
@@ -2358,7 +2469,7 @@ impl RowStore {
         gin_idx: &mut GinIndex,
         value: &Value,
         row_id: RowId,
-        indexed_paths: Option<&[String]>,
+        indexed_paths: Option<&[CompiledGinPath]>,
     ) {
         let Some(parsed) = Self::parse_jsonb_value(value) else {
             return;
@@ -2470,19 +2581,36 @@ impl RowStore {
         }
     }
 
+    fn remove_jsonb_contains_prefilter_for_key(
+        gin_idx: &mut GinIndex,
+        contains_key: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        let value_str = value.stringify_for_contains();
+        for gram in cynos_index::contains_trigrams(&value_str) {
+            gin_idx.remove_key_value(contains_key, &gram, row_id);
+        }
+    }
+
     fn remove_jsonb_selected_paths(
         gin_idx: &mut GinIndex,
         value: &ParsedJsonbValue,
         row_id: RowId,
-        indexed_paths: &[String],
+        indexed_paths: &[CompiledGinPath],
     ) {
         for path in indexed_paths {
-            let Some(selected) = Self::jsonb_value_at_encoded_gin_path(value, path) else {
+            let Some(selected) = Self::jsonb_value_at_compiled_gin_path(value, path) else {
                 continue;
             };
-            gin_idx.remove_key(path, row_id);
-            Self::remove_jsonb_scalar(gin_idx, path, selected, row_id);
-            Self::remove_jsonb_contains_prefilter(gin_idx, path, selected, row_id);
+            gin_idx.remove_key(&path.encoded_path, row_id);
+            Self::remove_jsonb_scalar(gin_idx, &path.encoded_path, selected, row_id);
+            Self::remove_jsonb_contains_prefilter_for_key(
+                gin_idx,
+                &path.contains_key,
+                selected,
+                row_id,
+            );
         }
     }
 
@@ -2854,6 +2982,11 @@ impl RowStore {
         let config = self.gin_index_configs.get(index_name)?;
         let value = row.get(config.column_idx)?;
         let parsed = Self::parse_jsonb_value(value)?;
+        if let Some(paths) = config.compiled_indexed_paths.as_ref() {
+            if let Some(path) = paths.iter().find(|path| path.encoded_path == key) {
+                return Self::jsonb_value_at_compiled_gin_path(&parsed, path).cloned();
+            }
+        }
         Self::jsonb_value_at_encoded_gin_path(&parsed, key).cloned()
     }
 
@@ -2905,6 +3038,24 @@ impl RowStore {
                     let index = segment.parse::<usize>().ok()?;
                     items.get(index)?
                 }
+                ParsedJsonbValue::Null
+                | ParsedJsonbValue::Bool(_)
+                | ParsedJsonbValue::Number(_)
+                | ParsedJsonbValue::String(_) => return None,
+            };
+        }
+        Some(current)
+    }
+
+    fn jsonb_value_at_compiled_gin_path<'a>(
+        value: &'a ParsedJsonbValue,
+        path: &CompiledGinPath,
+    ) -> Option<&'a ParsedJsonbValue> {
+        let mut current = value;
+        for segment in &path.segments {
+            current = match current {
+                ParsedJsonbValue::Object(object) => object.get(&segment.key)?,
+                ParsedJsonbValue::Array(items) => items.get(segment.array_index?)?,
                 ParsedJsonbValue::Null
                 | ParsedJsonbValue::Bool(_)
                 | ParsedJsonbValue::Number(_)

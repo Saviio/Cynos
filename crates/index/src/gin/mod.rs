@@ -10,6 +10,7 @@ pub use posting::PostingList;
 use crate::stats::IndexStats;
 use alloc::collections::BTreeSet;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use cynos_core::RowId;
 use hashbrown::HashMap;
@@ -64,7 +65,7 @@ fn push_sorted_unique_row(rows: &mut Vec<RowId>, row_id: RowId) {
 #[derive(Debug, Clone, Default)]
 pub struct GinBulkBuilder {
     key_index: HashMap<String, Vec<RowId>>,
-    key_value_index: HashMap<(String, String), Vec<RowId>>,
+    key_value_index: HashMap<String, HashMap<String, Vec<RowId>>>,
     key_add_count: usize,
 }
 
@@ -73,18 +74,36 @@ impl GinBulkBuilder {
         Self::default()
     }
 
-    pub fn add_key(&mut self, key: String, row_id: RowId) {
+    pub fn add_key_ref(&mut self, key: &str, row_id: RowId) {
         self.key_add_count += 1;
-        push_sorted_unique_row(self.key_index.entry(key).or_insert_with(Vec::new), row_id);
+        if let Some(rows) = self.key_index.get_mut(key) {
+            push_sorted_unique_row(rows, row_id);
+            return;
+        }
+
+        self.key_index.insert(key.into(), vec![row_id]);
+    }
+
+    pub fn add_key(&mut self, key: String, row_id: RowId) {
+        self.add_key_ref(&key, row_id);
+    }
+
+    pub fn add_key_value_ref(&mut self, key: &str, value: &str, row_id: RowId) {
+        let values = self
+            .key_value_index
+            .entry(key.into())
+            .or_insert_with(HashMap::new);
+
+        if let Some(rows) = values.get_mut(value) {
+            push_sorted_unique_row(rows, row_id);
+            return;
+        }
+
+        values.insert(value.into(), vec![row_id]);
     }
 
     pub fn add_key_value(&mut self, key: String, value: String, row_id: RowId) {
-        push_sorted_unique_row(
-            self.key_value_index
-                .entry((key, value))
-                .or_insert_with(Vec::new),
-            row_id,
-        );
+        self.add_key_value_ref(&key, &value, row_id);
     }
 
     pub fn add_key_values(
@@ -99,10 +118,19 @@ impl GinBulkBuilder {
 
     pub fn add_contains_trigrams(&mut self, path: &str, needle: &str, row_id: RowId) -> usize {
         let key = contains_trigram_key(path);
+        self.add_contains_trigrams_for_key(&key, needle, row_id)
+    }
+
+    pub fn add_contains_trigrams_for_key(
+        &mut self,
+        contains_key: &str,
+        needle: &str,
+        row_id: RowId,
+    ) -> usize {
         let grams = contains_trigrams(needle);
         let count = grams.len();
         for gram in grams {
-            self.add_key_value(key.clone(), gram, row_id);
+            self.add_key_value_ref(contains_key, &gram, row_id);
         }
         count
     }
@@ -117,7 +145,11 @@ impl GinBulkBuilder {
             key_value_index: self
                 .key_value_index
                 .into_iter()
-                .map(|((key, value), rows)| ((key, value), PostingList::from_sorted_unique(rows)))
+                .flat_map(|(key, values)| {
+                    values.into_iter().map(move |(value, rows)| {
+                        ((key.clone(), value), PostingList::from_sorted_unique(rows))
+                    })
+                })
                 .collect(),
             key_add_count: self.key_add_count,
         }
