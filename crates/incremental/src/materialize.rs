@@ -5,13 +5,15 @@
 //! the current result and propagates deltas through the dataflow graph.
 
 use crate::dataflow::node::JoinType;
-use crate::dataflow::{AggregateType, ColumnId, DataflowNode, TableId};
+use crate::dataflow::{AggregateType, ColumnId, DataflowNode, JoinKeySpec, TableId};
 use crate::delta::Delta;
 use crate::trace::{TraceDeltaBatch, TraceTupleArena, TraceTupleHandle, VisibleResultStore};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::mem;
 use cynos_core::{aggregate_group_row_id, Row, RowId, Value};
 use hashbrown::HashMap;
 
@@ -1079,9 +1081,95 @@ pub struct CompiledIvmPlan {
     node: CompiledIvmNode,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct BootstrapExecutionProfile {
+    pub filter_bootstrap_ms: f64,
+    pub project_bootstrap_ms: f64,
+    pub map_bootstrap_ms: f64,
+    pub join_bootstrap_ms: f64,
+    pub aggregate_bootstrap_ms: f64,
+    pub root_sink_ms: f64,
+}
+
 #[derive(Clone)]
 pub struct CompiledBootstrapPlan {
-    node: CompiledBootstrapNode,
+    legacy_node: CompiledBootstrapNode,
+    program: CompiledBootstrapProgram,
+}
+
+#[derive(Clone)]
+struct CompiledBootstrapProgram {
+    instructions: Box<[BootstrapInstruction]>,
+    slot_count: usize,
+}
+
+type BootstrapSlotId = usize;
+
+#[derive(Clone)]
+enum BootstrapInstruction {
+    Source {
+        node_index: usize,
+        source_index: usize,
+        output_slot: BootstrapSlotId,
+    },
+    Filter {
+        node_index: usize,
+        input_slot: BootstrapSlotId,
+        output_slot: BootstrapSlotId,
+        covered_source_index: Option<usize>,
+    },
+    Project {
+        input_slot: BootstrapSlotId,
+        output_slot: BootstrapSlotId,
+        columns: Rc<[usize]>,
+    },
+    Map {
+        node_index: usize,
+        input_slot: BootstrapSlotId,
+        output_slot: BootstrapSlotId,
+    },
+    Join {
+        node_index: usize,
+        state_id: usize,
+        left_width: usize,
+        right_width: usize,
+        left_slot: BootstrapSlotId,
+        right_slot: BootstrapSlotId,
+        output_slot: Option<BootstrapSlotId>,
+    },
+    Aggregate {
+        state_id: usize,
+        input_slot: BootstrapSlotId,
+        output_slot: Option<BootstrapSlotId>,
+        group_by: Vec<ColumnId>,
+        functions: Vec<(ColumnId, AggregateType)>,
+    },
+}
+
+struct BootstrapCompileOutput {
+    output_slot: Option<BootstrapSlotId>,
+    direct_source_index: Option<usize>,
+}
+
+enum BootstrapRuntimeNode<'a> {
+    Source {
+        table_id: TableId,
+    },
+    Filter {
+        predicate: &'a (dyn Fn(&Row) -> bool + Send + Sync),
+        trace_predicate:
+            Option<&'a (dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> bool + Send + Sync)>,
+    },
+    Map {
+        mapper: &'a (dyn Fn(&Row) -> Row + Send + Sync),
+        trace_mapper:
+            Option<&'a (dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> Row + Send + Sync)>,
+    },
+    Join {
+        left_key: &'a JoinKeySpec,
+        right_key: &'a JoinKeySpec,
+        join_type: JoinType,
+    },
 }
 
 #[derive(Clone)]
@@ -1091,7 +1179,9 @@ struct CompiledBootstrapNode {
 
 #[derive(Clone)]
 enum CompiledBootstrapNodeKind {
-    Source,
+    Source {
+        source_index: usize,
+    },
     Filter {
         input: Box<CompiledBootstrapNode>,
     },
@@ -1159,8 +1249,27 @@ impl CompiledIvmPlan {
 
 impl CompiledBootstrapPlan {
     pub fn compile(node: &DataflowNode) -> Self {
+        let mut next_source_index = 0usize;
+        let legacy_node = compile_bootstrap_node(node, 0, &mut next_source_index);
+        let mut program_source_index = 0usize;
+        let mut next_node_index = 0usize;
+        let mut next_slot = 0usize;
+        let mut instructions = Vec::new();
+        compile_bootstrap_program_node(
+            node,
+            false,
+            0,
+            &mut next_node_index,
+            &mut program_source_index,
+            &mut next_slot,
+            &mut instructions,
+        );
         Self {
-            node: compile_bootstrap_node(node, 0),
+            legacy_node,
+            program: CompiledBootstrapProgram {
+                instructions: instructions.into_boxed_slice(),
+                slot_count: next_slot,
+            },
         }
     }
 }
@@ -1236,18 +1345,26 @@ fn compile_ivm_node(node: &DataflowNode, state_id: usize) -> CompiledIvmNode {
     }
 }
 
-fn compile_bootstrap_node(node: &DataflowNode, state_id: usize) -> CompiledBootstrapNode {
+fn compile_bootstrap_node(
+    node: &DataflowNode,
+    state_id: usize,
+    next_source_index: &mut usize,
+) -> CompiledBootstrapNode {
     let kind = match node {
-        DataflowNode::Source { .. } => CompiledBootstrapNodeKind::Source,
+        DataflowNode::Source { .. } => {
+            let source_index = *next_source_index;
+            *next_source_index = next_source_index.saturating_add(1);
+            CompiledBootstrapNodeKind::Source { source_index }
+        }
         DataflowNode::Filter { input, .. } => CompiledBootstrapNodeKind::Filter {
-            input: Box::new(compile_bootstrap_node(input, state_id)),
+            input: Box::new(compile_bootstrap_node(input, state_id, next_source_index)),
         },
         DataflowNode::Project { input, columns } => CompiledBootstrapNodeKind::Project {
-            input: Box::new(compile_bootstrap_node(input, state_id)),
+            input: Box::new(compile_bootstrap_node(input, state_id, next_source_index)),
             columns: Rc::<[usize]>::from(columns.clone().into_boxed_slice()),
         },
         DataflowNode::Map { input, .. } => CompiledBootstrapNodeKind::Map {
-            input: Box::new(compile_bootstrap_node(input, state_id)),
+            input: Box::new(compile_bootstrap_node(input, state_id, next_source_index)),
         },
         DataflowNode::Join {
             left,
@@ -1259,15 +1376,348 @@ fn compile_bootstrap_node(node: &DataflowNode, state_id: usize) -> CompiledBoots
             state_id,
             left_width: *left_width,
             right_width: *right_width,
-            left: Box::new(compile_bootstrap_node(left, left_child_state_id(state_id))),
-            right: Box::new(compile_bootstrap_node(right, right_child_state_id(state_id))),
+            left: Box::new(compile_bootstrap_node(
+                left,
+                left_child_state_id(state_id),
+                next_source_index,
+            )),
+            right: Box::new(compile_bootstrap_node(
+                right,
+                right_child_state_id(state_id),
+                next_source_index,
+            )),
         },
         DataflowNode::Aggregate { input, .. } => CompiledBootstrapNodeKind::Aggregate {
             state_id,
-            input: Box::new(compile_bootstrap_node(input, left_child_state_id(state_id))),
+            input: Box::new(compile_bootstrap_node(
+                input,
+                left_child_state_id(state_id),
+                next_source_index,
+            )),
         },
     };
     CompiledBootstrapNode { kind }
+}
+
+fn alloc_bootstrap_slot(next_slot: &mut usize) -> BootstrapSlotId {
+    let slot = *next_slot;
+    *next_slot = next_slot.saturating_add(1);
+    slot
+}
+
+fn compile_bootstrap_program_node(
+    node: &DataflowNode,
+    emit_to_parent: bool,
+    state_id: usize,
+    next_node_index: &mut usize,
+    next_source_index: &mut usize,
+    next_slot: &mut usize,
+    instructions: &mut Vec<BootstrapInstruction>,
+) -> BootstrapCompileOutput {
+    let node_index = *next_node_index;
+    *next_node_index = next_node_index.saturating_add(1);
+
+    match node {
+        DataflowNode::Source { .. } => {
+            let source_index = *next_source_index;
+            *next_source_index = next_source_index.saturating_add(1);
+            if !emit_to_parent {
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: Some(source_index),
+                };
+            }
+
+            let output_slot = alloc_bootstrap_slot(next_slot);
+            instructions.push(BootstrapInstruction::Source {
+                node_index,
+                source_index,
+                output_slot,
+            });
+            BootstrapCompileOutput {
+                output_slot: Some(output_slot),
+                direct_source_index: Some(source_index),
+            }
+        }
+        DataflowNode::Filter { input, .. } => {
+            if !emit_to_parent {
+                compile_bootstrap_program_node(
+                    input,
+                    false,
+                    state_id,
+                    next_node_index,
+                    next_source_index,
+                    next_slot,
+                    instructions,
+                );
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: None,
+                };
+            }
+
+            let input = compile_bootstrap_program_node(
+                input,
+                true,
+                state_id,
+                next_node_index,
+                next_source_index,
+                next_slot,
+                instructions,
+            );
+            let Some(input_slot) = input.output_slot else {
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: None,
+                };
+            };
+            let output_slot = alloc_bootstrap_slot(next_slot);
+            instructions.push(BootstrapInstruction::Filter {
+                node_index,
+                input_slot,
+                output_slot,
+                covered_source_index: input.direct_source_index,
+            });
+            BootstrapCompileOutput {
+                output_slot: Some(output_slot),
+                direct_source_index: None,
+            }
+        }
+        DataflowNode::Project { input, columns } => {
+            if !emit_to_parent {
+                compile_bootstrap_program_node(
+                    input,
+                    false,
+                    state_id,
+                    next_node_index,
+                    next_source_index,
+                    next_slot,
+                    instructions,
+                );
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: None,
+                };
+            }
+
+            let input = compile_bootstrap_program_node(
+                input,
+                true,
+                state_id,
+                next_node_index,
+                next_source_index,
+                next_slot,
+                instructions,
+            );
+            let Some(input_slot) = input.output_slot else {
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: None,
+                };
+            };
+            let output_slot = alloc_bootstrap_slot(next_slot);
+            instructions.push(BootstrapInstruction::Project {
+                input_slot,
+                output_slot,
+                columns: Rc::<[usize]>::from(columns.clone().into_boxed_slice()),
+            });
+            BootstrapCompileOutput {
+                output_slot: Some(output_slot),
+                direct_source_index: None,
+            }
+        }
+        DataflowNode::Map { input, .. } => {
+            if !emit_to_parent {
+                compile_bootstrap_program_node(
+                    input,
+                    false,
+                    state_id,
+                    next_node_index,
+                    next_source_index,
+                    next_slot,
+                    instructions,
+                );
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: None,
+                };
+            }
+
+            let input = compile_bootstrap_program_node(
+                input,
+                true,
+                state_id,
+                next_node_index,
+                next_source_index,
+                next_slot,
+                instructions,
+            );
+            let Some(input_slot) = input.output_slot else {
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: None,
+                };
+            };
+            let output_slot = alloc_bootstrap_slot(next_slot);
+            instructions.push(BootstrapInstruction::Map {
+                node_index,
+                input_slot,
+                output_slot,
+            });
+            BootstrapCompileOutput {
+                output_slot: Some(output_slot),
+                direct_source_index: None,
+            }
+        }
+        DataflowNode::Join {
+            left,
+            right,
+            left_width,
+            right_width,
+            ..
+        } => {
+            let left = compile_bootstrap_program_node(
+                left,
+                true,
+                left_child_state_id(state_id),
+                next_node_index,
+                next_source_index,
+                next_slot,
+                instructions,
+            );
+            let Some(left_slot) = left.output_slot else {
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: None,
+                };
+            };
+            let right = compile_bootstrap_program_node(
+                right,
+                true,
+                right_child_state_id(state_id),
+                next_node_index,
+                next_source_index,
+                next_slot,
+                instructions,
+            );
+            let Some(right_slot) = right.output_slot else {
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: None,
+                };
+            };
+            let output_slot = emit_to_parent.then(|| alloc_bootstrap_slot(next_slot));
+            instructions.push(BootstrapInstruction::Join {
+                node_index,
+                state_id,
+                left_width: *left_width,
+                right_width: *right_width,
+                left_slot,
+                right_slot,
+                output_slot,
+            });
+            BootstrapCompileOutput {
+                output_slot,
+                direct_source_index: None,
+            }
+        }
+        DataflowNode::Aggregate {
+            input,
+            group_by,
+            functions,
+        } => {
+            let input = compile_bootstrap_program_node(
+                input,
+                true,
+                left_child_state_id(state_id),
+                next_node_index,
+                next_source_index,
+                next_slot,
+                instructions,
+            );
+            let Some(input_slot) = input.output_slot else {
+                return BootstrapCompileOutput {
+                    output_slot: None,
+                    direct_source_index: None,
+                };
+            };
+            let output_slot = emit_to_parent.then(|| alloc_bootstrap_slot(next_slot));
+            instructions.push(BootstrapInstruction::Aggregate {
+                state_id,
+                input_slot,
+                output_slot,
+                group_by: group_by.clone(),
+                functions: functions.clone(),
+            });
+            BootstrapCompileOutput {
+                output_slot,
+                direct_source_index: None,
+            }
+        }
+    }
+}
+
+fn collect_bootstrap_runtime_nodes<'a>(
+    node: &'a DataflowNode,
+    runtime_nodes: &mut Vec<BootstrapRuntimeNode<'a>>,
+) {
+    match node {
+        DataflowNode::Source { table_id } => {
+            runtime_nodes.push(BootstrapRuntimeNode::Source {
+                table_id: *table_id,
+            });
+        }
+        DataflowNode::Filter {
+            input,
+            predicate,
+            trace_predicate,
+        } => {
+            runtime_nodes.push(BootstrapRuntimeNode::Filter {
+                predicate: predicate.as_ref(),
+                trace_predicate: trace_predicate.as_deref(),
+            });
+            collect_bootstrap_runtime_nodes(input, runtime_nodes);
+        }
+        DataflowNode::Project { input, .. } => {
+            runtime_nodes.push(BootstrapRuntimeNode::Source {
+                table_id: u32::MAX,
+            });
+            collect_bootstrap_runtime_nodes(input, runtime_nodes);
+        }
+        DataflowNode::Map {
+            input,
+            mapper,
+            trace_mapper,
+        } => {
+            runtime_nodes.push(BootstrapRuntimeNode::Map {
+                mapper: mapper.as_ref(),
+                trace_mapper: trace_mapper.as_deref(),
+            });
+            collect_bootstrap_runtime_nodes(input, runtime_nodes);
+        }
+        DataflowNode::Join {
+            left,
+            right,
+            left_key,
+            right_key,
+            join_type,
+            ..
+        } => {
+            runtime_nodes.push(BootstrapRuntimeNode::Join {
+                left_key,
+                right_key,
+                join_type: *join_type,
+            });
+            collect_bootstrap_runtime_nodes(left, runtime_nodes);
+            collect_bootstrap_runtime_nodes(right, runtime_nodes);
+        }
+        DataflowNode::Aggregate { input, .. } => {
+            runtime_nodes.push(BootstrapRuntimeNode::Source {
+                table_id: u32::MAX,
+            });
+            collect_bootstrap_runtime_nodes(input, runtime_nodes);
+        }
+    }
 }
 
 fn merge_compiled_sources(left: &[TableId], right: &[TableId]) -> Box<[TableId]> {
@@ -1307,16 +1757,19 @@ fn bootstrap_node_stream_with_source_visitor<F>(
     aggregate_states: &mut HashMap<usize, GroupAggregateState>,
     emit: &mut dyn FnMut(TraceTupleHandle),
 ) where
-    F: FnMut(TableId, &mut dyn FnMut(Rc<Row>)),
+    F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
 {
     let arena = TraceTupleArena;
     match (node, &meta.kind) {
-        (DataflowNode::Source { table_id }, CompiledBootstrapNodeKind::Source) => {
+        (
+            DataflowNode::Source { table_id },
+            CompiledBootstrapNodeKind::Source { source_index },
+        ) => {
             if !emit_to_parent {
                 return;
             }
             let mut emit_source_row = |row: Rc<Row>| emit(arena.base_rc(row));
-            visit_source_rows(*table_id, &mut emit_source_row);
+            visit_source_rows(*table_id, *source_index, &mut emit_source_row);
         }
 
         (
@@ -1478,6 +1931,227 @@ fn bootstrap_node_stream_with_source_visitor<F>(
     }
 }
 
+fn timed_block(
+    now_fn: Option<fn() -> f64>,
+    total_ms: &mut f64,
+    run: impl FnOnce(),
+) {
+    if let Some(now_fn) = now_fn {
+        let started_at = now_fn();
+        run();
+        *total_ms += now_fn() - started_at;
+    } else {
+        run();
+    }
+}
+
+fn execute_compiled_bootstrap_program_with_source_visitor<F>(
+    dataflow: &DataflowNode,
+    plan: &CompiledBootstrapPlan,
+    visit_source_rows: &mut F,
+    source_filter_coverage: Option<&[bool]>,
+    join_states: &mut HashMap<usize, JoinState>,
+    aggregate_states: &mut HashMap<usize, GroupAggregateState>,
+    now_fn: Option<fn() -> f64>,
+) -> BootstrapExecutionProfile
+where
+    F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
+{
+    let arena = TraceTupleArena;
+    let mut runtime_nodes = Vec::new();
+    collect_bootstrap_runtime_nodes(dataflow, &mut runtime_nodes);
+    let mut slots = vec![Vec::<TraceTupleHandle>::new(); plan.program.slot_count];
+    let mut profile = BootstrapExecutionProfile::default();
+
+    for instruction in plan.program.instructions.iter() {
+        match instruction {
+            BootstrapInstruction::Source {
+                node_index,
+                source_index,
+                output_slot,
+            } => {
+                let table_id = match runtime_nodes.get(*node_index) {
+                    Some(BootstrapRuntimeNode::Source { table_id }) => *table_id,
+                    _ => unreachable!("bootstrap source instruction must map to source runtime node"),
+                };
+                let slot = &mut slots[*output_slot];
+                slot.clear();
+                let mut emit_source_row = |row: Rc<Row>| slot.push(arena.base_rc(row));
+                visit_source_rows(table_id, *source_index, &mut emit_source_row);
+            }
+            BootstrapInstruction::Filter {
+                node_index,
+                input_slot,
+                output_slot,
+                covered_source_index,
+            } => {
+                let (predicate, trace_predicate) = match runtime_nodes.get(*node_index) {
+                    Some(BootstrapRuntimeNode::Filter {
+                        predicate,
+                        trace_predicate,
+                    }) => (*predicate, *trace_predicate),
+                    _ => unreachable!("bootstrap filter instruction must map to filter runtime node"),
+                };
+                let input: Vec<TraceTupleHandle> = mem::take(&mut slots[*input_slot]);
+                let output = &mut slots[*output_slot];
+                output.clear();
+                output.reserve(input.len());
+                let skip_filter = covered_source_index
+                    .and_then(|source_index| {
+                        source_filter_coverage
+                            .and_then(|coverages| coverages.get(source_index))
+                            .copied()
+                    })
+                    .unwrap_or(false);
+                if skip_filter {
+                    output.extend(input);
+                    continue;
+                }
+                timed_block(now_fn, &mut profile.filter_bootstrap_ms, || {
+                    for handle in input {
+                        let keep = if let Some(trace_predicate) =
+                            trace_predicate.filter(|_| !arena.has_materialized_row(&handle))
+                        {
+                            trace_predicate(&arena, &handle)
+                        } else {
+                            let row = arena.materialize_rc(&handle);
+                            predicate(&row)
+                        };
+                        if keep {
+                            output.push(handle);
+                        }
+                    }
+                });
+            }
+            BootstrapInstruction::Project {
+                input_slot,
+                output_slot,
+                columns,
+            } => {
+                let input: Vec<TraceTupleHandle> = mem::take(&mut slots[*input_slot]);
+                let output = &mut slots[*output_slot];
+                output.clear();
+                output.reserve(input.len());
+                timed_block(now_fn, &mut profile.project_bootstrap_ms, || {
+                    for handle in input {
+                        output.push(arena.project(handle, columns.clone()));
+                    }
+                });
+            }
+            BootstrapInstruction::Map {
+                node_index,
+                input_slot,
+                output_slot,
+            } => {
+                let (mapper, trace_mapper) = match runtime_nodes.get(*node_index) {
+                    Some(BootstrapRuntimeNode::Map {
+                        mapper,
+                        trace_mapper,
+                    }) => (*mapper, *trace_mapper),
+                    _ => unreachable!("bootstrap map instruction must map to map runtime node"),
+                };
+                let input: Vec<TraceTupleHandle> = mem::take(&mut slots[*input_slot]);
+                let output = &mut slots[*output_slot];
+                output.clear();
+                output.reserve(input.len());
+                timed_block(now_fn, &mut profile.map_bootstrap_ms, || {
+                    for handle in input {
+                        let mut mapped = if let Some(trace_mapper) =
+                            trace_mapper.filter(|_| !arena.has_materialized_row(&handle))
+                        {
+                            trace_mapper(&arena, &handle)
+                        } else {
+                            let row = arena.materialize_rc(&handle);
+                            mapper(&row)
+                        };
+                        mapped.set_id(handle.row_id());
+                        mapped.set_version(handle.version());
+                        output.push(arena.owned(mapped));
+                    }
+                });
+            }
+            BootstrapInstruction::Join {
+                node_index,
+                state_id,
+                left_width,
+                right_width,
+                left_slot,
+                right_slot,
+                output_slot,
+            } => {
+                let (left_key, right_key, join_type) = match runtime_nodes.get(*node_index) {
+                    Some(BootstrapRuntimeNode::Join {
+                        left_key,
+                        right_key,
+                        join_type,
+                    }) => (*left_key, *right_key, *join_type),
+                    _ => unreachable!("bootstrap join instruction must map to join runtime node"),
+                };
+                let left_input = mem::take(&mut slots[*left_slot]);
+                let right_input = mem::take(&mut slots[*right_slot]);
+                let mut join_state = JoinState::with_col_counts(*left_width, *right_width);
+                timed_block(now_fn, &mut profile.join_bootstrap_ms, || {
+                    for handle in left_input {
+                        let key = extract_join_key_handle(left_key, &arena, &handle);
+                        join_state.left.insert(handle, key, 0);
+                    }
+                    for handle in right_input {
+                        let key = extract_join_key_handle(right_key, &arena, &handle);
+                        join_state.right.insert(handle, key, 0);
+                    }
+                    join_state.finalize_bootstrap_match_counts();
+                });
+
+                if let Some(output_slot) = output_slot {
+                    let output = &mut slots[*output_slot];
+                    output.clear();
+                    timed_block(now_fn, &mut profile.join_bootstrap_ms, || {
+                        join_state.emit_bootstrap_rows(join_type, &arena, &mut |handle| {
+                            output.push(handle);
+                        });
+                    });
+                } else {
+                    // Root join is the visible sink in trace bootstrap; visible rows are already installed.
+                    timed_block(now_fn, &mut profile.root_sink_ms, || {});
+                }
+
+                join_states.insert(*state_id, join_state);
+            }
+            BootstrapInstruction::Aggregate {
+                state_id,
+                input_slot,
+                output_slot,
+                group_by,
+                functions,
+            } => {
+                let input = mem::take(&mut slots[*input_slot]);
+                let mut aggregate_state = GroupAggregateState::new(group_by.clone(), functions.clone());
+                timed_block(now_fn, &mut profile.aggregate_bootstrap_ms, || {
+                    for handle in &input {
+                        aggregate_state.apply_trace_bootstrap_handle(&arena, handle);
+                    }
+                });
+
+                if let Some(output_slot) = output_slot {
+                    let output = &mut slots[*output_slot];
+                    output.clear();
+                    timed_block(now_fn, &mut profile.aggregate_bootstrap_ms, || {
+                        aggregate_state.emit_bootstrap_rows(&arena, &mut |handle| {
+                            output.push(handle);
+                        });
+                    });
+                } else {
+                    timed_block(now_fn, &mut profile.root_sink_ms, || {});
+                }
+
+                aggregate_states.insert(*state_id, aggregate_state);
+            }
+        }
+    }
+
+    profile
+}
+
 fn extract_numeric(value: &Value) -> f64 {
     match value {
         Value::Int32(v) => *v as f64,
@@ -1608,20 +2282,20 @@ impl MaterializedView {
 
         let mut join_states = HashMap::new();
         let mut aggregate_states = HashMap::new();
-        bootstrap_node_stream_with_source_visitor(
+        execute_compiled_bootstrap_program_with_source_visitor(
             &dataflow,
-            &compiled_bootstrap_plan.node,
-            false,
-            &mut |table_id, emit| {
+            &compiled_bootstrap_plan,
+            &mut |table_id, _source_index, emit| {
                 if let Some(rows) = source_rows.get(&table_id) {
                     for row in rows {
                         emit(Rc::new(row.clone()));
                     }
                 }
             },
+            None,
             &mut join_states,
             &mut aggregate_states,
-            &mut |_| {},
+            None,
         );
 
         Self {
@@ -1668,7 +2342,7 @@ impl MaterializedView {
             compiled_plan,
             compiled_bootstrap_plan,
             initial,
-            move |table_id, emit| {
+            move |table_id, _source_index, emit| {
                 for row in load_source_rows(table_id) {
                     emit(row);
                 }
@@ -1681,33 +2355,81 @@ impl MaterializedView {
         compiled_plan: CompiledIvmPlan,
         compiled_bootstrap_plan: CompiledBootstrapPlan,
         initial: Vec<Rc<Row>>,
-        mut visit_source_rows: F,
+        visit_source_rows: F,
     ) -> Self
     where
-        F: FnMut(TableId, &mut dyn FnMut(Rc<Row>)),
+        F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
+    {
+        Self::with_compiled_source_visitor_and_bootstrap_profiled(
+            dataflow,
+            compiled_plan,
+            compiled_bootstrap_plan,
+            initial,
+            visit_source_rows,
+            None,
+        )
+        .0
+    }
+
+    pub fn with_compiled_source_visitor_and_bootstrap_profiled<F>(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<Rc<Row>>,
+        visit_source_rows: F,
+        now_fn: Option<fn() -> f64>,
+    ) -> (Self, BootstrapExecutionProfile)
+    where
+        F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
+    {
+        Self::with_compiled_source_visitor_and_bootstrap_profiled_with_filter_coverage(
+            dataflow,
+            compiled_plan,
+            compiled_bootstrap_plan,
+            initial,
+            visit_source_rows,
+            None,
+            now_fn,
+        )
+    }
+
+    pub fn with_compiled_source_visitor_and_bootstrap_profiled_with_filter_coverage<F>(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<Rc<Row>>,
+        mut visit_source_rows: F,
+        source_filter_coverage: Option<Vec<bool>>,
+        now_fn: Option<fn() -> f64>,
+    ) -> (Self, BootstrapExecutionProfile)
+    where
+        F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
     {
         let dependencies = compiled_plan.sources().to_vec();
 
         let mut join_states = HashMap::new();
         let mut aggregate_states = HashMap::new();
-        bootstrap_node_stream_with_source_visitor(
+        let bootstrap_profile = execute_compiled_bootstrap_program_with_source_visitor(
             &dataflow,
-            &compiled_bootstrap_plan.node,
-            false,
+            &compiled_bootstrap_plan,
             &mut visit_source_rows,
+            source_filter_coverage.as_deref(),
             &mut join_states,
             &mut aggregate_states,
-            &mut |_| {},
+            now_fn,
         );
 
-        Self {
-            dataflow,
-            compiled_plan,
-            visible_rows: VisibleResultStore::from_rc_rows(initial),
-            dependencies,
-            join_states,
-            aggregate_states,
-        }
+        (
+            Self {
+                dataflow,
+                compiled_plan,
+                visible_rows: VisibleResultStore::from_rc_rows(initial),
+                dependencies,
+                join_states,
+                aggregate_states,
+            },
+            bootstrap_profile,
+        )
     }
 
     pub fn initialize_join_state(
@@ -2209,6 +2931,7 @@ mod tests {
     use super::*;
     use crate::dataflow::JoinKeySpec;
     use alloc::boxed::Box;
+    use alloc::rc::Rc;
     use alloc::vec;
     use cynos_core::Value;
 
@@ -2288,6 +3011,159 @@ mod tests {
 
     fn make_department(id: u64, name_hash: i64) -> Row {
         Row::new(id, vec![Value::Int64(id as i64), Value::Int64(name_hash)])
+    }
+
+    fn make_employee_department_inner_join() -> DataflowNode {
+        DataflowNode::Join {
+            left: Box::new(DataflowNode::source(1)),
+            right: Box::new(DataflowNode::source(2)),
+            left_key: JoinKeySpec::Columns(vec![2]),
+            right_key: JoinKeySpec::Columns(vec![0]),
+            join_type: JoinType::Inner,
+            left_width: 3,
+            right_width: 2,
+        }
+    }
+
+    fn make_employee_department_left_outer_join() -> DataflowNode {
+        DataflowNode::Join {
+            left: Box::new(DataflowNode::source(1)),
+            right: Box::new(DataflowNode::source(2)),
+            left_key: JoinKeySpec::Columns(vec![2]),
+            right_key: JoinKeySpec::Columns(vec![0]),
+            join_type: JoinType::LeftOuter,
+            left_width: 3,
+            right_width: 2,
+        }
+    }
+
+    fn make_sum_aggregate() -> DataflowNode {
+        DataflowNode::Aggregate {
+            input: Box::new(DataflowNode::source(1)),
+            group_by: vec![0],
+            functions: vec![(1, AggregateType::Sum)],
+        }
+    }
+
+    fn make_self_join() -> DataflowNode {
+        DataflowNode::Join {
+            left: Box::new(DataflowNode::source(1)),
+            right: Box::new(DataflowNode::source(1)),
+            left_key: JoinKeySpec::Columns(vec![1]),
+            right_key: JoinKeySpec::Columns(vec![0]),
+            join_type: JoinType::Inner,
+            left_width: 2,
+            right_width: 2,
+        }
+    }
+
+    fn normalize_rows(rows: &[Row]) -> Vec<alloc::string::String> {
+        let mut normalized: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                alloc::format!(
+                    "{:?}:{}:{}",
+                    row.values(),
+                    row.id(),
+                    row.version()
+                )
+            })
+            .collect();
+        normalized.sort();
+        normalized
+    }
+
+    fn normalize_deltas(deltas: &[Delta<Row>]) -> Vec<alloc::string::String> {
+        let mut normalized: Vec<_> = deltas
+            .iter()
+            .map(|delta| {
+                alloc::format!(
+                    "{}:{:?}:{}:{}",
+                    if delta.is_insert() { "insert" } else { "delete" },
+                    delta.data.values(),
+                    delta.data.id(),
+                    delta.data.version()
+                )
+            })
+            .collect();
+        normalized.sort();
+        normalized
+    }
+
+    fn bootstrap_view_with_legacy_executor(
+        dataflow: DataflowNode,
+        initial: Vec<Row>,
+        source_rows: &HashMap<(TableId, usize), Vec<Row>>,
+    ) -> MaterializedView {
+        let compiled_plan = CompiledIvmPlan::compile(&dataflow);
+        let compiled_bootstrap_plan = CompiledBootstrapPlan::compile(&dataflow);
+        let dependencies = compiled_plan.sources().to_vec();
+        let mut join_states = HashMap::new();
+        let mut aggregate_states = HashMap::new();
+        bootstrap_node_stream_with_source_visitor(
+            &dataflow,
+            &compiled_bootstrap_plan.legacy_node,
+            false,
+            &mut |table_id, source_index, emit| {
+                if let Some(rows) = source_rows.get(&(table_id, source_index)) {
+                    for row in rows {
+                        emit(Rc::new(row.clone()));
+                    }
+                }
+            },
+            &mut join_states,
+            &mut aggregate_states,
+            &mut |_handle| {},
+        );
+        MaterializedView {
+            dataflow,
+            compiled_plan,
+            visible_rows: VisibleResultStore::from_rc_rows(
+                initial.into_iter().map(Rc::new).collect(),
+            ),
+            dependencies,
+            join_states,
+            aggregate_states,
+        }
+    }
+
+    fn bootstrap_view_with_compiled_executor(
+        dataflow: DataflowNode,
+        initial: Vec<Row>,
+        source_rows: &HashMap<(TableId, usize), Vec<Row>>,
+    ) -> MaterializedView {
+        bootstrap_view_with_compiled_executor_with_filter_coverage(
+            dataflow,
+            initial,
+            source_rows,
+            None,
+        )
+    }
+
+    fn bootstrap_view_with_compiled_executor_with_filter_coverage(
+        dataflow: DataflowNode,
+        initial: Vec<Row>,
+        source_rows: &HashMap<(TableId, usize), Vec<Row>>,
+        source_filter_coverage: Option<Vec<bool>>,
+    ) -> MaterializedView {
+        let compiled_plan = CompiledIvmPlan::compile(&dataflow);
+        let compiled_bootstrap_plan = CompiledBootstrapPlan::compile(&dataflow);
+        MaterializedView::with_compiled_source_visitor_and_bootstrap_profiled_with_filter_coverage(
+            dataflow,
+            compiled_plan,
+            compiled_bootstrap_plan,
+            initial.into_iter().map(Rc::new).collect(),
+            |table_id, source_index, emit| {
+                if let Some(rows) = source_rows.get(&(table_id, source_index)) {
+                    for row in rows {
+                        emit(Rc::new(row.clone()));
+                    }
+                }
+            },
+            source_filter_coverage,
+            None,
+        )
+        .0
     }
 
     #[test]
@@ -2574,6 +3450,241 @@ mod tests {
         assert_eq!(inserts.len(), 1);
         assert_eq!(inserts[0].data.get(1), Some(&Value::Float64(35.0)));
         assert_eq!(view.result()[0].get(1), Some(&Value::Float64(35.0)));
+    }
+
+    #[test]
+    fn test_compiled_bootstrap_skip_covered_source_filter_matches_reference_aggregate() {
+        let dataflow = DataflowNode::Aggregate {
+            input: Box::new(DataflowNode::Filter {
+                input: Box::new(DataflowNode::source(1)),
+                predicate: Box::new(|row| {
+                    row.get(1)
+                        .and_then(Value::as_i64)
+                        .map(|value| value > 10)
+                        .unwrap_or(false)
+                }),
+                trace_predicate: None,
+            }),
+            group_by: vec![0],
+            functions: vec![(1, AggregateType::Sum)],
+        };
+
+        let initial = vec![Row::new(
+            aggregate_group_row_id(&[Value::Int64(1)]),
+            vec![Value::Int64(1), Value::Float64(50.0)],
+        )];
+        let mut source_rows = HashMap::new();
+        source_rows.insert(
+            (1, 0),
+            vec![
+                Row::new(1, vec![Value::Int64(1), Value::Int64(20)]),
+                Row::new(2, vec![Value::Int64(1), Value::Int64(30)]),
+            ],
+        );
+
+        let mut reference_view =
+            bootstrap_view_with_compiled_executor(dataflow, initial.clone(), &source_rows);
+        let mut skip_view = bootstrap_view_with_compiled_executor_with_filter_coverage(
+            DataflowNode::Aggregate {
+                input: Box::new(DataflowNode::Filter {
+                    input: Box::new(DataflowNode::source(1)),
+                    predicate: Box::new(|row| {
+                        row.get(1)
+                            .and_then(Value::as_i64)
+                            .map(|value| value > 10)
+                            .unwrap_or(false)
+                    }),
+                    trace_predicate: None,
+                }),
+                group_by: vec![0],
+                functions: vec![(1, AggregateType::Sum)],
+            },
+            initial,
+            &source_rows,
+            Some(vec![true]),
+        );
+
+        let follow_up = vec![
+            Delta::insert(Row::new(3, vec![Value::Int64(1), Value::Int64(5)])),
+            Delta::insert(Row::new(4, vec![Value::Int64(1), Value::Int64(25)])),
+        ];
+        let reference_output = reference_view.on_table_change(1, follow_up.clone());
+        let skip_output = skip_view.on_table_change(1, follow_up);
+
+        assert_eq!(normalize_deltas(&reference_output), normalize_deltas(&skip_output));
+        assert_eq!(
+            normalize_rows(&reference_view.result()),
+            normalize_rows(&skip_view.result())
+        );
+    }
+
+    #[test]
+    fn test_compiled_bootstrap_skip_covered_source_filter_matches_reference_join_state() {
+        let employee = make_employee(1, 200, 10);
+        let department = make_department(10, 100);
+        let initial = vec![merge_rows(&employee, &department)];
+        let mut source_rows = HashMap::new();
+        source_rows.insert((1, 0), vec![employee]);
+        source_rows.insert((2, 1), vec![department]);
+
+        let filtered_join = || DataflowNode::Join {
+            left: Box::new(DataflowNode::Filter {
+                input: Box::new(DataflowNode::source(1)),
+                predicate: Box::new(|row| {
+                    row.get(2)
+                        .and_then(Value::as_i64)
+                        .map(|dept_id| dept_id == 10)
+                        .unwrap_or(false)
+                }),
+                trace_predicate: None,
+            }),
+            right: Box::new(DataflowNode::source(2)),
+            left_key: JoinKeySpec::Columns(vec![2]),
+            right_key: JoinKeySpec::Columns(vec![0]),
+            join_type: JoinType::Inner,
+            left_width: 3,
+            right_width: 2,
+        };
+
+        let mut reference_view =
+            bootstrap_view_with_compiled_executor(filtered_join(), initial.clone(), &source_rows);
+        let mut skip_view = bootstrap_view_with_compiled_executor_with_filter_coverage(
+            filtered_join(),
+            initial,
+            &source_rows,
+            Some(vec![true, false]),
+        );
+
+        let follow_up = vec![Delta::insert(make_employee(2, 201, 10))];
+        let reference_output = reference_view.on_table_change(1, follow_up.clone());
+        let skip_output = skip_view.on_table_change(1, follow_up);
+
+        assert_eq!(normalize_deltas(&reference_output), normalize_deltas(&skip_output));
+        assert_eq!(
+            normalize_rows(&reference_view.result()),
+            normalize_rows(&skip_view.result())
+        );
+    }
+
+    #[test]
+    fn test_compiled_bootstrap_matches_legacy_inner_join_followup_delta() {
+        let employee = make_employee(1, 200, 10);
+        let department = make_department(10, 100);
+        let initial = vec![merge_rows(&employee, &department)];
+
+        let mut source_rows = HashMap::new();
+        source_rows.insert((1, 0), vec![employee]);
+        source_rows.insert((2, 1), vec![department]);
+
+        let mut legacy_view = bootstrap_view_with_legacy_executor(
+            make_employee_department_inner_join(),
+            initial.clone(),
+            &source_rows,
+        );
+        let mut compiled_view = bootstrap_view_with_compiled_executor(
+            make_employee_department_inner_join(),
+            initial,
+            &source_rows,
+        );
+
+        let follow_up = vec![Delta::insert(make_employee(2, 201, 10))];
+        let legacy_output = legacy_view.on_table_change(1, follow_up.clone());
+        let compiled_output = compiled_view.on_table_change(1, follow_up);
+
+        assert_eq!(normalize_deltas(&legacy_output), normalize_deltas(&compiled_output));
+        assert_eq!(
+            normalize_rows(&legacy_view.result()),
+            normalize_rows(&compiled_view.result())
+        );
+    }
+
+    #[test]
+    fn test_compiled_bootstrap_matches_legacy_left_outer_join_followup_delta() {
+        let employee = make_employee(1, 200, 99);
+        let initial = vec![merge_rows_null_right(&employee, 2)];
+
+        let mut source_rows = HashMap::new();
+        source_rows.insert((1, 0), vec![employee]);
+        source_rows.insert((2, 1), Vec::new());
+
+        let mut legacy_view = bootstrap_view_with_legacy_executor(
+            make_employee_department_left_outer_join(),
+            initial.clone(),
+            &source_rows,
+        );
+        let mut compiled_view = bootstrap_view_with_compiled_executor(
+            make_employee_department_left_outer_join(),
+            initial,
+            &source_rows,
+        );
+
+        let follow_up = vec![Delta::insert(make_department(99, 300))];
+        let legacy_output = legacy_view.on_table_change(2, follow_up.clone());
+        let compiled_output = compiled_view.on_table_change(2, follow_up);
+
+        assert_eq!(normalize_deltas(&legacy_output), normalize_deltas(&compiled_output));
+        assert_eq!(
+            normalize_rows(&legacy_view.result()),
+            normalize_rows(&compiled_view.result())
+        );
+    }
+
+    #[test]
+    fn test_compiled_bootstrap_matches_legacy_aggregate_followup_delta() {
+        let initial = vec![Row::new(
+            aggregate_group_row_id(&[Value::Int64(1)]),
+            vec![Value::Int64(1), Value::Float64(30.0)],
+        )];
+        let mut source_rows = HashMap::new();
+        source_rows.insert(
+            (1, 0),
+            vec![
+                Row::new(1, vec![Value::Int64(1), Value::Int64(10)]),
+                Row::new(2, vec![Value::Int64(1), Value::Int64(20)]),
+            ],
+        );
+
+        let mut legacy_view =
+            bootstrap_view_with_legacy_executor(make_sum_aggregate(), initial.clone(), &source_rows);
+        let mut compiled_view =
+            bootstrap_view_with_compiled_executor(make_sum_aggregate(), initial, &source_rows);
+
+        let follow_up = vec![Delta::insert(Row::new(
+            3,
+            vec![Value::Int64(1), Value::Int64(5)],
+        ))];
+        let legacy_output = legacy_view.on_table_change(1, follow_up.clone());
+        let compiled_output = compiled_view.on_table_change(1, follow_up);
+
+        assert_eq!(normalize_deltas(&legacy_output), normalize_deltas(&compiled_output));
+        assert_eq!(
+            normalize_rows(&legacy_view.result()),
+            normalize_rows(&compiled_view.result())
+        );
+    }
+
+    #[test]
+    fn test_compiled_bootstrap_uses_source_index_for_self_join_sources() {
+        let left = Row::new(1, vec![Value::Int64(1), Value::Int64(10)]);
+        let right = Row::new(2, vec![Value::Int64(10), Value::Int64(99)]);
+        let initial = vec![merge_rows(&left, &right)];
+
+        let mut source_rows = HashMap::new();
+        source_rows.insert((1, 0), vec![left]);
+        source_rows.insert((1, 1), vec![right]);
+
+        let legacy_view =
+            bootstrap_view_with_legacy_executor(make_self_join(), initial.clone(), &source_rows);
+        let compiled_view =
+            bootstrap_view_with_compiled_executor(make_self_join(), initial, &source_rows);
+
+        let legacy_state = legacy_view.join_states.values().next().unwrap();
+        let compiled_state = compiled_view.join_states.values().next().unwrap();
+        assert_eq!(legacy_state.left.len(), 1);
+        assert_eq!(legacy_state.right.len(), 1);
+        assert_eq!(compiled_state.left.len(), 1);
+        assert_eq!(compiled_state.right.len(), 1);
+        assert_eq!(legacy_view.len(), compiled_view.len());
     }
 
     // ==================== Bug 2 Test: Sum is_empty() incorrect logic ====================

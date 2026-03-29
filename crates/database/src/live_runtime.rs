@@ -10,15 +10,18 @@ use crate::reactive_bridge::{
     GraphqlDeltaObservable, GraphqlSubscriptionObservable, JsGraphqlSubscription,
     JsIvmObservableQuery, JsObservableQuery, ReQueryObservable,
 };
+use alloc::collections::BTreeSet;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use cynos_core::schema::Table;
-use cynos_core::Row;
+use cynos_core::{Row, Value};
 use cynos_gql::{bind::BoundRootField, GraphqlCatalog};
 use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta, TableId};
+use cynos_index::KeyRange;
 use cynos_query::ast::SortOrder;
+use cynos_query::planner::{IndexBounds, PhysicalPlan};
 use cynos_reactive::ObservableQuery;
 use cynos_storage::TableCache;
 use hashbrown::{HashMap, HashSet};
@@ -64,6 +67,57 @@ impl LiveDependencySet {
     pub fn graphql(tables: Vec<TableId>, root_tables: Vec<TableId>) -> Self {
         Self::new(tables, root_tables)
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TraceBootstrapAccessPath {
+    FullScan,
+    IndexScanScalar {
+        index: String,
+        range: Option<KeyRange<Value>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    },
+    IndexScanComposite {
+        index: String,
+        range: Option<KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    },
+    IndexGet {
+        index: String,
+        key: Value,
+        limit: Option<usize>,
+    },
+    IndexInGet {
+        index: String,
+        keys: Vec<Value>,
+    },
+    GinKeyValue {
+        index: String,
+        key: String,
+        value: String,
+    },
+    GinKey {
+        index: String,
+        key: String,
+    },
+    GinMulti {
+        index: String,
+        pairs: Vec<(String, String)>,
+        match_all: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TraceBootstrapSourceBinding {
+    pub source_index: usize,
+    pub table_id: TableId,
+    pub table_name: String,
+    pub access_path: TraceBootstrapAccessPath,
+    pub covers_source_filter: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -118,7 +172,7 @@ pub(crate) struct DeltaKernelPlan {
     pub compiled_ivm_plan: CompiledIvmPlan,
     pub compiled_bootstrap_plan: CompiledBootstrapPlan,
     pub initial_rows: Vec<Rc<Row>>,
-    pub source_table_bindings: Vec<(TableId, String)>,
+    pub source_bindings: Vec<TraceBootstrapSourceBinding>,
     pub trace_init_profile: Option<TraceInitProfile>,
 }
 
@@ -253,6 +307,420 @@ pub(crate) enum AdapterPlan {
     GraphqlDelta(GraphqlDeltaAdapterPlan),
 }
 
+fn trace_bootstrap_sql_point_lookup_keys(key: &Value) -> Vec<Value> {
+    match key {
+        Value::Int32(value) => alloc::vec![Value::Int32(*value), Value::Int64(*value as i64)],
+        Value::Int64(value) => {
+            let mut keys = alloc::vec![Value::Int64(*value)];
+            if i32::try_from(*value).is_ok() {
+                keys.push(Value::Int32(*value as i32));
+            }
+            keys
+        }
+        _ => alloc::vec![key.clone()],
+    }
+}
+
+fn trace_index_column_arity(schema: &Table, index_name: &str) -> Option<usize> {
+    schema
+        .get_index(index_name)
+        .or_else(|| {
+            schema
+                .indices()
+                .iter()
+                .find(|candidate| candidate.normalized_name() == index_name)
+        })
+        .or_else(|| {
+            schema.primary_key().filter(|candidate| {
+                candidate.name() == index_name || candidate.normalized_name() == index_name
+            })
+        })
+        .map(|index| index.columns().len())
+}
+
+fn trace_index_scan_access_path(
+    schema: Option<&Table>,
+    index: &str,
+    bounds: &IndexBounds,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    reverse: bool,
+) -> TraceBootstrapAccessPath {
+    let offset = offset.unwrap_or(0);
+    match bounds {
+        IndexBounds::Scalar(range) => TraceBootstrapAccessPath::IndexScanScalar {
+            index: index.into(),
+            range: Some(range.clone()),
+            limit,
+            offset,
+            reverse,
+        },
+        IndexBounds::Composite(range) => TraceBootstrapAccessPath::IndexScanComposite {
+            index: index.into(),
+            range: Some(range.clone()),
+            limit,
+            offset,
+            reverse,
+        },
+        IndexBounds::Unbounded => {
+            let arity = schema
+                .and_then(|schema| trace_index_column_arity(schema, index))
+                .unwrap_or(1);
+            if arity > 1 {
+                TraceBootstrapAccessPath::IndexScanComposite {
+                    index: index.into(),
+                    range: None,
+                    limit,
+                    offset,
+                    reverse,
+                }
+            } else {
+                TraceBootstrapAccessPath::IndexScanScalar {
+                    index: index.into(),
+                    range: None,
+                    limit,
+                    offset,
+                    reverse,
+                }
+            }
+        }
+    }
+}
+
+fn push_trace_bootstrap_source_binding(
+    bindings: &mut Vec<TraceBootstrapSourceBinding>,
+    table_ids: &HashMap<String, TableId>,
+    table_name: &str,
+    access_path: TraceBootstrapAccessPath,
+    covers_source_filter: bool,
+) {
+    let Some(table_id) = table_ids.get(table_name).copied() else {
+        return;
+    };
+
+    bindings.push(TraceBootstrapSourceBinding {
+        source_index: bindings.len(),
+        table_id,
+        table_name: table_name.into(),
+        access_path,
+        covers_source_filter,
+    });
+}
+
+fn collect_trace_bootstrap_source_bindings_into(
+    plan: &PhysicalPlan,
+    table_ids: &HashMap<String, TableId>,
+    table_schemas: &HashMap<String, Table>,
+    bindings: &mut Vec<TraceBootstrapSourceBinding>,
+) {
+    match plan {
+        PhysicalPlan::TableScan { table } => push_trace_bootstrap_source_binding(
+            bindings,
+            table_ids,
+            table,
+            TraceBootstrapAccessPath::FullScan,
+            false,
+        ),
+        PhysicalPlan::IndexScan {
+            table,
+            index,
+            bounds,
+            limit,
+            offset,
+            reverse,
+        } => push_trace_bootstrap_source_binding(
+            bindings,
+            table_ids,
+            table,
+            trace_index_scan_access_path(
+                table_schemas.get(table),
+                index,
+                bounds,
+                *limit,
+                *offset,
+                *reverse,
+            ),
+            true,
+        ),
+        PhysicalPlan::IndexGet {
+            table,
+            index,
+            key,
+            limit,
+        } => push_trace_bootstrap_source_binding(
+            bindings,
+            table_ids,
+            table,
+            TraceBootstrapAccessPath::IndexGet {
+                index: index.clone(),
+                key: key.clone(),
+                limit: *limit,
+            },
+            true,
+        ),
+        PhysicalPlan::IndexInGet { table, index, keys } => push_trace_bootstrap_source_binding(
+            bindings,
+            table_ids,
+            table,
+            TraceBootstrapAccessPath::IndexInGet {
+                index: index.clone(),
+                keys: keys.clone(),
+            },
+            true,
+        ),
+        PhysicalPlan::GinIndexScan {
+            table,
+            index,
+            key,
+            value,
+            query_type,
+            ..
+        } => {
+            let access_path = match (query_type.as_str(), value.as_ref()) {
+                ("eq", Some(value)) => TraceBootstrapAccessPath::GinKeyValue {
+                    index: index.clone(),
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+                ("contains", _) | ("exists", _) => TraceBootstrapAccessPath::GinKey {
+                    index: index.clone(),
+                    key: key.clone(),
+                },
+                _ => TraceBootstrapAccessPath::FullScan,
+            };
+            push_trace_bootstrap_source_binding(bindings, table_ids, table, access_path, true);
+        }
+        PhysicalPlan::GinIndexScanMulti {
+            table,
+            index,
+            pairs,
+            match_all,
+            ..
+        } => push_trace_bootstrap_source_binding(
+            bindings,
+            table_ids,
+            table,
+            TraceBootstrapAccessPath::GinMulti {
+                index: index.clone(),
+                pairs: pairs.clone(),
+                match_all: *match_all,
+            },
+            true,
+        ),
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::HashAggregate { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::TopN { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::NoOp { input } => {
+            collect_trace_bootstrap_source_bindings_into(input, table_ids, table_schemas, bindings);
+        }
+        PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::SortMergeJoin { left, right, .. }
+        | PhysicalPlan::NestedLoopJoin { left, right, .. }
+        | PhysicalPlan::CrossProduct { left, right }
+        | PhysicalPlan::Union { left, right, .. } => {
+            collect_trace_bootstrap_source_bindings_into(left, table_ids, table_schemas, bindings);
+            collect_trace_bootstrap_source_bindings_into(right, table_ids, table_schemas, bindings);
+        }
+        PhysicalPlan::IndexNestedLoopJoin {
+            outer,
+            inner_table,
+            outer_is_left,
+            ..
+        } => {
+            if *outer_is_left {
+                collect_trace_bootstrap_source_bindings_into(
+                    outer,
+                    table_ids,
+                    table_schemas,
+                    bindings,
+                );
+                push_trace_bootstrap_source_binding(
+                    bindings,
+                    table_ids,
+                    inner_table,
+                    TraceBootstrapAccessPath::FullScan,
+                    false,
+                );
+            } else {
+                push_trace_bootstrap_source_binding(
+                    bindings,
+                    table_ids,
+                    inner_table,
+                    TraceBootstrapAccessPath::FullScan,
+                    false,
+                );
+                collect_trace_bootstrap_source_bindings_into(
+                    outer,
+                    table_ids,
+                    table_schemas,
+                    bindings,
+                );
+            }
+        }
+        PhysicalPlan::Empty => {}
+    }
+}
+
+pub(crate) fn collect_trace_bootstrap_source_bindings(
+    plan: &PhysicalPlan,
+    table_ids: &HashMap<String, TableId>,
+    table_schemas: &HashMap<String, Table>,
+) -> Vec<TraceBootstrapSourceBinding> {
+    let mut bindings = Vec::new();
+    collect_trace_bootstrap_source_bindings_into(plan, table_ids, table_schemas, &mut bindings);
+    bindings
+}
+
+fn visit_trace_bootstrap_binding_rows(
+    cache: &TableCache,
+    binding: &TraceBootstrapSourceBinding,
+    emit: &mut dyn FnMut(Rc<Row>),
+) {
+    let Some(store) = cache.get_table(&binding.table_name) else {
+        return;
+    };
+
+    match &binding.access_path {
+        TraceBootstrapAccessPath::FullScan => {
+            store.visit_rows(|row| {
+                emit(Rc::clone(row));
+                true
+            });
+        }
+        TraceBootstrapAccessPath::IndexScanScalar {
+            index,
+            range,
+            limit,
+            offset,
+            reverse,
+        } => {
+            store.visit_index_scan_with_options(
+                index,
+                range.as_ref(),
+                *limit,
+                *offset,
+                *reverse,
+                |row| {
+                    emit(Rc::clone(row));
+                    true
+                },
+            );
+        }
+        TraceBootstrapAccessPath::IndexScanComposite {
+            index,
+            range,
+            limit,
+            offset,
+            reverse,
+        } => {
+            store.visit_index_scan_composite_with_options(
+                index,
+                range.as_ref(),
+                *limit,
+                *offset,
+                *reverse,
+                |row| {
+                    emit(Rc::clone(row));
+                    true
+                },
+            );
+        }
+        TraceBootstrapAccessPath::IndexGet { index, key, limit } => {
+            let mut seen_ids = BTreeSet::new();
+            let mut remaining = limit.unwrap_or(usize::MAX);
+            let enforce_limit = limit.is_some();
+
+            for probe_key in trace_bootstrap_sql_point_lookup_keys(key) {
+                if enforce_limit && remaining == 0 {
+                    break;
+                }
+
+                let range = KeyRange::only(probe_key);
+                let mut keep_scanning = true;
+                store.visit_index_scan_with_options(
+                    index,
+                    Some(&range),
+                    if enforce_limit { Some(remaining) } else { None },
+                    0,
+                    false,
+                    |row| {
+                        if !seen_ids.insert(row.id()) {
+                            return true;
+                        }
+
+                        emit(Rc::clone(row));
+                        if enforce_limit {
+                            remaining = remaining.saturating_sub(1);
+                        }
+                        keep_scanning = !enforce_limit || remaining > 0;
+                        keep_scanning
+                    },
+                );
+                if !keep_scanning {
+                    break;
+                }
+            }
+        }
+        TraceBootstrapAccessPath::IndexInGet { index, keys } => {
+            let mut seen_ids = BTreeSet::new();
+            for key in keys {
+                for probe_key in trace_bootstrap_sql_point_lookup_keys(key) {
+                    let range = KeyRange::only(probe_key);
+                    store.visit_index_scan_with_options(
+                        index,
+                        Some(&range),
+                        None,
+                        0,
+                        false,
+                        |row| {
+                            if seen_ids.insert(row.id()) {
+                                emit(Rc::clone(row));
+                            }
+                            true
+                        },
+                    );
+                }
+            }
+        }
+        TraceBootstrapAccessPath::GinKeyValue { index, key, value } => {
+            store.visit_gin_index_by_key_value(index, key, value, |row| {
+                emit(Rc::clone(row));
+                true
+            });
+        }
+        TraceBootstrapAccessPath::GinKey { index, key } => {
+            store.visit_gin_index_by_key(index, key, |row| {
+                emit(Rc::clone(row));
+                true
+            });
+        }
+        TraceBootstrapAccessPath::GinMulti {
+            index,
+            pairs,
+            match_all,
+        } => {
+            let pair_refs: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            if *match_all {
+                store.visit_gin_index_by_key_values_all(index, &pair_refs, |row| {
+                    emit(Rc::clone(row));
+                    true
+                });
+            } else {
+                store.visit_gin_index_by_key_values_any(index, &pair_refs, |row| {
+                    emit(Rc::clone(row));
+                    true
+                });
+            }
+        }
+    }
+}
+
 pub(crate) struct LivePlanDescriptor {
     pub engine: LiveEngineKind,
     #[allow(dead_code)]
@@ -305,7 +773,7 @@ impl LivePlan {
         compiled_ivm_plan: CompiledIvmPlan,
         compiled_bootstrap_plan: CompiledBootstrapPlan,
         initial_rows: Vec<Rc<Row>>,
-        source_table_bindings: Vec<(TableId, String)>,
+        source_bindings: Vec<TraceBootstrapSourceBinding>,
         projection: RowsProjection,
         binary_layout: SchemaLayout,
         trace_init_profile: TraceInitProfile,
@@ -321,7 +789,7 @@ impl LivePlan {
                 compiled_ivm_plan,
                 compiled_bootstrap_plan,
                 initial_rows,
-                source_table_bindings,
+                source_bindings,
                 trace_init_profile: Some(trace_init_profile),
             }),
             adapter: AdapterPlan::RowsDelta(RowsDeltaAdapterPlan {
@@ -365,7 +833,7 @@ impl LivePlan {
         compiled_ivm_plan: CompiledIvmPlan,
         compiled_bootstrap_plan: CompiledBootstrapPlan,
         initial_rows: Vec<Rc<Row>>,
-        source_table_bindings: Vec<(TableId, String)>,
+        source_bindings: Vec<TraceBootstrapSourceBinding>,
         catalog: GraphqlCatalog,
         field: BoundRootField,
         dependency_table_bindings: Vec<(TableId, String)>,
@@ -381,7 +849,7 @@ impl LivePlan {
                 compiled_ivm_plan,
                 compiled_bootstrap_plan,
                 initial_rows,
-                source_table_bindings,
+                source_bindings,
                 trace_init_profile: None,
             }),
             adapter: AdapterPlan::GraphqlDelta(GraphqlDeltaAdapterPlan {
@@ -452,39 +920,68 @@ impl LivePlan {
 
         let bridge_profiler = registry.borrow().ivm_bridge_profiler();
         let mut trace_init_profile = kernel.trace_init_profile.unwrap_or_default();
-        trace_init_profile.source_table_count = kernel.source_table_bindings.len();
+        trace_init_profile.source_table_count = kernel
+            .source_bindings
+            .iter()
+            .map(|binding| binding.table_id)
+            .collect::<HashSet<_>>()
+            .len();
         trace_init_profile.initial_row_count = kernel.initial_rows.len();
         let init_started_at = now_ms();
         let cache_for_loader = cache.clone();
-        let bindings_by_id: HashMap<TableId, String> =
-            kernel.source_table_bindings.iter().cloned().collect();
-        let source_bootstrap_ms = Rc::new(RefCell::new(0.0));
-        let source_bootstrap_ms_ref = source_bootstrap_ms.clone();
-        let observable = Rc::new(RefCell::new(ObservableQuery::with_compiled_source_visitor(
-            kernel.dataflow,
-            kernel.compiled_ivm_plan,
-            kernel.compiled_bootstrap_plan,
-            kernel.initial_rows,
-            move |table_id, emit| {
-                let load_started_at = now_ms();
-                {
-                    let cache = cache_for_loader.borrow();
-                    let Some(table_name) = bindings_by_id.get(&table_id) else {
-                        return;
-                    };
-                    let Some(store) = cache.get_table(table_name) else {
-                        return;
-                    };
-                    for row in store.scan() {
-                        emit(row);
+        let source_bindings = kernel.source_bindings.clone();
+        let source_filter_coverage: Vec<bool> = kernel
+            .source_bindings
+            .iter()
+            .map(|binding| binding.covers_source_filter)
+            .collect();
+        let source_access_ms = Rc::new(RefCell::new(0.0));
+        let source_emit_ms = Rc::new(RefCell::new(0.0));
+        let source_access_ms_ref = source_access_ms.clone();
+        let source_emit_ms_ref = source_emit_ms.clone();
+        let (observable, bootstrap_profile) =
+            ObservableQuery::with_compiled_source_visitor_profiled_with_filter_coverage(
+                kernel.dataflow,
+                kernel.compiled_ivm_plan,
+                kernel.compiled_bootstrap_plan,
+                kernel.initial_rows,
+                move |table_id, source_index, emit| {
+                    let load_started_at = now_ms();
+                    let mut emit_local_ms = 0.0;
+                    {
+                        let cache = cache_for_loader.borrow();
+                        let Some(binding) = source_bindings.get(source_index) else {
+                            return;
+                        };
+                        debug_assert_eq!(binding.source_index, source_index);
+                        debug_assert_eq!(binding.table_id, table_id);
+                        let mut timed_emit = |row: Rc<Row>| {
+                            let emit_started_at = now_ms();
+                            emit(row);
+                            emit_local_ms += now_ms() - emit_started_at;
+                        };
+                        visit_trace_bootstrap_binding_rows(&cache, binding, &mut timed_emit);
                     }
-                };
-                *source_bootstrap_ms_ref.borrow_mut() += now_ms() - load_started_at;
-            },
-        )));
-        trace_init_profile.source_bootstrap_ms = *source_bootstrap_ms.borrow();
+                    let total_ms = now_ms() - load_started_at;
+                    *source_emit_ms_ref.borrow_mut() += emit_local_ms;
+                    *source_access_ms_ref.borrow_mut() += (total_ms - emit_local_ms).max(0.0);
+                },
+                Some(source_filter_coverage),
+                Some(now_ms),
+            );
+        let observable = Rc::new(RefCell::new(observable));
+        trace_init_profile.source_access_ms = *source_access_ms.borrow();
+        trace_init_profile.source_emit_ms = *source_emit_ms.borrow();
+        trace_init_profile.source_bootstrap_ms =
+            trace_init_profile.source_access_ms + trace_init_profile.source_emit_ms;
         trace_init_profile.bootstrap_scan_ms = trace_init_profile.source_bootstrap_ms;
         trace_init_profile.materialized_view_init_ms = now_ms() - init_started_at;
+        trace_init_profile.filter_bootstrap_ms = bootstrap_profile.filter_bootstrap_ms;
+        trace_init_profile.project_bootstrap_ms = bootstrap_profile.project_bootstrap_ms;
+        trace_init_profile.map_bootstrap_ms = bootstrap_profile.map_bootstrap_ms;
+        trace_init_profile.join_bootstrap_ms = bootstrap_profile.join_bootstrap_ms;
+        trace_init_profile.aggregate_bootstrap_ms = bootstrap_profile.aggregate_bootstrap_ms;
+        trace_init_profile.root_sink_ms = bootstrap_profile.root_sink_ms;
         trace_init_profile.bootstrap_execute_ms = (trace_init_profile.materialized_view_init_ms
             - trace_init_profile.source_bootstrap_ms)
             .max(0.0);
@@ -561,8 +1058,7 @@ impl LivePlan {
         };
 
         let cache_for_loader = cache.clone();
-        let bindings_by_id: HashMap<TableId, String> =
-            kernel.source_table_bindings.iter().cloned().collect();
+        let source_bindings = kernel.source_bindings.clone();
         let observable = Rc::new(RefCell::new(
             GraphqlDeltaObservable::new_with_compiled_source_visitor(
                 kernel.dataflow,
@@ -573,17 +1069,14 @@ impl LivePlan {
                 adapter.field,
                 adapter.dependency_table_bindings,
                 kernel.initial_rows,
-                move |table_id, emit| {
+                move |table_id, source_index, emit| {
                     let cache_ref = cache_for_loader.borrow();
-                    let Some(table_name) = bindings_by_id.get(&table_id) else {
+                    let Some(binding) = source_bindings.get(source_index) else {
                         return;
                     };
-                    let Some(store) = cache_ref.get_table(table_name) else {
-                        return;
-                    };
-                    for row in store.scan() {
-                        emit(row);
-                    }
+                    debug_assert_eq!(binding.source_index, source_index);
+                    debug_assert_eq!(binding.table_id, table_id);
+                    visit_trace_bootstrap_binding_rows(&cache_ref, binding, emit);
                 },
             ),
         ));
@@ -998,5 +1491,297 @@ impl LiveRegistry {
 impl Default for LiveRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cynos_core::schema::TableBuilder;
+    use cynos_core::{DataType, JsonbValue, Row, Value};
+    use cynos_query::ast::{Expr, JoinType};
+    use cynos_storage::TableCache;
+
+    fn jsonb_value(json: &str) -> Value {
+        Value::Jsonb(JsonbValue::new(json.as_bytes().to_vec()))
+    }
+
+    fn build_trace_source_test_schemas() -> HashMap<String, Table> {
+        let users = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("team_id", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_users_team_id", &["team_id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let issues = TableBuilder::new("issues")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("user_id", DataType::Int64)
+            .unwrap()
+            .add_column("metadata", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_jsonb_index("idx_issues_metadata_status", "metadata", &["status"])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut schemas = HashMap::new();
+        schemas.insert("users".into(), users);
+        schemas.insert("issues".into(), issues);
+        schemas
+    }
+
+    #[test]
+    fn test_collect_trace_bootstrap_source_bindings_preserves_source_order_and_access_paths() {
+        let table_schemas = build_trace_source_test_schemas();
+        let mut table_ids = HashMap::new();
+        table_ids.insert("users".into(), 1u32);
+        table_ids.insert("issues".into(), 2u32);
+
+        let users_pk = table_schemas
+            .get("users")
+            .and_then(Table::primary_key)
+            .map(|index| index.name().to_string())
+            .unwrap();
+
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(PhysicalPlan::IndexGet {
+                table: "users".into(),
+                index: users_pk,
+                key: Value::Int64(7),
+                limit: None,
+            }),
+            right: Box::new(PhysicalPlan::GinIndexScan {
+                table: "issues".into(),
+                index: "idx_issues_metadata_status".into(),
+                key: "status".into(),
+                value: Some("open".into()),
+                query_type: "eq".into(),
+                recheck: Some(Expr::eq(
+                    Expr::Function {
+                        name: "JSONB_EXTRACT".into(),
+                        args: alloc::vec![
+                            Expr::column("issues", "metadata", 2),
+                            Expr::literal("$.status"),
+                        ],
+                    },
+                    Expr::literal("open"),
+                )),
+            }),
+            condition: Expr::eq(
+                Expr::column("users", "id", 0),
+                Expr::column("issues", "user_id", 1),
+            ),
+            join_type: JoinType::Inner,
+            output_tables: alloc::vec!["users".into(), "issues".into()],
+        };
+
+        let bindings =
+            collect_trace_bootstrap_source_bindings(&plan, &table_ids, &table_schemas);
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].source_index, 0);
+        assert_eq!(bindings[0].table_id, 1);
+        assert_eq!(bindings[0].table_name, "users");
+        assert!(matches!(
+            bindings[0].access_path,
+            TraceBootstrapAccessPath::IndexGet { .. }
+        ));
+        assert!(bindings[0].covers_source_filter);
+        assert_eq!(bindings[1].source_index, 1);
+        assert_eq!(bindings[1].table_id, 2);
+        assert_eq!(bindings[1].table_name, "issues");
+        assert!(matches!(
+            bindings[1].access_path,
+            TraceBootstrapAccessPath::GinKeyValue { .. }
+        ));
+        assert!(bindings[1].covers_source_filter);
+    }
+
+    #[test]
+    fn test_collect_trace_bootstrap_source_bindings_keeps_per_source_bindings_for_same_table() {
+        let table_schemas = build_trace_source_test_schemas();
+        let mut table_ids = HashMap::new();
+        table_ids.insert("users".into(), 1u32);
+
+        let users_pk = table_schemas
+            .get("users")
+            .and_then(Table::primary_key)
+            .map(|index| index.name().to_string())
+            .unwrap();
+
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(PhysicalPlan::TableScan {
+                table: "users".into(),
+            }),
+            right: Box::new(PhysicalPlan::IndexGet {
+                table: "users".into(),
+                index: users_pk,
+                key: Value::Int64(42),
+                limit: None,
+            }),
+            condition: Expr::eq(
+                Expr::column("users", "id", 0),
+                Expr::column("users", "team_id", 1),
+            ),
+            join_type: JoinType::Inner,
+            output_tables: alloc::vec!["users".into(), "users".into()],
+        };
+
+        let bindings =
+            collect_trace_bootstrap_source_bindings(&plan, &table_ids, &table_schemas);
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].table_id, 1);
+        assert_eq!(bindings[1].table_id, 1);
+        assert_eq!(bindings[0].source_index, 0);
+        assert_eq!(bindings[1].source_index, 1);
+        assert!(matches!(
+            bindings[0].access_path,
+            TraceBootstrapAccessPath::FullScan
+        ));
+        assert!(!bindings[0].covers_source_filter);
+        assert!(matches!(
+            bindings[1].access_path,
+            TraceBootstrapAccessPath::IndexGet { .. }
+        ));
+        assert!(bindings[1].covers_source_filter);
+    }
+
+    #[test]
+    fn test_collect_trace_bootstrap_source_bindings_does_not_mark_index_join_fallback_scan_as_covered() {
+        let table_schemas = build_trace_source_test_schemas();
+        let mut table_ids = HashMap::new();
+        table_ids.insert("users".into(), 1u32);
+
+        let users_pk = table_schemas
+            .get("users")
+            .and_then(Table::primary_key)
+            .map(|index| index.name().to_string())
+            .unwrap();
+
+        let plan = PhysicalPlan::IndexNestedLoopJoin {
+            outer: Box::new(PhysicalPlan::IndexGet {
+                table: "users".into(),
+                index: users_pk,
+                key: Value::Int64(42),
+                limit: None,
+            }),
+            inner_table: "users".into(),
+            inner_index: "idx_users_team_id".into(),
+            condition: Expr::eq(
+                Expr::column("users", "id", 0),
+                Expr::column("users", "team_id", 1),
+            ),
+            join_type: JoinType::Inner,
+            outer_is_left: true,
+            output_tables: alloc::vec!["users".into(), "users".into()],
+        };
+
+        let bindings =
+            collect_trace_bootstrap_source_bindings(&plan, &table_ids, &table_schemas);
+        assert_eq!(bindings.len(), 2);
+        assert!(matches!(
+            bindings[0].access_path,
+            TraceBootstrapAccessPath::IndexGet { .. }
+        ));
+        assert!(bindings[0].covers_source_filter);
+        assert!(matches!(
+            bindings[1].access_path,
+            TraceBootstrapAccessPath::FullScan
+        ));
+        assert!(!bindings[1].covers_source_filter);
+    }
+
+    #[test]
+    fn test_visit_trace_bootstrap_binding_rows_uses_index_and_gin_access_paths() {
+        let mut cache = TableCache::new();
+        for schema in build_trace_source_test_schemas().into_values() {
+            cache.create_table(schema).unwrap();
+        }
+
+        let users_pk = cache
+            .get_table("users")
+            .and_then(|store| store.schema().primary_key())
+            .map(|index| index.name().to_string())
+            .unwrap();
+
+        {
+            let store = cache.get_table_mut("users").unwrap();
+            store
+                .insert(Row::new(1, alloc::vec![Value::Int64(1), Value::Int64(10)]))
+                .unwrap();
+            store
+                .insert(Row::new(2, alloc::vec![Value::Int64(2), Value::Int64(20)]))
+                .unwrap();
+        }
+
+        {
+            let store = cache.get_table_mut("issues").unwrap();
+            store
+                .insert(Row::new(
+                    11,
+                    alloc::vec![
+                        Value::Int64(11),
+                        Value::Int64(1),
+                        jsonb_value("{\"status\":\"open\"}"),
+                    ],
+                ))
+                .unwrap();
+            store
+                .insert(Row::new(
+                    12,
+                    alloc::vec![
+                        Value::Int64(12),
+                        Value::Int64(2),
+                        jsonb_value("{\"status\":\"closed\"}"),
+                    ],
+                ))
+                .unwrap();
+        }
+
+        let index_binding = TraceBootstrapSourceBinding {
+            source_index: 0,
+            table_id: 1,
+            table_name: "users".into(),
+            access_path: TraceBootstrapAccessPath::IndexGet {
+                index: users_pk,
+                key: Value::Int64(2),
+                limit: None,
+            },
+            covers_source_filter: true,
+        };
+
+        let mut index_rows = Vec::new();
+        visit_trace_bootstrap_binding_rows(&cache, &index_binding, &mut |row| {
+            index_rows.push(row.id());
+        });
+        assert_eq!(index_rows, alloc::vec![2]);
+
+        let gin_binding = TraceBootstrapSourceBinding {
+            source_index: 1,
+            table_id: 2,
+            table_name: "issues".into(),
+            access_path: TraceBootstrapAccessPath::GinKeyValue {
+                index: "idx_issues_metadata_status".into(),
+                key: "status".into(),
+                value: "open".into(),
+            },
+            covers_source_filter: true,
+        };
+
+        let mut gin_rows = Vec::new();
+        visit_trace_bootstrap_binding_rows(&cache, &gin_binding, &mut |row| {
+            gin_rows.push(row.id());
+        });
+        assert_eq!(gin_rows, alloc::vec![11]);
     }
 }

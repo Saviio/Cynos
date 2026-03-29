@@ -6,7 +6,9 @@
 use crate::binary_protocol::SchemaLayoutCache;
 use crate::convert::{gql_response_to_js, js_to_gql_variables};
 use crate::dataflow_compiler::compile_to_dataflow;
-use crate::live_runtime::{LiveDependencySet, LivePlan, LiveRegistry};
+use crate::live_runtime::{
+    collect_trace_bootstrap_source_bindings, LiveDependencySet, LivePlan, LiveRegistry,
+};
 #[cfg(feature = "benchmark")]
 use crate::profiling::SnapshotInitProfile;
 use crate::profiling::{
@@ -788,6 +790,18 @@ fn trace_init_profile_to_js_value(profile: TraceInitProfile) -> JsValue {
     .ok();
     js_sys::Reflect::set(
         &object,
+        &JsValue::from_str("sourceAccessMs"),
+        &JsValue::from_f64(profile.source_access_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceEmitMs"),
+        &JsValue::from_f64(profile.source_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
         &JsValue::from_str("bootstrapScanMs"),
         &JsValue::from_f64(profile.bootstrap_scan_ms),
     )
@@ -796,6 +810,42 @@ fn trace_init_profile_to_js_value(profile: TraceInitProfile) -> JsValue {
         &object,
         &JsValue::from_str("bootstrapExecuteMs"),
         &JsValue::from_f64(profile.bootstrap_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("filterBootstrapMs"),
+        &JsValue::from_f64(profile.filter_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("projectBootstrapMs"),
+        &JsValue::from_f64(profile.project_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("mapBootstrapMs"),
+        &JsValue::from_f64(profile.map_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("joinBootstrapMs"),
+        &JsValue::from_f64(profile.join_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("aggregateBootstrapMs"),
+        &JsValue::from_f64(profile.aggregate_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSinkMs"),
+        &JsValue::from_f64(profile.root_sink_ms),
     )
     .ok();
     js_sys::Reflect::set(
@@ -1344,17 +1394,11 @@ fn build_graphql_delta_live_plan(
         crate::query_engine::execute_physical_plan(cache, &physical_plan).map_err(|error| {
             JsValue::from_str(&alloc::format!("Query execution error: {:?}", error))
         })?;
-    let mut source_table_bindings: Vec<(TableId, String)> = compile_result
-        .table_ids
-        .iter()
-        .map(|(table_name, table_id)| (*table_id, table_name.clone()))
-        .collect();
-    source_table_bindings.sort_unstable_by(|(left_id, left_name), (right_id, right_name)| {
-        left_id
-            .cmp(right_id)
-            .then_with(|| left_name.cmp(right_name))
-    });
-    source_table_bindings.dedup_by(|left, right| left.0 == right.0);
+    let source_bindings = collect_trace_bootstrap_source_bindings(
+        &physical_plan,
+        &compile_result.table_ids,
+        &table_schemas,
+    );
 
     Ok(Some(LivePlan::graphql_delta(
         dependency_set,
@@ -1362,7 +1406,7 @@ fn build_graphql_delta_live_plan(
         compiled_ivm_plan,
         compiled_bootstrap_plan,
         initial_rows,
-        source_table_bindings,
+        source_bindings,
         catalog,
         field,
         dependency_table_bindings,

@@ -59,8 +59,8 @@ pub use dataflow::{
 };
 pub use delta::{Delta, DeltaBatch, DeltaBatchExt};
 pub use materialize::{
-    AggregateState, CompiledBootstrapPlan, CompiledIvmPlan, GroupAggregateState, JoinState,
-    MaterializedView, MaterializedViewBuilder,
+    AggregateState, BootstrapExecutionProfile, CompiledBootstrapPlan, CompiledIvmPlan,
+    GroupAggregateState, JoinState, MaterializedView, MaterializedViewBuilder,
 };
 pub use operators::{
     filter_incremental, map_incremental, project_incremental, IncrementalAvg, IncrementalCount,

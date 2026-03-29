@@ -8,9 +8,10 @@ use crate::convert::{js_array_to_rows, js_to_value, projected_rows_to_js_array, 
 use crate::dataflow_compiler::compile_to_dataflow;
 use crate::expr::{Expr, ExprInner};
 use crate::live_runtime::{
-    LiveDependencySet, LivePlan, LiveRegistry, RowsProjection, RowsSnapshotDependencyGraph,
-    RowsSnapshotDirectedJoinEdge, RowsSnapshotJoinEdge, RowsSnapshotLookupPrimitive,
-    RowsSnapshotOrderKey, RowsSnapshotPartialRefreshMetadata, RowsSnapshotPartialRefreshState,
+    collect_trace_bootstrap_source_bindings, LiveDependencySet, LivePlan, LiveRegistry,
+    RowsProjection, RowsSnapshotDependencyGraph, RowsSnapshotDirectedJoinEdge,
+    RowsSnapshotJoinEdge, RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey,
+    RowsSnapshotPartialRefreshMetadata, RowsSnapshotPartialRefreshState,
     RowsSnapshotRootSubsetMetadata, RowsSnapshotRootSubsetPlan, RowsSnapshotRootSubsetVariants,
 };
 #[cfg(feature = "benchmark")]
@@ -2387,17 +2388,11 @@ impl SelectBuilder {
 
         let dependencies =
             LiveDependencySet::snapshot(compile_result.table_ids.values().copied().collect());
-        let mut source_table_bindings: Vec<(TableId, String)> = compile_result
-            .table_ids
-            .iter()
-            .map(|(table_name, table_id)| (*table_id, table_name.clone()))
-            .collect();
-        source_table_bindings.sort_unstable_by(|(left_id, left_name), (right_id, right_name)| {
-            left_id
-                .cmp(right_id)
-                .then_with(|| left_name.cmp(right_name))
-        });
-        source_table_bindings.dedup_by(|left, right| left.0 == right.0);
+        let source_bindings = collect_trace_bootstrap_source_bindings(
+            &physical_plan,
+            &compile_result.table_ids,
+            &table_schemas,
+        );
         drop(cache);
         drop(table_id_map);
 
@@ -2425,7 +2420,7 @@ impl SelectBuilder {
             compiled_ivm_plan,
             compiled_bootstrap_plan,
             initial_rows,
-            source_table_bindings,
+            source_bindings,
             projection,
             binary_layout,
             TraceInitProfile {

@@ -1608,7 +1608,7 @@ impl GraphqlDeltaObservable {
         visit_source_rows: F,
     ) -> Self
     where
-        F: FnMut(TableId, &mut dyn FnMut(Rc<Row>)),
+        F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
     {
         Self {
             view: MaterializedView::with_compiled_source_visitor_and_bootstrap(

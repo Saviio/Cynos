@@ -13,8 +13,8 @@ use crate::subscription::{
 use alloc::vec::Vec;
 use cynos_core::{Row, Value};
 use cynos_incremental::{
-    CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta, MaterializedView, TableId,
-    TraceDeltaBatch,
+    BootstrapExecutionProfile, CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta,
+    MaterializedView, TableId, TraceDeltaBatch,
 };
 use hashbrown::HashMap;
 
@@ -130,7 +130,7 @@ impl ObservableQuery {
         visit_source_rows: F,
     ) -> Self
     where
-        F: FnMut(TableId, &mut dyn FnMut(alloc::rc::Rc<Row>)),
+        F: FnMut(TableId, usize, &mut dyn FnMut(alloc::rc::Rc<Row>)),
     {
         Self {
             view: MaterializedView::with_compiled_source_visitor_and_bootstrap(
@@ -145,6 +145,64 @@ impl ObservableQuery {
             trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
             initialized: true,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_compiled_source_visitor_profiled<F>(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<alloc::rc::Rc<Row>>,
+        visit_source_rows: F,
+        now_fn: Option<fn() -> f64>,
+    ) -> (Self, BootstrapExecutionProfile)
+    where
+        F: FnMut(TableId, usize, &mut dyn FnMut(alloc::rc::Rc<Row>)),
+    {
+        Self::with_compiled_source_visitor_profiled_with_filter_coverage(
+            dataflow,
+            compiled_plan,
+            compiled_bootstrap_plan,
+            initial,
+            visit_source_rows,
+            None,
+            now_fn,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn with_compiled_source_visitor_profiled_with_filter_coverage<F>(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<alloc::rc::Rc<Row>>,
+        visit_source_rows: F,
+        source_filter_coverage: Option<Vec<bool>>,
+        now_fn: Option<fn() -> f64>,
+    ) -> (Self, BootstrapExecutionProfile)
+    where
+        F: FnMut(TableId, usize, &mut dyn FnMut(alloc::rc::Rc<Row>)),
+    {
+        let (view, bootstrap_profile) =
+            MaterializedView::with_compiled_source_visitor_and_bootstrap_profiled_with_filter_coverage(
+                dataflow,
+                compiled_plan,
+                compiled_bootstrap_plan,
+                initial,
+                visit_source_rows,
+                source_filter_coverage,
+                now_fn,
+            );
+        (
+            Self {
+                view,
+                subscriptions: SubscriptionManager::new(),
+                raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
+                trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+                initialized: true,
+            },
+            bootstrap_profile,
+        )
     }
 
     /// Initializes join state from source data.
