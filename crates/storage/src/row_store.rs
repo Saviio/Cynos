@@ -9,6 +9,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use cynos_core::schema::{IndexType, Table};
 use cynos_core::{Error, Result, Row, RowId, Value};
@@ -36,6 +37,7 @@ struct GinIndexConfig {
     column_idx: usize,
     indexed_paths: Option<Vec<String>>,
     compiled_indexed_paths: Option<Vec<CompiledGinPath>>,
+    compiled_indexed_path_tree: Option<CompiledGinPathTree>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +50,20 @@ struct CompiledGinPath {
 #[derive(Clone, Debug)]
 struct CompiledGinPathSegment {
     key: String,
+    lookup_key: Option<String>,
     array_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompiledGinPathTree {
+    nodes: Vec<CompiledGinPathNode>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompiledGinPathNode {
+    terminal_path_indices: Vec<usize>,
+    object_children: BTreeMap<String, usize>,
+    array_children: BTreeMap<usize, usize>,
 }
 
 enum ExtractedJsonbTextValue<'a> {
@@ -56,16 +71,49 @@ enum ExtractedJsonbTextValue<'a> {
     Parsed(ParsedJsonbValue),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum JsonScalarIndexValue<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+}
+
+impl JsonScalarIndexValue<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value.as_str(),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_owned(self) -> String {
+        match self {
+            Self::Borrowed(value) => value.into(),
+            Self::Owned(value) => value,
+        }
+    }
+}
+
 impl GinIndexConfig {
     fn new(column_idx: usize, indexed_paths: Option<Vec<String>>) -> Self {
         let indexed_paths = indexed_paths.filter(|paths| !paths.is_empty());
         let compiled_indexed_paths = indexed_paths
             .as_ref()
-            .map(|paths| paths.iter().cloned().map(CompiledGinPath::new).collect());
+            .map(|paths| {
+                paths
+                    .iter()
+                    .cloned()
+                    .map(CompiledGinPath::new)
+                    .collect::<Vec<_>>()
+            });
+        let compiled_indexed_path_tree = compiled_indexed_paths
+            .as_ref()
+            .map(|paths| CompiledGinPathTree::new(paths));
         Self {
             column_idx,
             indexed_paths,
             compiled_indexed_paths,
+            compiled_indexed_path_tree,
         }
     }
 }
@@ -76,6 +124,7 @@ impl CompiledGinPath {
             .into_iter()
             .map(|key| CompiledGinPathSegment {
                 array_index: key.parse::<usize>().ok(),
+                lookup_key: Some(escape_json_string_fragment(&key)),
                 key,
             })
             .collect();
@@ -87,11 +136,61 @@ impl CompiledGinPath {
     }
 }
 
+impl CompiledGinPathTree {
+    fn new(paths: &[CompiledGinPath]) -> Self {
+        let mut tree = Self {
+            nodes: vec![CompiledGinPathNode::default()],
+        };
+
+        for (path_index, path) in paths.iter().enumerate() {
+            let mut node_index = 0usize;
+            for segment in &path.segments {
+                let next_node_index = if let Some(array_index) = segment.array_index {
+                    if let Some(existing) = tree.nodes[node_index].array_children.get(&array_index) {
+                        *existing
+                    } else {
+                        let next = tree.nodes.len();
+                        tree.nodes.push(CompiledGinPathNode::default());
+                        tree.nodes[node_index]
+                            .array_children
+                            .insert(array_index, next);
+                        next
+                    }
+                } else if let Some(lookup_key) = segment.lookup_key.as_ref() {
+                    if let Some(existing) = tree.nodes[node_index].object_children.get(lookup_key) {
+                        *existing
+                    } else {
+                        let next = tree.nodes.len();
+                        tree.nodes.push(CompiledGinPathNode::default());
+                        tree.nodes[node_index]
+                            .object_children
+                            .insert(lookup_key.clone(), next);
+                        next
+                    }
+                } else {
+                    node_index
+                };
+                node_index = next_node_index;
+            }
+
+            tree.nodes[node_index].terminal_path_indices.push(path_index);
+        }
+
+        tree
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BatchSecondaryDef {
     name: String,
     cols: Vec<usize>,
     unique: bool,
+}
+
+struct PreparedBatchInsert {
+    row_id_entries: Vec<(Value, RowId)>,
+    primary_entries: Option<Vec<(IndexKey, RowId)>>,
+    secondary_entries: Vec<Vec<(IndexKey, RowId)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -382,6 +481,16 @@ pub trait IndexStore {
         key: Value,
         row_id: RowId,
     ) -> core::result::Result<(), cynos_index::IndexError>;
+    /// Adds multiple key-value pairs to the index.
+    fn add_batch(
+        &mut self,
+        entries: &[(Value, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        for (key, row_id) in entries {
+            self.add(key.clone(), *row_id)?;
+        }
+        Ok(())
+    }
     /// Sets a key-value pair, replacing any existing values.
     fn set(&mut self, key: Value, row_id: RowId);
     /// Gets all row IDs for a key.
@@ -455,6 +564,13 @@ impl BTreeIndexStore {
         self.inner.add(key, row_id)
     }
 
+    fn add_batch_index_keys(
+        &mut self,
+        entries: &[(IndexKey, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        self.inner.add_batch(entries)
+    }
+
     fn set_index_key(&mut self, key: IndexKey, row_id: RowId) {
         self.inner.set(key, row_id);
     }
@@ -510,6 +626,17 @@ impl IndexStore for BTreeIndexStore {
         row_id: RowId,
     ) -> core::result::Result<(), cynos_index::IndexError> {
         self.add_index_key(IndexKey::scalar(key), row_id)
+    }
+
+    fn add_batch(
+        &mut self,
+        entries: &[(Value, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        let entries: Vec<(IndexKey, RowId)> = entries
+            .iter()
+            .map(|(key, row_id)| (IndexKey::scalar(key.clone()), *row_id))
+            .collect();
+        self.add_batch_index_keys(&entries)
     }
 
     fn set(&mut self, key: Value, row_id: RowId) {
@@ -603,6 +730,13 @@ impl HashIndexStore {
         self.inner.add(key, row_id)
     }
 
+    fn add_batch_index_keys(
+        &mut self,
+        entries: &[(IndexKey, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        self.inner.add_batch(entries)
+    }
+
     fn set_index_key(&mut self, key: IndexKey, row_id: RowId) {
         self.inner.set(key, row_id);
     }
@@ -662,6 +796,17 @@ impl IndexStore for HashIndexStore {
         row_id: RowId,
     ) -> core::result::Result<(), cynos_index::IndexError> {
         self.add_index_key(IndexKey::scalar(key), row_id)
+    }
+
+    fn add_batch(
+        &mut self,
+        entries: &[(Value, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        let entries: Vec<(IndexKey, RowId)> = entries
+            .iter()
+            .map(|(key, row_id)| (IndexKey::scalar(key.clone()), *row_id))
+            .collect();
+        self.add_batch_index_keys(&entries)
     }
 
     fn set(&mut self, key: Value, row_id: RowId) {
@@ -759,6 +904,16 @@ impl SecondaryIndexStore {
         }
     }
 
+    fn add_batch_index_keys(
+        &mut self,
+        entries: &[(IndexKey, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        match self {
+            Self::BTree(index) => index.add_batch_index_keys(entries),
+            Self::Hash(index) => index.add_batch_index_keys(entries),
+        }
+    }
+
     fn remove_index_key(&mut self, key: &IndexKey, row_id: Option<RowId>) {
         match self {
             Self::BTree(index) => index.remove_index_key(key, row_id),
@@ -827,6 +982,17 @@ fn extract_key(row: &Row, col_indices: &[usize]) -> IndexKey {
 
 fn extract_key_from_values(values: &[Value]) -> IndexKey {
     IndexKey::from_values(values.to_vec())
+}
+
+fn first_duplicate_batch_key<K: Clone + Ord>(entries: &[(K, RowId)]) -> Option<K> {
+    let mut keys: Vec<&K> = entries.iter().map(|(key, _)| key).collect();
+    keys.sort();
+    keys.windows(2).find_map(|window| {
+        let [left, right] = window else {
+            return None;
+        };
+        (left == right).then(|| (*left).clone())
+    })
 }
 
 fn composite_range_has_expected_arity(range: &KeyRange<Vec<Value>>, expected: usize) -> bool {
@@ -1077,35 +1243,50 @@ impl RowStore {
             .windows(2)
             .all(|window| window[0].id() <= window[1].id()));
 
-        let started = profiler.start_timer();
+        let mut row_id_entries = Vec::with_capacity(rows.len());
+        let mut primary_entries = self
+            .primary_index
+            .as_ref()
+            .map(|_| Vec::with_capacity(rows.len()));
+        let mut secondary_entries: Vec<Vec<(IndexKey, RowId)>> = secondary_defs
+            .iter()
+            .map(|_| Vec::with_capacity(rows.len()))
+            .collect();
         for row in &rows {
             let row_id = row.id();
-            if self
-                .row_id_index
-                .add(Value::Int64(row_id as i64), row_id)
-                .is_err()
-            {
-                self.clear();
-                return Err(Error::invalid_operation(
-                    "Failed to add to row ID index during bulk load",
-                ));
+            row_id_entries.push((Value::Int64(row_id as i64), row_id));
+            if let Some(entries) = primary_entries.as_mut() {
+                entries.push((extract_key(row, &self.pk_columns), row_id));
             }
+            for ((_, cols), entries) in secondary_defs.iter().zip(secondary_entries.iter_mut()) {
+                entries.push((extract_key(row, cols), row_id));
+            }
+        }
+
+        let started = profiler.start_timer();
+        if self.row_id_index.add_batch(&row_id_entries).is_err() {
+            self.clear();
+            return Err(Error::invalid_operation(
+                "Failed to add to row ID index during bulk load",
+            ));
         }
         profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
 
         if let Some(ref mut pk_index) = self.primary_index {
             let started = profiler.start_timer();
-            let mut violation = None;
-            for row in &rows {
-                let pk = extract_key(row, &self.pk_columns);
-                if pk_index.add_index_key(pk.clone(), row.id()).is_err() {
-                    violation = Some(Error::UniqueConstraint {
-                        column: "primary_key".into(),
-                        value: pk.to_error_value(),
-                    });
-                    break;
-                }
-            }
+            let violation = primary_entries
+                .as_ref()
+                .and_then(|entries| {
+                    pk_index
+                        .add_batch_index_keys(entries)
+                        .err()
+                        .map(|_| entries)
+                })
+                .and_then(|entries| first_duplicate_batch_key(entries))
+                .map(|pk: IndexKey| Error::UniqueConstraint {
+                    column: "primary_key".into(),
+                    value: pk.to_error_value(),
+                });
             profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
             if let Some(error) = violation {
                 self.clear();
@@ -1114,21 +1295,20 @@ impl RowStore {
         }
 
         let started = profiler.start_timer();
-        for (idx_name, cols) in secondary_defs {
+        for ((idx_name, _), entries) in secondary_defs.iter().zip(secondary_entries.iter()) {
             let mut violation = None;
             {
                 let Some(idx) = self.secondary_indices.get_mut(idx_name) else {
                     continue;
                 };
-                for row in &rows {
-                    let key = extract_key(row, cols);
-                    if idx.add_index_key(key.clone(), row.id()).is_err() {
-                        violation = Some(Error::UniqueConstraint {
-                            column: idx_name.clone(),
-                            value: key.to_error_value(),
-                        });
-                        break;
-                    }
+                if idx.add_batch_index_keys(entries).is_err() {
+                    let value = first_duplicate_batch_key(entries)
+                        .map(|key| key.to_error_value())
+                        .unwrap_or(Value::Null);
+                    violation = Some(Error::UniqueConstraint {
+                        column: idx_name.clone(),
+                        value,
+                    });
                 }
             }
             if let Some(error) = violation {
@@ -1152,6 +1332,7 @@ impl RowStore {
                         value,
                         row.id(),
                         config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
                         profiler,
                     );
                 }
@@ -1260,7 +1441,18 @@ impl RowStore {
                 .collect();
             return self.bulk_load_with_profiler(rows, &bulk_secondary_defs, gin_defs, profiler);
         }
+        let prepared_batch = self.prepare_batch_insert_merge(&rows, secondary_defs);
         profiler.finish_phase(InsertProfilePhase::Validation, validation_started);
+
+        if let Some(prepared_batch) = prepared_batch {
+            return self.apply_prepared_batch_insert_with_profiler(
+                rows,
+                prepared_batch,
+                secondary_defs,
+                gin_defs,
+                profiler,
+            );
+        }
 
         let mut gin_builders: Vec<GinBulkBuilder> =
             gin_defs.iter().map(|_| GinBulkBuilder::new()).collect();
@@ -1410,6 +1602,7 @@ impl RowStore {
                         value,
                         row_id,
                         config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
                         profiler,
                     );
                 }
@@ -1429,6 +1622,201 @@ impl RowStore {
             profiler,
         );
         Ok(inserted)
+    }
+
+    fn prepare_batch_insert_merge(
+        &self,
+        rows: &[Row],
+        secondary_defs: &[BatchSecondaryDef],
+    ) -> Option<PreparedBatchInsert> {
+        if rows.is_empty()
+            || !rows
+                .windows(2)
+                .all(|window| window[0].id() <= window[1].id())
+        {
+            return None;
+        }
+
+        let mut row_id_entries = Vec::with_capacity(rows.len());
+        let mut primary_entries =
+            (!self.pk_columns.is_empty()).then(|| Vec::with_capacity(rows.len()));
+        let mut secondary_entries: Vec<Vec<(IndexKey, RowId)>> = secondary_defs
+            .iter()
+            .map(|_| Vec::with_capacity(rows.len()))
+            .collect();
+
+        let mut seen_row_ids = BTreeSet::new();
+        let mut seen_primary_keys = (!self.pk_columns.is_empty()).then(BTreeSet::new);
+        let mut seen_secondary_keys: Vec<Option<BTreeSet<IndexKey>>> = secondary_defs
+            .iter()
+            .map(|def| def.unique.then(BTreeSet::new))
+            .collect();
+
+        for row in rows {
+            let row_id = row.id();
+            if self.rows.contains_key(&row_id) || !seen_row_ids.insert(row_id) {
+                return None;
+            }
+            row_id_entries.push((Value::Int64(row_id as i64), row_id));
+
+            if let Some(entries) = primary_entries.as_mut() {
+                let pk = extract_key(row, &self.pk_columns);
+                if self
+                    .primary_index
+                    .as_ref()
+                    .is_some_and(|pk_index| pk_index.contains_index_key(&pk))
+                {
+                    return None;
+                }
+                if !seen_primary_keys
+                    .as_mut()
+                    .is_some_and(|seen| seen.insert(pk.clone()))
+                {
+                    return None;
+                }
+                entries.push((pk, row_id));
+            }
+
+            for ((def, entries), maybe_seen) in secondary_defs
+                .iter()
+                .zip(secondary_entries.iter_mut())
+                .zip(seen_secondary_keys.iter_mut())
+            {
+                let key = extract_key(row, &def.cols);
+                if let Some(seen) = maybe_seen.as_mut() {
+                    if self
+                        .secondary_indices
+                        .get(&def.name)
+                        .is_some_and(|idx| idx.contains_index_key(&key))
+                        || !seen.insert(key.clone())
+                    {
+                        return None;
+                    }
+                }
+                entries.push((key, row_id));
+            }
+        }
+
+        Some(PreparedBatchInsert {
+            row_id_entries,
+            primary_entries,
+            secondary_entries,
+        })
+    }
+
+    fn apply_prepared_batch_insert_with_profiler(
+        &mut self,
+        rows: Vec<Row>,
+        prepared_batch: PreparedBatchInsert,
+        secondary_defs: &[BatchSecondaryDef],
+        gin_defs: &[(String, GinIndexConfig)],
+        profiler: &mut InsertBatchProfiler,
+    ) -> Result<usize> {
+        let PreparedBatchInsert {
+            row_id_entries,
+            primary_entries,
+            secondary_entries,
+        } = prepared_batch;
+
+        let row_count = rows.len();
+
+        let started = profiler.start_timer();
+        if self.row_id_index.add_batch(&row_id_entries).is_err() {
+            profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
+            return Err(Error::invalid_operation("Failed to add to row ID index"));
+        }
+        profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
+
+        let started = profiler.start_timer();
+        if let (Some(ref mut pk_index), Some(entries)) =
+            (&mut self.primary_index, primary_entries.as_ref())
+        {
+            if pk_index.add_batch_index_keys(entries).is_err() {
+                self.row_id_index.remove_batch(&row_id_entries);
+                profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
+                let value = first_duplicate_batch_key(entries)
+                    .map(|pk| pk.to_error_value())
+                    .unwrap_or(Value::Null);
+                return Err(Error::UniqueConstraint {
+                    column: "primary_key".into(),
+                    value,
+                });
+            }
+        }
+        profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
+
+        let started = profiler.start_timer();
+        for (secondary_offset, def) in secondary_defs.iter().enumerate() {
+            let entries = &secondary_entries[secondary_offset];
+            let Some(idx) = self.secondary_indices.get_mut(&def.name) else {
+                continue;
+            };
+            if idx.add_batch_index_keys(entries).is_err() {
+                for (rollback_def, rollback_entries) in secondary_defs
+                    .iter()
+                    .zip(secondary_entries.iter())
+                    .take(secondary_offset)
+                {
+                    if let Some(rollback_idx) = self.secondary_indices.get_mut(&rollback_def.name) {
+                        rollback_idx.remove_batch_index_keys(rollback_entries);
+                    }
+                }
+                if let (Some(ref mut pk_index), Some(entries)) =
+                    (&mut self.primary_index, primary_entries.as_ref())
+                {
+                    pk_index.remove_batch_index_keys(entries);
+                }
+                self.row_id_index.remove_batch(&row_id_entries);
+                profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
+                let value = first_duplicate_batch_key(entries)
+                    .map(|key| key.to_error_value())
+                    .unwrap_or(Value::Null);
+                return Err(Error::UniqueConstraint {
+                    column: def.name.clone(),
+                    value,
+                });
+            }
+        }
+        profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
+
+        let mut gin_builders: Vec<GinBulkBuilder> =
+            gin_defs.iter().map(|_| GinBulkBuilder::new()).collect();
+        let started = profiler.start_timer();
+        for row in &rows {
+            let row_id = row.id();
+            for ((_, config), builder) in gin_defs.iter().zip(gin_builders.iter_mut()) {
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::collect_jsonb_value_into_builder_profiled(
+                        builder,
+                        value,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                        profiler,
+                    );
+                }
+            }
+        }
+        profiler.finish_phase(InsertProfilePhase::GinCollect, started);
+
+        Self::flush_gin_bulk_builders_profiled(
+            &mut self.gin_indices,
+            gin_defs,
+            &mut gin_builders,
+            profiler,
+        );
+
+        self.row_slots.reserve(row_count);
+        self.scan_order.reserve(row_count);
+
+        let started = profiler.start_timer();
+        for row in rows {
+            let row_id = row.id();
+            self.insert_row_slot(row_id, Rc::new(row));
+        }
+        profiler.finish_phase(InsertProfilePhase::RowSlot, started);
+
+        Ok(row_count)
     }
 
     fn flush_gin_bulk_builders(
@@ -1571,6 +1959,7 @@ impl RowStore {
                         value,
                         row_id,
                         config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
                     );
                 }
             }
@@ -1611,6 +2000,7 @@ impl RowStore {
                         value,
                         row_id,
                         config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
                     );
                 }
             }
@@ -1695,6 +2085,7 @@ impl RowStore {
                             old_val,
                             row_id,
                             config.compiled_indexed_paths.as_deref(),
+                            config.compiled_indexed_path_tree.as_ref(),
                         );
                     }
                     if let Some(new_val) = new_value {
@@ -1703,6 +2094,7 @@ impl RowStore {
                             new_val,
                             row_id,
                             config.compiled_indexed_paths.as_deref(),
+                            config.compiled_indexed_path_tree.as_ref(),
                         );
                     }
                 }
@@ -1751,6 +2143,7 @@ impl RowStore {
                         value,
                         row_id,
                         config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
                     );
                 }
             }
@@ -1824,6 +2217,7 @@ impl RowStore {
                             value,
                             row.id(),
                             config.compiled_indexed_paths.as_deref(),
+                            config.compiled_indexed_path_tree.as_ref(),
                         );
                     }
                 }
@@ -2521,10 +2915,11 @@ impl RowStore {
         value: &Value,
         row_id: RowId,
         indexed_paths: Option<&[CompiledGinPath]>,
+        indexed_path_tree: Option<&CompiledGinPathTree>,
     ) {
         if let Some(paths) = indexed_paths {
             if let Some(extracted) =
-                Self::extract_selected_jsonb_entries_from_text(value, paths, None)
+                Self::extract_selected_jsonb_entries_from_text(value, paths, indexed_path_tree, None)
             {
                 Self::index_extracted_jsonb_selected_paths(gin_idx, row_id, paths, extracted);
                 return;
@@ -2549,11 +2944,17 @@ impl RowStore {
         value: &Value,
         row_id: RowId,
         indexed_paths: Option<&[CompiledGinPath]>,
+        indexed_path_tree: Option<&CompiledGinPathTree>,
         profiler: &mut InsertBatchProfiler,
     ) {
         if let Some(paths) = indexed_paths {
             if let Some(extracted) =
-                Self::extract_selected_jsonb_entries_from_text(value, paths, Some(profiler))
+                Self::extract_selected_jsonb_entries_from_text(
+                    value,
+                    paths,
+                    indexed_path_tree,
+                    Some(profiler),
+                )
             {
                 Self::collect_extracted_jsonb_selected_paths_into_builder_profiled(
                     builder, row_id, paths, extracted, profiler,
@@ -2770,11 +3171,11 @@ impl RowStore {
         scalar_text: &str,
         row_id: RowId,
     ) {
-        let Some(value_str) = Self::json_text_scalar_to_index_value(scalar_text) else {
+        let Some(value_str) = Self::json_text_scalar_to_index_value_ref(scalar_text) else {
             return;
         };
-        gin_idx.add_key_value(path.encoded_path.clone(), value_str.clone(), row_id);
-        for gram in cynos_index::contains_trigrams(&value_str) {
+        gin_idx.add_key_value(path.encoded_path.clone(), value_str.as_str().into(), row_id);
+        for gram in cynos_index::contains_trigrams(value_str.as_str()) {
             gin_idx.add_key_value(path.contains_key.clone(), gram, row_id);
         }
     }
@@ -2787,14 +3188,14 @@ impl RowStore {
         profiler: &mut InsertBatchProfiler,
     ) {
         let scalar_started = profiler.start_timer();
-        let scalar_value = Self::json_text_scalar_to_index_value(scalar_text);
+        let scalar_value = Self::json_text_scalar_to_index_value_ref(scalar_text);
         profiler.finish_gin_phase(GinInsertProfilePhase::ScalarEmit, scalar_started);
         let Some(scalar_value) = scalar_value else {
             return;
         };
 
         profiler.record_gin_scalar_value();
-        builder.add_key_value_ref(&path.encoded_path, &scalar_value, row_id);
+        builder.add_key_value_ref(&path.encoded_path, scalar_value.as_str(), row_id);
 
         let stringify_started = profiler.start_timer();
         let contains_value = scalar_value.as_str();
@@ -2980,11 +3381,11 @@ impl RowStore {
         scalar_text: &str,
         row_id: RowId,
     ) {
-        let Some(value_str) = Self::json_text_scalar_to_index_value(scalar_text) else {
+        let Some(value_str) = Self::json_text_scalar_to_index_value_ref(scalar_text) else {
             return;
         };
-        gin_idx.remove_key_value(&path.encoded_path, &value_str, row_id);
-        for gram in cynos_index::contains_trigrams(&value_str) {
+        gin_idx.remove_key_value(&path.encoded_path, value_str.as_str(), row_id);
+        for gram in cynos_index::contains_trigrams(value_str.as_str()) {
             gin_idx.remove_key_value(&path.contains_key, &gram, row_id);
         }
     }
@@ -2995,10 +3396,11 @@ impl RowStore {
         value: &Value,
         row_id: RowId,
         indexed_paths: Option<&[CompiledGinPath]>,
+        indexed_path_tree: Option<&CompiledGinPathTree>,
     ) {
         if let Some(paths) = indexed_paths {
             if let Some(extracted) =
-                Self::extract_selected_jsonb_entries_from_text(value, paths, None)
+                Self::extract_selected_jsonb_entries_from_text(value, paths, indexed_path_tree, None)
             {
                 Self::remove_extracted_jsonb_selected_paths(gin_idx, row_id, paths, extracted);
                 return;
@@ -3187,21 +3589,35 @@ impl RowStore {
         parse_json_text(json_str)
     }
 
+    #[cfg(test)]
     fn json_text_scalar_to_index_value(value_slice: &str) -> Option<String> {
+        Self::json_text_scalar_to_index_value_ref(value_slice)
+            .map(JsonScalarIndexValue::into_owned)
+    }
+
+    fn json_text_scalar_to_index_value_ref(value_slice: &str) -> Option<JsonScalarIndexValue<'_>> {
         let value_slice = value_slice.trim();
         if value_slice == "null" || value_slice == "true" || value_slice == "false" {
-            return Some(value_slice.into());
+            return Some(JsonScalarIndexValue::Borrowed(value_slice));
         }
         if value_slice.starts_with('"') && value_slice.ends_with('"') && value_slice.len() >= 2 {
-            return Some(unescape_json(&value_slice[1..value_slice.len() - 1]));
+            let inner = &value_slice[1..value_slice.len() - 1];
+            if !inner.as_bytes().contains(&b'\\') {
+                return Some(JsonScalarIndexValue::Borrowed(inner));
+            }
+            return Some(JsonScalarIndexValue::Owned(unescape_json(inner)));
+        }
+        if is_fast_json_integer_literal(value_slice) {
+            return Some(JsonScalarIndexValue::Borrowed(value_slice));
         }
         let number = value_slice.parse::<f64>().ok()?;
-        Some(format!("{number}"))
+        Some(JsonScalarIndexValue::Owned(format!("{number}")))
     }
 
     fn extract_selected_jsonb_entries_from_text<'a>(
         value: &'a Value,
         indexed_paths: &[CompiledGinPath],
+        indexed_path_tree: Option<&CompiledGinPathTree>,
         profiler: Option<&mut InsertBatchProfiler>,
     ) -> Option<Vec<(usize, ExtractedJsonbTextValue<'a>)>> {
         let Value::Jsonb(jsonb) = value else {
@@ -3210,7 +3626,7 @@ impl RowStore {
         let json_text = core::str::from_utf8(&jsonb.0).ok()?;
         let mut extracted = Vec::with_capacity(indexed_paths.len());
         let mut profiler = profiler;
-        let path_indices: Vec<usize> = (0..indexed_paths.len()).collect();
+        let indexed_path_tree = indexed_path_tree?;
 
         if let Some(profiler) = profiler.as_deref_mut() {
             for _ in indexed_paths {
@@ -3224,7 +3640,7 @@ impl RowStore {
         if Self::extract_selected_jsonb_entries_from_slice(
             json_text.trim(),
             indexed_paths,
-            &path_indices,
+            indexed_path_tree,
             0,
             &mut extracted,
             &mut profiler,
@@ -3245,24 +3661,21 @@ impl RowStore {
     fn extract_selected_jsonb_entries_from_slice<'a>(
         json_text: &'a str,
         indexed_paths: &[CompiledGinPath],
-        path_indices: &[usize],
-        depth: usize,
+        indexed_path_tree: &CompiledGinPathTree,
+        node_index: usize,
         extracted: &mut Vec<(usize, ExtractedJsonbTextValue<'a>)>,
         profiler: &mut Option<&mut InsertBatchProfiler>,
     ) -> core::result::Result<(), ()> {
         let json_text = json_text.trim();
-        let mut remaining = Vec::with_capacity(path_indices.len());
+        let Some(node) = indexed_path_tree.nodes.get(node_index) else {
+            return Err(());
+        };
 
-        for &path_index in path_indices {
-            let path = &indexed_paths[path_index];
-            if path.segments.len() == depth {
-                Self::push_extracted_jsonb_entry(json_text, path_index, extracted, profiler)?;
-            } else {
-                remaining.push(path_index);
-            }
+        for &path_index in &node.terminal_path_indices {
+            Self::push_extracted_jsonb_entry(json_text, path_index, extracted, profiler)?;
         }
 
-        if remaining.is_empty() {
+        if node.object_children.is_empty() && node.array_children.is_empty() {
             return Ok(());
         }
 
@@ -3270,16 +3683,16 @@ impl RowStore {
             Some(b'{') => Self::extract_selected_jsonb_entries_from_object(
                 json_text,
                 indexed_paths,
-                &remaining,
-                depth,
+                indexed_path_tree,
+                node_index,
                 extracted,
                 profiler,
             ),
             Some(b'[') => Self::extract_selected_jsonb_entries_from_array(
                 json_text,
                 indexed_paths,
-                &remaining,
-                depth,
+                indexed_path_tree,
+                node_index,
                 extracted,
                 profiler,
             ),
@@ -3291,8 +3704,8 @@ impl RowStore {
     fn extract_selected_jsonb_entries_from_object<'a>(
         json_text: &'a str,
         indexed_paths: &[CompiledGinPath],
-        path_indices: &[usize],
-        depth: usize,
+        indexed_path_tree: &CompiledGinPathTree,
+        node_index: usize,
         extracted: &mut Vec<(usize, ExtractedJsonbTextValue<'a>)>,
         profiler: &mut Option<&mut InsertBatchProfiler>,
     ) -> core::result::Result<(), ()> {
@@ -3300,6 +3713,9 @@ impl RowStore {
         if bytes.first().copied() != Some(b'{') {
             return Err(());
         }
+        let Some(node) = indexed_path_tree.nodes.get(node_index) else {
+            return Err(());
+        };
 
         let mut index = 1usize;
         loop {
@@ -3322,22 +3738,12 @@ impl RowStore {
             let value_start = index;
             let value_end = scan_json_value_end_bytes(bytes, value_start).ok_or(())?;
             let value_slice = json_text[value_start..value_end].trim();
-            let mut child_indices = Vec::new();
-
-            for &path_index in path_indices {
-                let segment = &indexed_paths[path_index].segments[depth];
-                if segment.array_index.is_some() || !json_escaped_string_eq(key, &segment.key) {
-                    continue;
-                }
-                child_indices.push(path_index);
-            }
-
-            if !child_indices.is_empty() {
+            if let Some(&child_node_index) = node.object_children.get(key) {
                 Self::extract_selected_jsonb_entries_from_slice(
                     value_slice,
                     indexed_paths,
-                    &child_indices,
-                    depth + 1,
+                    indexed_path_tree,
+                    child_node_index,
                     extracted,
                     profiler,
                 )?;
@@ -3356,8 +3762,8 @@ impl RowStore {
     fn extract_selected_jsonb_entries_from_array<'a>(
         json_text: &'a str,
         indexed_paths: &[CompiledGinPath],
-        path_indices: &[usize],
-        depth: usize,
+        indexed_path_tree: &CompiledGinPathTree,
+        node_index: usize,
         extracted: &mut Vec<(usize, ExtractedJsonbTextValue<'a>)>,
         profiler: &mut Option<&mut InsertBatchProfiler>,
     ) -> core::result::Result<(), ()> {
@@ -3365,6 +3771,9 @@ impl RowStore {
         if bytes.first().copied() != Some(b'[') {
             return Err(());
         }
+        let Some(node) = indexed_path_tree.nodes.get(node_index) else {
+            return Err(());
+        };
 
         let mut index = 1usize;
         let mut current_index = 0usize;
@@ -3379,21 +3788,12 @@ impl RowStore {
             let value_start = index;
             let value_end = scan_json_value_end_bytes(bytes, value_start).ok_or(())?;
             let value_slice = json_text[value_start..value_end].trim();
-            let mut child_indices = Vec::new();
-
-            for &path_index in path_indices {
-                let segment = &indexed_paths[path_index].segments[depth];
-                if segment.array_index == Some(current_index) {
-                    child_indices.push(path_index);
-                }
-            }
-
-            if !child_indices.is_empty() {
+            if let Some(&child_node_index) = node.array_children.get(&current_index) {
                 Self::extract_selected_jsonb_entries_from_slice(
                     value_slice,
                     indexed_paths,
-                    &child_indices,
-                    depth + 1,
+                    indexed_path_tree,
+                    child_node_index,
                     extracted,
                     profiler,
                 )?;
@@ -3445,10 +3845,16 @@ impl RowStore {
     fn extract_selected_jsonb_values_from_text(
         value: &Value,
         indexed_paths: &[CompiledGinPath],
+        indexed_path_tree: Option<&CompiledGinPathTree>,
         profiler: Option<&mut InsertBatchProfiler>,
     ) -> Option<Vec<(usize, ParsedJsonbValue)>> {
         let extracted =
-            Self::extract_selected_jsonb_entries_from_text(value, indexed_paths, profiler)?;
+            Self::extract_selected_jsonb_entries_from_text(
+                value,
+                indexed_paths,
+                indexed_path_tree,
+                profiler,
+            )?;
         let mut parsed_values = Vec::with_capacity(extracted.len());
         for (path_index, value) in extracted {
             let parsed = match value {
@@ -4032,7 +4438,11 @@ fn parse_json_text(s: &str) -> Option<ParsedJsonbValue> {
 }
 
 fn unescape_json(s: &str) -> String {
-    let mut result = String::new();
+    if !s.as_bytes().contains(&b'\\') {
+        return s.into();
+    }
+
+    let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -4056,65 +4466,53 @@ fn unescape_json(s: &str) -> String {
     result
 }
 
-fn json_escaped_string_eq(escaped: &str, target: &str) -> bool {
-    if !escaped.as_bytes().contains(&b'\\') {
-        return escaped == target;
+fn is_fast_json_integer_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return false;
     }
 
-    let mut target_chars = target.chars();
-    let mut escaped_chars = escaped.chars();
-    while let Some(ch) = escaped_chars.next() {
-        if ch != '\\' {
-            if Some(ch) != target_chars.next() {
-                return false;
-            }
-            continue;
-        }
+    let digits = if bytes[0] == b'-' { &bytes[1..] } else { bytes };
 
-        let Some(escaped_ch) = escaped_chars.next() else {
-            return false;
-        };
+    if digits.is_empty() {
+        return false;
+    }
 
-        match escaped_ch {
-            'n' => {
-                if Some('\n') != target_chars.next() {
-                    return false;
-                }
-            }
-            't' => {
-                if Some('\t') != target_chars.next() {
-                    return false;
-                }
-            }
-            'r' => {
-                if Some('\r') != target_chars.next() {
-                    return false;
-                }
-            }
+    if digits.len() > 1 && digits[0] == b'0' {
+        return false;
+    }
+
+    digits.iter().all(|byte| byte.is_ascii_digit())
+}
+
+fn escape_json_string_fragment(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
             '"' => {
-                if Some('"') != target_chars.next() {
-                    return false;
-                }
+                escaped.push('\\');
+                escaped.push('"');
             }
             '\\' => {
-                if Some('\\') != target_chars.next() {
-                    return false;
-                }
+                escaped.push('\\');
+                escaped.push('\\');
             }
-            '/' => {
-                if Some('/') != target_chars.next() {
-                    return false;
-                }
+            '\n' => {
+                escaped.push('\\');
+                escaped.push('n');
             }
-            other => {
-                if Some('\\') != target_chars.next() || Some(other) != target_chars.next() {
-                    return false;
-                }
+            '\r' => {
+                escaped.push('\\');
+                escaped.push('r');
             }
+            '\t' => {
+                escaped.push('\\');
+                escaped.push('t');
+            }
+            _ => escaped.push(ch),
         }
     }
-
-    target_chars.next().is_none()
+    escaped
 }
 
 fn parse_json_object(s: &str) -> Option<ParsedJsonbValue> {
@@ -4467,6 +4865,44 @@ mod tests {
         let rows = vec![
             Row::new(10, vec![Value::Int64(1), Value::String("Alice".into())]),
             Row::new(11, vec![Value::Int64(1), Value::String("Bob".into())]),
+        ];
+
+        assert!(store.bulk_load(rows).is_err());
+        assert!(store.is_empty());
+        assert!(store.scan().next().is_none());
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_builds_hash_secondary_index() {
+        let mut store = RowStore::new(test_schema_with_hash_index());
+        let rows = vec![
+            Row::new(10, vec![Value::Int64(1), Value::Int64(100)]),
+            Row::new(11, vec![Value::Int64(2), Value::Int64(200)]),
+            Row::new(12, vec![Value::Int64(3), Value::Int64(100)]),
+        ];
+
+        let loaded = store.bulk_load(rows).unwrap();
+        assert_eq!(loaded, 3);
+
+        let indexed = store.index_scan("idx_value_hash", Some(&KeyRange::only(Value::Int64(100))));
+        assert_eq!(
+            indexed.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![10, 12]
+        );
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_rejects_unique_secondary_duplicates_without_leaking_state() {
+        let mut store = RowStore::new(test_schema_with_unique_index());
+        let rows = vec![
+            Row::new(
+                10,
+                vec![Value::Int64(1), Value::String("alice@example.com".into())],
+            ),
+            Row::new(
+                11,
+                vec![Value::Int64(2), Value::String("alice@example.com".into())],
+            ),
         ];
 
         assert!(store.bulk_load(rows).is_err());
@@ -5689,9 +6125,15 @@ mod tests {
             CompiledGinPath::new("tags.1".into()),
             CompiledGinPath::new("history.0.state".into()),
         ];
+        let path_tree = CompiledGinPathTree::new(&paths);
 
-        let extracted = RowStore::extract_selected_jsonb_values_from_text(&value, &paths, None)
-            .expect("text extractor should succeed");
+        let extracted = RowStore::extract_selected_jsonb_values_from_text(
+            &value,
+            &paths,
+            Some(&path_tree),
+            None,
+        )
+        .expect("text extractor should succeed");
 
         let mut extracted_values = BTreeMap::new();
         for (path_index, selected) in extracted {
@@ -5720,9 +6162,15 @@ mod tests {
     fn test_path_directed_extractor_matches_escaped_object_key() {
         let value = make_jsonb(r#"{"st\"atus":"active"}"#);
         let paths = vec![CompiledGinPath::new("st\"atus".into())];
+        let path_tree = CompiledGinPathTree::new(&paths);
 
-        let extracted = RowStore::extract_selected_jsonb_values_from_text(&value, &paths, None)
-            .expect("text extractor should succeed");
+        let extracted = RowStore::extract_selected_jsonb_values_from_text(
+            &value,
+            &paths,
+            Some(&path_tree),
+            None,
+        )
+        .expect("text extractor should succeed");
 
         assert_eq!(extracted.len(), 1);
         assert_eq!(
@@ -5792,6 +6240,53 @@ mod tests {
             vec![1],
             "string scalar fast path should still unescape JSON string values",
         );
+    }
+
+    #[test]
+    fn test_json_text_scalar_to_index_value_fast_paths_preserve_semantics() {
+        assert_eq!(
+            RowStore::json_text_scalar_to_index_value("\"enterprise\""),
+            Some("enterprise".into()),
+            "plain strings should not require the slower unescape path",
+        );
+        assert_eq!(
+            RowStore::json_text_scalar_to_index_value("\"hi\\nthere\""),
+            Some("hi\nthere".into()),
+            "escaped strings must still decode correctly",
+        );
+        assert_eq!(
+            RowStore::json_text_scalar_to_index_value("42"),
+            Some("42".into()),
+            "integer literals should preserve their canonical JSON text form",
+        );
+        assert_eq!(
+            RowStore::json_text_scalar_to_index_value("1.0"),
+            Some("1".into()),
+            "floating-point literals must keep the previous f64 formatting semantics",
+        );
+    }
+
+    #[test]
+    fn test_json_text_scalar_to_index_value_ref_borrows_common_literals() {
+        match RowStore::json_text_scalar_to_index_value_ref("\"enterprise\"") {
+            Some(JsonScalarIndexValue::Borrowed("enterprise")) => {}
+            other => panic!("expected borrowed plain string, got {other:?}"),
+        }
+
+        match RowStore::json_text_scalar_to_index_value_ref("42") {
+            Some(JsonScalarIndexValue::Borrowed("42")) => {}
+            other => panic!("expected borrowed integer literal, got {other:?}"),
+        }
+
+        match RowStore::json_text_scalar_to_index_value_ref("\"hi\\nthere\"") {
+            Some(JsonScalarIndexValue::Owned(value)) => assert_eq!(value, "hi\nthere"),
+            other => panic!("expected owned escaped string, got {other:?}"),
+        }
+
+        match RowStore::json_text_scalar_to_index_value_ref("1.0") {
+            Some(JsonScalarIndexValue::Owned(value)) => assert_eq!(value, "1"),
+            other => panic!("expected owned floating literal, got {other:?}"),
+        }
     }
 
     #[test]

@@ -93,6 +93,37 @@ impl<K: Clone + Ord> BTreeIndex<K> {
         }
     }
 
+    /// Finds the leaf that should contain the given key, starting from a previous leaf hint
+    /// when keys are inserted in non-decreasing order.
+    fn find_leaf_from_hint(&self, key: &K, hint: Option<NodeId>) -> NodeId {
+        let Some(mut leaf_id) = hint else {
+            return self.find_leaf(key);
+        };
+
+        loop {
+            let leaf = &self.arena[leaf_id];
+            debug_assert!(leaf.is_leaf);
+
+            match leaf.keys.last() {
+                None => return leaf_id,
+                Some(last_key) if !self.comparator.is_less(last_key, key) => return leaf_id,
+                Some(_) => {}
+            }
+
+            let Some(next_id) = leaf.next else {
+                return leaf_id;
+            };
+            let next = &self.arena[next_id];
+            match next.keys.first() {
+                None => return next_id,
+                Some(first_key) if !self.comparator.is_less(key, first_key) => {
+                    leaf_id = next_id;
+                }
+                Some(_) => return leaf_id,
+            }
+        }
+    }
+
     /// Finds the position of the child to descend into for an internal node.
     /// Uses binary search for O(log n) performance instead of linear scan.
     #[inline]
@@ -603,6 +634,58 @@ impl<K: Clone + Ord> BTreeIndex<K> {
 impl<K: Clone + Ord> Index<K> for BTreeIndex<K> {
     fn add(&mut self, key: K, value: RowId) -> Result<(), IndexError> {
         self.insert(key, value)
+    }
+
+    fn add_batch(&mut self, entries: &[(K, RowId)]) -> Result<(), IndexError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut sorted_entries = entries.to_vec();
+        sorted_entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        if self.unique {
+            let mut last_key: Option<&K> = None;
+            for (key, _) in &sorted_entries {
+                if self.contains_key(key) || last_key == Some(key) {
+                    return Err(IndexError::DuplicateKey);
+                }
+                last_key = Some(key);
+            }
+        }
+
+        let mut leaf_hint = None;
+        let mut i = 0usize;
+        while i < sorted_entries.len() {
+            let key = sorted_entries[i].0.clone();
+            let mut values = Vec::new();
+            while i < sorted_entries.len() && sorted_entries[i].0 == key {
+                values.push(sorted_entries[i].1);
+                i += 1;
+            }
+
+            let leaf_id = self.find_leaf_from_hint(&key, leaf_hint);
+            let pos = self.arena[leaf_id].find_key_position(&key);
+            if pos < self.arena[leaf_id].key_count() && self.arena[leaf_id].keys[pos] == key {
+                if self.unique {
+                    return Err(IndexError::DuplicateKey);
+                }
+                self.arena[leaf_id].values[pos].extend(values.iter().copied());
+            } else {
+                self.arena[leaf_id].keys.insert(pos, key);
+                self.arena[leaf_id].values.insert(pos, values.clone());
+            }
+            self.stats.add_rows(values.len());
+
+            if self.arena[leaf_id].key_count() >= self.order {
+                self.split_leaf(leaf_id);
+                leaf_hint = None;
+            } else {
+                leaf_hint = Some(leaf_id);
+            }
+        }
+
+        Ok(())
     }
 
     fn set(&mut self, key: K, value: RowId) {
@@ -1797,5 +1880,40 @@ mod tests {
         // Verify range query still works correctly
         let result = tree.get_range(None, false, None, 0);
         assert_eq!(result, vec![0, 1, 2, 4, 5, 6, 8, 9]);
+    }
+
+    #[test]
+    fn test_btree_add_batch_groups_duplicate_keys() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, false);
+
+        tree.add_batch(&[(3, 30), (1, 10), (1, 11), (2, 20), (1, 12)])
+            .unwrap();
+
+        assert_eq!(tree.get(&1), vec![10, 11, 12]);
+        assert_eq!(tree.get(&2), vec![20]);
+        assert_eq!(tree.get(&3), vec![30]);
+        assert_eq!(tree.len(), 5);
+        assert_eq!(tree.distinct_key_count(), 3);
+    }
+
+    #[test]
+    fn test_btree_add_batch_unique_detects_duplicate_keys() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, true);
+
+        let err = tree.add_batch(&[(1, 10), (1, 11)]).unwrap_err();
+
+        assert_eq!(err, IndexError::DuplicateKey);
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_btree_add_batch_merges_into_existing_non_unique_key() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, false);
+        tree.add(1, 1).unwrap();
+
+        tree.add_batch(&[(2, 20), (1, 10), (1, 11)]).unwrap();
+
+        assert_eq!(tree.get(&1), vec![1, 10, 11]);
+        assert_eq!(tree.get(&2), vec![20]);
     }
 }

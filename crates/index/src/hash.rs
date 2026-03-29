@@ -6,7 +6,8 @@ use crate::stats::IndexStats;
 use crate::traits::{Index, IndexError, KeyRange, RangeIndex};
 use alloc::vec::Vec;
 use cynos_core::RowId;
-use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
+use hashbrown::{HashMap, HashSet};
 
 /// A hash-based index for O(1) point queries.
 ///
@@ -61,6 +62,45 @@ impl<K: Eq + core::hash::Hash + Clone + Ord> Index<K> for HashIndex<K> {
 
         self.map.entry(key).or_insert_with(Vec::new).push(value);
         self.stats.add_rows(1);
+        Ok(())
+    }
+
+    fn add_batch(&mut self, entries: &[(K, RowId)]) -> Result<(), IndexError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        if self.unique {
+            let mut seen = HashSet::with_capacity(entries.len());
+            for (key, _) in entries {
+                if self.map.contains_key(key) || !seen.insert(key.clone()) {
+                    return Err(IndexError::DuplicateKey);
+                }
+            }
+
+            self.map.reserve(entries.len());
+            for (key, row_id) in entries {
+                self.map.insert(key.clone(), alloc::vec![*row_id]);
+            }
+            self.stats.add_rows(entries.len());
+            return Ok(());
+        }
+
+        let mut grouped = HashMap::<K, Vec<RowId>>::with_capacity(entries.len());
+        for (key, row_id) in entries {
+            grouped.entry(key.clone()).or_default().push(*row_id);
+        }
+
+        self.map.reserve(grouped.len());
+        for (key, mut row_ids) in grouped {
+            match self.map.entry(key) {
+                Entry::Occupied(mut entry) => entry.get_mut().append(&mut row_ids),
+                Entry::Vacant(entry) => {
+                    entry.insert(row_ids);
+                }
+            }
+        }
+        self.stats.add_rows(entries.len());
         Ok(())
     }
 
@@ -476,5 +516,29 @@ mod tests {
 
         assert_eq!(index.get(&1), vec![1000]);
         assert_eq!(index.get(&2), vec![2000]);
+    }
+
+    #[test]
+    fn test_hash_index_add_batch_groups_duplicate_keys() {
+        let mut index: HashIndex<i32> = HashIndex::new(false);
+
+        index
+            .add_batch(&[(1, 10), (1, 11), (2, 20), (1, 12)])
+            .unwrap();
+
+        assert_eq!(index.get(&1), vec![10, 11, 12]);
+        assert_eq!(index.get(&2), vec![20]);
+        assert_eq!(index.len(), 4);
+        assert_eq!(index.distinct_key_count(), 2);
+    }
+
+    #[test]
+    fn test_hash_index_add_batch_unique_detects_duplicate_keys() {
+        let mut index: HashIndex<i32> = HashIndex::new(true);
+
+        let err = index.add_batch(&[(1, 10), (1, 11)]).unwrap_err();
+
+        assert_eq!(err, IndexError::DuplicateKey);
+        assert!(index.is_empty());
     }
 }

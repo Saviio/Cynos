@@ -16,6 +16,7 @@ use hashbrown::{HashMap, HashSet};
 
 /// Synthetic key namespace used for JSONB_CONTAINS trigram prefilters.
 pub const CONTAINS_TRIGRAM_KEY_PREFIX: &str = "__cynos_contains3__:";
+const TRIGRAM_CACHE_CAPACITY: usize = 256;
 
 /// Builds the synthetic key used for path-scoped JSONB_CONTAINS trigrams.
 pub fn contains_trigram_key(path: &str) -> String {
@@ -23,6 +24,8 @@ pub fn contains_trigram_key(path: &str) -> String {
     key.push_str(path);
     key
 }
+
+const INLINE_TRIGRAM_DEDUP_CAPACITY: usize = 12;
 
 fn trigram_code(first: char, second: char, third: char) -> u128 {
     ((first as u128) << 42) | ((second as u128) << 21) | (third as u128)
@@ -35,9 +38,55 @@ fn push_trigram_string(out: &mut String, first: char, second: char, third: char)
     out.push(third);
 }
 
-fn for_each_unique_trigram<F>(value: &str, mut visitor: F) -> usize
+fn trigram_chars(code: u128) -> Option<(char, char, char)> {
+    let first = core::char::from_u32(((code >> 42) & 0x1f_ffff) as u32)?;
+    let second = core::char::from_u32(((code >> 21) & 0x1f_ffff) as u32)?;
+    let third = core::char::from_u32((code & 0x1f_ffff) as u32)?;
+    Some((first, second, third))
+}
+
+fn trigram_string_from_code(code: u128) -> String {
+    let Some((first, second, third)) = trigram_chars(code) else {
+        return String::new();
+    };
+
+    let mut gram = String::with_capacity(first.len_utf8() + second.len_utf8() + third.len_utf8());
+    gram.push(first);
+    gram.push(second);
+    gram.push(third);
+    gram
+}
+
+fn try_mark_trigram_seen(
+    code: u128,
+    inline_seen: &mut [u128; INLINE_TRIGRAM_DEDUP_CAPACITY],
+    inline_len: &mut usize,
+    spilled_seen: &mut Option<HashSet<u128>>,
+) -> bool {
+    if let Some(seen) = spilled_seen.as_mut() {
+        return seen.insert(code);
+    }
+
+    if inline_seen[..*inline_len].contains(&code) {
+        return false;
+    }
+
+    if *inline_len < INLINE_TRIGRAM_DEDUP_CAPACITY {
+        inline_seen[*inline_len] = code;
+        *inline_len += 1;
+        return true;
+    }
+
+    let mut seen = HashSet::with_capacity(*inline_len * 2);
+    seen.extend(inline_seen[..*inline_len].iter().copied());
+    let inserted = seen.insert(code);
+    *spilled_seen = Some(seen);
+    inserted
+}
+
+fn for_each_unique_trigram_code<F>(value: &str, mut visitor: F) -> usize
 where
-    F: FnMut(&str),
+    F: FnMut(u128),
 {
     let mut chars = value.chars();
     let Some(mut first) = chars.next() else {
@@ -50,14 +99,15 @@ where
         return 0;
     };
 
-    let mut seen = HashSet::with_capacity(value.len().saturating_sub(2));
-    let mut gram = String::with_capacity(first.len_utf8() + second.len_utf8() + third.len_utf8());
+    let mut inline_seen = [0u128; INLINE_TRIGRAM_DEDUP_CAPACITY];
+    let mut inline_len = 0usize;
+    let mut spilled_seen = None;
     let mut count = 0usize;
 
     loop {
-        if seen.insert(trigram_code(first, second, third)) {
-            push_trigram_string(&mut gram, first, second, third);
-            visitor(gram.as_str());
+        let code = trigram_code(first, second, third);
+        if try_mark_trigram_seen(code, &mut inline_seen, &mut inline_len, &mut spilled_seen) {
+            visitor(code);
             count += 1;
         }
 
@@ -70,6 +120,24 @@ where
     }
 
     count
+}
+
+fn for_each_unique_trigram<F>(value: &str, mut visitor: F) -> usize
+where
+    F: FnMut(&str),
+{
+    let mut gram = String::new();
+    for_each_unique_trigram_code(value, |code| {
+        let Some((first, second, third)) = trigram_chars(code) else {
+            return;
+        };
+
+        if gram.capacity() < first.len_utf8() + second.len_utf8() + third.len_utf8() {
+            gram.reserve(first.len_utf8() + second.len_utf8() + third.len_utf8() - gram.capacity());
+        }
+        push_trigram_string(&mut gram, first, second, third);
+        visitor(gram.as_str());
+    })
 }
 
 /// Extracts unique trigrams from a string for substring prefiltering.
@@ -101,10 +169,62 @@ fn push_sorted_unique_row(rows: &mut Vec<RowId>, row_id: RowId) {
     }
 }
 
+fn extend_sorted_unique_rows(rows: &mut Vec<RowId>, incoming: &[RowId]) {
+    if incoming.is_empty() {
+        return;
+    }
+
+    if rows.is_empty() {
+        rows.extend_from_slice(incoming);
+        return;
+    }
+
+    let Some(&incoming_first) = incoming.first() else {
+        return;
+    };
+    if rows.last().copied().is_some_and(|last| last < incoming_first) {
+        rows.extend_from_slice(incoming);
+        return;
+    }
+
+    let mut merged = Vec::with_capacity(rows.len() + incoming.len());
+    let mut left = 0usize;
+    let mut right = 0usize;
+
+    while left < rows.len() && right < incoming.len() {
+        match rows[left].cmp(&incoming[right]) {
+            core::cmp::Ordering::Less => {
+                merged.push(rows[left]);
+                left += 1;
+            }
+            core::cmp::Ordering::Greater => {
+                merged.push(incoming[right]);
+                right += 1;
+            }
+            core::cmp::Ordering::Equal => {
+                merged.push(rows[left]);
+                left += 1;
+                right += 1;
+            }
+        }
+    }
+
+    if left < rows.len() {
+        merged.extend_from_slice(&rows[left..]);
+    }
+    if right < incoming.len() {
+        merged.extend_from_slice(&incoming[right..]);
+    }
+
+    *rows = merged;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GinBulkBuilder {
     key_index: HashMap<String, Vec<RowId>>,
     key_value_index: HashMap<String, HashMap<String, Vec<RowId>>>,
+    contains_value_index: HashMap<String, HashMap<String, Vec<RowId>>>,
+    trigram_cache: HashMap<String, Vec<u128>>,
     key_add_count: usize,
 }
 
@@ -168,26 +288,83 @@ impl GinBulkBuilder {
         needle: &str,
         row_id: RowId,
     ) -> usize {
-        for_each_unique_trigram(needle, |gram| {
-            self.add_key_value_ref(contains_key, gram, row_id)
-        })
+        self.add_contains_value_ref(contains_key, needle, row_id);
+        self.trigram_codes_for_value(needle).len()
+    }
+
+    fn add_contains_value_ref(&mut self, contains_key: &str, value: &str, row_id: RowId) {
+        if let Some(values) = self.contains_value_index.get_mut(contains_key) {
+            if let Some(rows) = values.get_mut(value) {
+                push_sorted_unique_row(rows, row_id);
+                return;
+            }
+
+            values.insert(value.into(), vec![row_id]);
+            return;
+        }
+
+        let mut values = HashMap::new();
+        values.insert(value.into(), vec![row_id]);
+        self.contains_value_index.insert(contains_key.into(), values);
+    }
+
+    fn trigram_codes_for_value(&mut self, needle: &str) -> Vec<u128> {
+        if let Some(cached) = self.trigram_cache.get(needle) {
+            return cached.clone();
+        }
+
+        let mut codes = Vec::new();
+        for_each_unique_trigram_code(needle, |code| codes.push(code));
+        if self.trigram_cache.len() < TRIGRAM_CACHE_CAPACITY {
+            self.trigram_cache.insert(needle.into(), codes.clone());
+        }
+        codes
     }
 
     fn finish(self) -> GinBulkDelta {
+        let mut key_value_index: HashMap<(String, String), Vec<RowId>> = self
+            .key_value_index
+            .into_iter()
+            .flat_map(|(key, values)| {
+                values
+                    .into_iter()
+                    .map(move |(value, rows)| ((key.clone(), value), rows))
+            })
+            .collect();
+
+        let mut trigram_cache = self.trigram_cache;
+        for (contains_key, values) in self.contains_value_index {
+            for (value, rows) in values {
+                let trigram_codes = if let Some(cached) = trigram_cache.get(&value) {
+                    cached.clone()
+                } else {
+                    let mut codes = Vec::new();
+                    for_each_unique_trigram_code(&value, |code| codes.push(code));
+                    if trigram_cache.len() < TRIGRAM_CACHE_CAPACITY {
+                        trigram_cache.insert(value.clone(), codes.clone());
+                    }
+                    codes
+                };
+
+                for trigram_code in trigram_codes {
+                    let trigram = trigram_string_from_code(trigram_code);
+                    let entry = key_value_index
+                        .entry((contains_key.clone(), trigram))
+                        .or_default();
+                    extend_sorted_unique_rows(entry, &rows);
+                }
+            }
+        }
+
         GinBulkDelta {
             key_index: self
                 .key_index
                 .into_iter()
                 .map(|(key, rows)| (key, PostingList::from_sorted_unique(rows)))
                 .collect(),
-            key_value_index: self
-                .key_value_index
+            key_value_index: key_value_index
                 .into_iter()
-                .flat_map(|(key, values)| {
-                    values.into_iter().map(move |(value, rows)| {
-                        ((key.clone(), value), PostingList::from_sorted_unique(rows))
-                    })
-                })
+                .map(|(pair, rows)| (pair, PostingList::from_sorted_unique(rows)))
                 .collect(),
             key_add_count: self.key_add_count,
         }
@@ -268,8 +445,8 @@ impl GinIndex {
 
     pub fn add_contains_trigrams(&mut self, path: &str, needle: &str, row_id: RowId) -> usize {
         let key = contains_trigram_key(path);
-        for_each_unique_trigram(needle, |gram| {
-            self.add_key_value(key.clone(), gram.into(), row_id);
+        for_each_unique_trigram_code(needle, |code| {
+            self.add_key_value(key.clone(), trigram_string_from_code(code), row_id);
         })
     }
 
@@ -829,5 +1006,36 @@ mod tests {
 
         assert_eq!(gin.get_by_key("status"), vec![1, 2, 3]);
         assert_eq!(gin.get_by_key_value("status", "active"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_gin_bulk_builder_contains_trigrams_for_key() {
+        let mut gin = GinIndex::new();
+        let contains_key = contains_trigram_key("status");
+        let mut builder = GinBulkBuilder::new();
+        builder.add_contains_trigrams_for_key(&contains_key, "enterprise", 7);
+
+        gin.apply_bulk_builder(builder);
+
+        for gram in contains_trigrams("enterprise") {
+            assert_eq!(gin.get_by_key_value(&contains_key, &gram), vec![7]);
+        }
+    }
+
+    #[test]
+    fn test_gin_bulk_builder_reuses_repeated_trigram_needles_without_changing_postings() {
+        let mut gin = GinIndex::new();
+        let contains_key = contains_trigram_key("status");
+        let mut builder = GinBulkBuilder::new();
+
+        for row_id in [7, 8, 9] {
+            builder.add_contains_trigrams_for_key(&contains_key, "enterprise", row_id);
+        }
+
+        gin.apply_bulk_builder(builder);
+
+        for gram in contains_trigrams("enterprise") {
+            assert_eq!(gin.get_by_key_value(&contains_key, &gram), vec![7, 8, 9]);
+        }
     }
 }
