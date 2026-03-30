@@ -2974,11 +2974,9 @@ impl MaterializedView {
         compiled_plan: CompiledIvmPlan,
         initial: Vec<Row>,
     ) -> Self {
-        let compiled_bootstrap_plan = CompiledBootstrapPlan::compile(&dataflow);
-        Self::with_compiled_initial_and_bootstrap(
+        Self::with_compiled_initial_rc(
             dataflow,
             compiled_plan,
-            compiled_bootstrap_plan,
             initial.into_iter().map(Rc::new).collect(),
         )
     }
@@ -2988,19 +2986,16 @@ impl MaterializedView {
         compiled_plan: CompiledIvmPlan,
         initial: Vec<Rc<Row>>,
     ) -> Self {
-        let compiled_bootstrap_plan = CompiledBootstrapPlan::compile(&dataflow);
-        Self::with_compiled_initial_and_bootstrap(
+        Self::with_compiled_initial_only(
             dataflow,
             compiled_plan,
-            compiled_bootstrap_plan,
             initial,
         )
     }
 
-    pub fn with_compiled_initial_and_bootstrap(
+    fn with_compiled_initial_only(
         dataflow: DataflowNode,
         compiled_plan: CompiledIvmPlan,
-        _compiled_bootstrap_plan: CompiledBootstrapPlan,
         initial: Vec<Rc<Row>>,
     ) -> Self {
         let dependencies = compiled_plan.sources().to_vec();
@@ -3012,6 +3007,15 @@ impl MaterializedView {
             join_states: HashMap::new(),
             aggregate_states: HashMap::new(),
         }
+    }
+
+    pub fn with_compiled_initial_and_bootstrap(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        _compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<Rc<Row>>,
+    ) -> Self {
+        Self::with_compiled_initial_only(dataflow, compiled_plan, initial)
     }
 
     pub fn with_sources(
