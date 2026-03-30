@@ -28,6 +28,7 @@ struct GraphqlSharedJsCacheEntry<T> {
 #[derive(Default)]
 pub(crate) struct GraphqlJsEncodeCache {
     jsonb_cache: JsonbJsCache,
+    jsonb_cache_bytes: usize,
     field_key_cache: GraphqlFieldKeyCache,
     object_cache: GraphqlObjectJsCache,
     list_cache: GraphqlListJsCache,
@@ -41,10 +42,121 @@ pub(crate) struct GraphqlRootListJsCache {
 
 impl GraphqlJsEncodeCache {
     fn maybe_prune(&mut self) {
-        const MAX_SHARED_JS_CACHE_ENTRIES: usize = 65_536;
-        if self.object_cache.len() + self.list_cache.len() > MAX_SHARED_JS_CACHE_ENTRIES {
-            self.object_cache.clear();
-            self.list_cache.clear();
+        self.maybe_prune_shared_with_limits(65_536, 49_152);
+        self.maybe_prune_field_keys_with_limits(4_096, 3_072);
+        self.maybe_prune_jsonb_with_limits(8_192, 6_144, 4 * 1024 * 1024, 3 * 1024 * 1024);
+    }
+
+    fn maybe_prune_shared_with_limits(&mut self, max_entries: usize, target_entries: usize) {
+        if self.object_cache.len() + self.list_cache.len() <= max_entries {
+            return;
+        }
+
+        self.object_cache
+            .retain(|_, entry| entry.weak.upgrade().is_some());
+        self.list_cache
+            .retain(|_, entry| entry.weak.upgrade().is_some());
+
+        let target_entries = target_entries.min(max_entries);
+        while self.object_cache.len() + self.list_cache.len() > target_entries {
+            let total_len = self.object_cache.len() + self.list_cache.len();
+            let to_remove = total_len.saturating_sub(target_entries);
+            if self.object_cache.len() >= self.list_cache.len() {
+                self.evict_object_entries(to_remove);
+            } else {
+                self.evict_list_entries(to_remove);
+            }
+        }
+    }
+
+    fn maybe_prune_field_keys_with_limits(&mut self, max_entries: usize, target_entries: usize) {
+        if self.field_key_cache.len() <= max_entries {
+            return;
+        }
+
+        let target_entries = target_entries.min(max_entries);
+        let to_remove = self.field_key_cache.len().saturating_sub(target_entries);
+        if to_remove == 0 {
+            return;
+        }
+
+        let keys: Vec<_> = self
+            .field_key_cache
+            .keys()
+            .take(to_remove)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.field_key_cache.remove(key.as_ref());
+        }
+    }
+
+    fn maybe_prune_jsonb_with_limits(
+        &mut self,
+        max_entries: usize,
+        target_entries: usize,
+        max_bytes: usize,
+        target_bytes: usize,
+    ) {
+        if self.jsonb_cache.len() <= max_entries && self.jsonb_cache_bytes <= max_bytes {
+            return;
+        }
+
+        let target_entries = target_entries.min(max_entries);
+        let target_bytes = target_bytes.min(max_bytes);
+        let mut projected_len = self.jsonb_cache.len();
+        let mut projected_bytes = self.jsonb_cache_bytes;
+        let mut keys_to_remove = Vec::new();
+
+        for key in self.jsonb_cache.keys() {
+            if projected_len <= target_entries && projected_bytes <= target_bytes {
+                break;
+            }
+            projected_len = projected_len.saturating_sub(1);
+            projected_bytes = projected_bytes.saturating_sub(key.len());
+            keys_to_remove.push(key.clone());
+        }
+
+        for key in keys_to_remove {
+            if self.jsonb_cache.remove(key.as_slice()).is_some() {
+                self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_sub(key.len());
+            }
+        }
+    }
+
+    fn evict_object_entries(&mut self, count: usize) {
+        let keys: Vec<_> = self.object_cache.keys().take(count.max(1)).copied().collect();
+        for key in keys {
+            self.object_cache.remove(&key);
+        }
+    }
+
+    fn evict_list_entries(&mut self, count: usize) {
+        let keys: Vec<_> = self.list_cache.keys().take(count.max(1)).copied().collect();
+        for key in keys {
+            self.list_cache.remove(&key);
+        }
+    }
+
+    fn value_to_js(&mut self, value: &Value) -> JsValue {
+        match value {
+            Value::Jsonb(jsonb) => {
+                if let Some(cached) = self.jsonb_cache.get(jsonb.0.as_slice()) {
+                    return cached.clone();
+                }
+
+                let parsed = value_to_js(value);
+                self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_add(jsonb.0.len());
+                self.jsonb_cache.insert(jsonb.0.clone(), parsed.clone());
+                self.maybe_prune_jsonb_with_limits(
+                    8_192,
+                    6_144,
+                    4 * 1024 * 1024,
+                    3 * 1024 * 1024,
+                );
+                parsed
+            }
+            _ => value_to_js(value),
         }
     }
 }
@@ -653,7 +765,7 @@ fn gql_value_to_js_with_cache(
 ) -> JsValue {
     match value {
         cynos_gql::ResponseValue::Null => JsValue::NULL,
-        cynos_gql::ResponseValue::Scalar(value) => value_to_js_with_cache(value, &mut cache.jsonb_cache),
+        cynos_gql::ResponseValue::Scalar(value) => cache.value_to_js(value),
         cynos_gql::ResponseValue::List(values) => {
             let cache_key = Rc::as_ptr(values);
             if let Some(cached) = cache.list_cache.get(&cache_key) {
@@ -750,6 +862,7 @@ pub fn infer_type(js: &JsValue) -> Option<DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::rc::Rc;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -759,6 +872,65 @@ mod tests {
         let js = JsValue::from_bool(true);
         let result = js_to_value(&js, DataType::Boolean).unwrap();
         assert_eq!(result, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_graphql_js_encode_cache_prunes_jsonb_incrementally() {
+        let mut cache = GraphqlJsEncodeCache::default();
+        for seed in 0..5u8 {
+            let key = vec![seed; 3];
+            cache.jsonb_cache_bytes += key.len();
+            cache.jsonb_cache.insert(key, JsValue::NULL);
+        }
+
+        cache.maybe_prune_jsonb_with_limits(4, 3, 12, 9);
+
+        assert!(cache.jsonb_cache.len() <= 3);
+        assert!(cache.jsonb_cache_bytes <= 9);
+        assert!(!cache.jsonb_cache.is_empty());
+    }
+
+    #[test]
+    fn test_graphql_js_encode_cache_prunes_dead_shared_entries_without_full_clear() {
+        let mut cache = GraphqlJsEncodeCache::default();
+        let live_fields: Rc<[cynos_gql::ResponseField]> = Rc::from(
+            vec![cynos_gql::ResponseField {
+                name: Rc::<str>::from("live"),
+                value: cynos_gql::ResponseValue::Null,
+            }]
+            .into_boxed_slice(),
+        );
+        let live_key = Rc::as_ptr(&live_fields);
+        cache.object_cache.insert(
+            live_key,
+            GraphqlSharedJsCacheEntry {
+                weak: Rc::downgrade(&live_fields),
+                value: JsValue::NULL,
+            },
+        );
+
+        for _ in 0..4 {
+            let fields: Rc<[cynos_gql::ResponseField]> = Rc::from(
+                vec![cynos_gql::ResponseField {
+                    name: Rc::<str>::from("dead"),
+                    value: cynos_gql::ResponseValue::Null,
+                }]
+                .into_boxed_slice(),
+            );
+            cache.object_cache.insert(
+                Rc::as_ptr(&fields),
+                GraphqlSharedJsCacheEntry {
+                    weak: Rc::downgrade(&fields),
+                    value: JsValue::NULL,
+                },
+            );
+            drop(fields);
+        }
+
+        cache.maybe_prune_shared_with_limits(2, 1);
+
+        assert_eq!(cache.object_cache.len() + cache.list_cache.len(), 1);
+        assert!(cache.object_cache.contains_key(&live_key));
     }
 
     #[wasm_bindgen_test]
