@@ -294,6 +294,7 @@ pub(crate) struct GraphqlSnapshotAdapterPlan {
     pub catalog: GraphqlCatalog,
     pub field: BoundRootField,
     pub dependency_table_bindings: Vec<(TableId, String)>,
+    pub root_subset_refresh: Option<RowsSnapshotRootSubsetPlan>,
 }
 
 pub(crate) struct GraphqlDeltaAdapterPlan {
@@ -809,6 +810,7 @@ impl LivePlan {
         catalog: GraphqlCatalog,
         field: BoundRootField,
         dependency_table_bindings: Vec<(TableId, String)>,
+        root_subset_refresh: Option<RowsSnapshotRootSubsetPlan>,
     ) -> Self {
         Self {
             descriptor: LivePlanDescriptor {
@@ -825,6 +827,7 @@ impl LivePlan {
                 catalog,
                 field,
                 dependency_table_bindings,
+                root_subset_refresh,
             }),
         }
     }
@@ -1027,6 +1030,7 @@ impl LivePlan {
             adapter.catalog,
             adapter.field,
             adapter.dependency_table_bindings,
+            adapter.root_subset_refresh,
             root_table_ids,
             kernel.initial_rows,
             kernel.initial_summary,

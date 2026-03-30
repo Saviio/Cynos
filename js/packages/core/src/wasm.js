@@ -539,77 +539,6 @@ export class Database {
         wasm.__wbg_database_free(ptr, 0);
     }
     /**
-     * Benchmarks pure Rust insert performance without JS serialization overhead.
-     *
-     * This method generates and inserts `count` rows directly in Rust,
-     * measuring only the storage layer performance.
-     *
-     * Returns an object with:
-     * - `duration_ms`: Total time in milliseconds
-     * - `rows_per_sec`: Throughput in rows per second
-     * @param {string} table
-     * @param {number} count
-     * @returns {any}
-     */
-    benchmarkInsert(table, count) {
-        try {
-            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passStringToWasm0(table, wasm.__wbindgen_export, wasm.__wbindgen_export2);
-            const len0 = WASM_VECTOR_LEN;
-            wasm.database_benchmarkInsert(retptr, this.__wbg_ptr, ptr0, len0, count);
-            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
-            if (r2) {
-                throw takeObject(r1);
-            }
-            return takeObject(r0);
-        } finally {
-            wasm.__wbindgen_add_to_stack_pointer(16);
-        }
-    }
-    /**
-     * Benchmarks pure Rust range query performance without JS serialization overhead.
-     *
-     * This method executes a range query (column > threshold) directly in Rust,
-     * measuring only the query execution time without serialization to JS.
-     *
-     * Parameters:
-     * - `table`: Table name to query
-     * - `column`: Column name for the range condition
-     * - `threshold`: The threshold value (column > threshold)
-     *
-     * Returns an object with:
-     * - `query_ms`: Time for query execution only (no serialization)
-     * - `serialize_ms`: Time for serialization to JS
-     * - `total_ms`: Total time including serialization
-     * - `row_count`: Number of rows returned
-     * - `serialization_overhead_pct`: Percentage of time spent on serialization
-     * @param {string} table
-     * @param {string} column
-     * @param {number} threshold
-     * @returns {any}
-     */
-    benchmarkRangeQuery(table, column, threshold) {
-        try {
-            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passStringToWasm0(table, wasm.__wbindgen_export, wasm.__wbindgen_export2);
-            const len0 = WASM_VECTOR_LEN;
-            const ptr1 = passStringToWasm0(column, wasm.__wbindgen_export, wasm.__wbindgen_export2);
-            const len1 = WASM_VECTOR_LEN;
-            wasm.database_benchmarkRangeQuery(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, threshold);
-            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
-            if (r2) {
-                throw takeObject(r1);
-            }
-            return takeObject(r0);
-        } finally {
-            wasm.__wbindgen_add_to_stack_pointer(16);
-        }
-    }
-    /**
      * Clears all data from all tables.
      */
     clear() {
@@ -917,13 +846,6 @@ export class Database {
     /**
      * @returns {any}
      */
-    takeLastInsertProfile() {
-        const ret = wasm.database_takeLastInsertProfile(this.__wbg_ptr);
-        return takeObject(ret);
-    }
-    /**
-     * @returns {any}
-     */
     takeLastIvmBridgeProfile() {
         const ret = wasm.database_takeLastIvmBridgeProfile(this.__wbg_ptr);
         return takeObject(ret);
@@ -933,13 +855,6 @@ export class Database {
      */
     takeLastSnapshotFlushProfile() {
         const ret = wasm.database_takeLastSnapshotFlushProfile(this.__wbg_ptr);
-        return takeObject(ret);
-    }
-    /**
-     * @returns {any}
-     */
-    takeLastSnapshotInitProfile() {
-        const ret = wasm.database_takeLastSnapshotInitProfile(this.__wbg_ptr);
         return takeObject(ret);
     }
     /**
@@ -2911,7 +2826,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_8953(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_8993(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -3020,12 +2935,12 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [], shim_idx: 2, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_87, __wasm_bindgen_func_elem_1552);
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_88, __wasm_bindgen_func_elem_1547);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 296, function: Function { arguments: [Externref], shim_idx: 297, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_3609, __wasm_bindgen_func_elem_3616);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 299, function: Function { arguments: [Externref], shim_idx: 300, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_3637, __wasm_bindgen_func_elem_3644);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000003: function(arg0) {
@@ -3056,16 +2971,16 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1552(arg0, arg1) {
-    wasm.__wasm_bindgen_func_elem_1552(arg0, arg1);
+function __wasm_bindgen_func_elem_1547(arg0, arg1) {
+    wasm.__wasm_bindgen_func_elem_1547(arg0, arg1);
 }
 
-function __wasm_bindgen_func_elem_3616(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_3616(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_3644(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_3644(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_8953(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_8953(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_8993(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_8993(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const BinaryResultFinalization = (typeof FinalizationRegistry === 'undefined')

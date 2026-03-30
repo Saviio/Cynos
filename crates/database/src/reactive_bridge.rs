@@ -170,6 +170,11 @@ struct RootSubsetRefreshRuntime {
     visible_root_order: Vec<SnapshotRootKey>,
 }
 
+struct SnapshotRootRefreshOutcome {
+    changed: bool,
+    dirty_root_rows: HashSet<u64>,
+}
+
 impl RootSubsetRefreshRuntime {
     fn new(
         cache: &TableCache,
@@ -1239,6 +1244,9 @@ impl ReQueryObservable {
         let cache = cache_ref.borrow();
         let mut dirty_rows_by_table: HashMap<TableId, HashSet<u64>> = HashMap::new();
         for (table_id, row_ids) in changes {
+            if dependency_graph.table_name(*table_id).is_none() {
+                continue;
+            }
             dirty_rows_by_table
                 .entry(*table_id)
                 .or_insert_with(HashSet::new)
@@ -1260,7 +1268,9 @@ impl ReQueryObservable {
             dirty_row_ids.clear();
             dirty_row_ids.extend(dirty_row_set.iter().copied());
 
-            let table_name = dependency_graph.table_name(table_id)?;
+            let Some(table_name) = dependency_graph.table_name(table_id) else {
+                continue;
+            };
             let store = cache.get_table(table_name)?;
             if table_id != dependency_graph.root_table_id
                 && store.count_existing_rows_by_ids(&dirty_row_ids) != dirty_row_ids.len()
@@ -1316,6 +1326,7 @@ pub struct GraphqlSubscriptionObservable {
     root_table_ids: HashSet<TableId>,
     root_rows: Vec<Rc<Row>>,
     root_summary: QueryResultSummary,
+    root_subset_refresh: Option<RootSubsetRefreshRuntime>,
     response: Option<cynos_gql::GraphqlResponse>,
     response_js: Option<JsValue>,
     response_encode_cache: GraphqlJsEncodeCache,
@@ -1325,16 +1336,22 @@ pub struct GraphqlSubscriptionObservable {
 }
 
 impl GraphqlSubscriptionObservable {
-    pub fn new(
+    pub(crate) fn new(
         compiled_plan: CompiledPhysicalPlan,
         cache: Rc<RefCell<TableCache>>,
         catalog: cynos_gql::GraphqlCatalog,
         field: cynos_gql::bind::BoundRootField,
         dependency_table_bindings: Vec<(TableId, String)>,
+        root_subset_refresh: Option<RowsSnapshotRootSubsetPlan>,
         root_table_ids: HashSet<TableId>,
         initial_rows: Vec<Rc<Row>>,
         initial_summary: QueryResultSummary,
     ) -> Self {
+        let root_subset_refresh = {
+            let cache_ref = cache.borrow();
+            root_subset_refresh
+                .and_then(|plan| RootSubsetRefreshRuntime::new(&cache_ref, plan, &initial_rows))
+        };
         Self {
             compiled_plan,
             cache,
@@ -1348,6 +1365,7 @@ impl GraphqlSubscriptionObservable {
             root_table_ids,
             root_rows: initial_rows,
             root_summary: initial_summary,
+            root_subset_refresh,
             response: None,
             response_js: None,
             response_encode_cache: GraphqlJsEncodeCache::default(),
@@ -1464,14 +1482,18 @@ impl GraphqlSubscriptionObservable {
             }
         }
 
+        let should_refresh_roots = !root_changed_ids.is_empty() || self.root_subset_refresh.is_some();
         let mut root_changed = false;
-        if !root_changed_ids.is_empty() {
+        let mut dirty_root_rows = HashSet::new();
+        if should_refresh_roots {
             #[cfg(feature = "benchmark")]
             let refresh_started_at = now_ms();
-            root_changed = match self.refresh_root_rows(&root_changed_ids) {
-                Some(changed) => changed,
+            let refresh_outcome = match self.refresh_root_rows(changes, &root_changed_ids) {
+                Some(outcome) => outcome,
                 None => return,
             };
+            root_changed = refresh_outcome.changed;
+            dirty_root_rows = refresh_outcome.dirty_root_rows;
             #[cfg(feature = "benchmark")]
             if let Some(profile) = profile.as_deref_mut() {
                 profile.root_refresh_ms += now_ms() - refresh_started_at;
@@ -1489,7 +1511,7 @@ impl GraphqlSubscriptionObservable {
                 &self.dependency_table_names,
                 changes,
                 root_changed,
-                &root_changed_ids,
+                &dirty_root_rows,
             ) {
                 Ok(invalidation) => self.batch_state.apply_invalidation(plan, &invalidation),
                 Err(()) => {
@@ -1539,21 +1561,41 @@ impl GraphqlSubscriptionObservable {
         }
     }
 
-    fn refresh_root_rows(&mut self, changed_ids: &HashSet<u64>) -> Option<bool> {
-        if let Some(changed_rows) =
-            collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
-        {
-            match self
-                .compiled_plan
-                .apply_reactive_patch(&mut self.root_rows, &changed_rows)
+    fn refresh_root_rows(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        changed_ids: &HashSet<u64>,
+    ) -> Option<SnapshotRootRefreshOutcome> {
+        let only_root_table_changes = !changes.is_empty()
+            && changes.keys().all(|table_id| self.root_table_ids.contains(table_id));
+        if !changed_ids.is_empty() && only_root_table_changes {
+            if let Some(changed_rows) =
+                collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
             {
-                Some(true) => {
-                    self.root_summary = QueryResultSummary::from_rows(&self.root_rows);
-                    return Some(true);
+                match self
+                    .compiled_plan
+                    .apply_reactive_patch(&mut self.root_rows, &changed_rows)
+                {
+                    Some(true) => {
+                        self.root_summary = QueryResultSummary::from_rows(&self.root_rows);
+                        return Some(SnapshotRootRefreshOutcome {
+                            changed: true,
+                            dirty_root_rows: changed_ids.clone(),
+                        });
+                    }
+                    Some(false) => {
+                        return Some(SnapshotRootRefreshOutcome {
+                            changed: false,
+                            dirty_root_rows: HashSet::new(),
+                        });
+                    }
+                    None => {}
                 }
-                Some(false) => return Some(false),
-                None => {}
             }
+        }
+
+        if let Some(outcome) = self.try_root_subset_refresh(changes) {
+            return Some(outcome);
         }
 
         let cache = self.cache.borrow();
@@ -1565,12 +1607,87 @@ impl GraphqlSubscriptionObservable {
             &self.root_rows,
             &output.rows,
         ) {
-            return Some(false);
+            return Some(SnapshotRootRefreshOutcome {
+                changed: false,
+                dirty_root_rows: HashSet::new(),
+            });
         }
 
         self.root_rows = output.rows;
         self.root_summary = output.summary;
-        Some(true)
+        Some(SnapshotRootRefreshOutcome {
+            changed: true,
+            dirty_root_rows: changed_ids.clone(),
+        })
+    }
+
+    fn try_root_subset_refresh(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+    ) -> Option<SnapshotRootRefreshOutcome> {
+        let (affected_root_ids, affected_root_keys) = {
+            let root_subset_refresh = self.root_subset_refresh.as_mut()?;
+            let affected_root_ids = ReQueryObservable::collect_affected_root_row_ids(
+                &self.cache,
+                changes,
+                &root_subset_refresh.metadata.dependency_graph,
+            )?;
+            if affected_root_ids.is_empty() {
+                return Some(SnapshotRootRefreshOutcome {
+                    changed: false,
+                    dirty_root_rows: HashSet::new(),
+                });
+            }
+
+            let cache = self.cache.borrow();
+            let refresh_existing_root_keys =
+                changes.contains_key(&root_subset_refresh.metadata.dependency_graph.root_table_id);
+            let affected_root_keys = root_subset_refresh.collect_affected_root_keys(
+                &cache,
+                &affected_root_ids,
+                refresh_existing_root_keys,
+            )?;
+            (affected_root_ids, affected_root_keys)
+        };
+
+        if affected_root_keys.is_empty() {
+            return Some(SnapshotRootRefreshOutcome {
+                changed: false,
+                dirty_root_rows: HashSet::new(),
+            });
+        }
+
+        let root_table = self
+            .root_subset_refresh
+            .as_ref()
+            .map(|runtime| runtime.metadata.root_table.clone())?;
+        let rows = {
+            let cache = self.cache.borrow();
+            let subset_plan = self
+                .root_subset_refresh
+                .as_ref()
+                .map(|runtime| runtime.select_compiled_plan(&cache, &affected_root_ids))?;
+            execute_compiled_physical_plan_on_table_subset(
+                &cache,
+                subset_plan,
+                &root_table,
+                &affected_root_ids,
+            )
+            .ok()?
+        };
+
+        let rows = {
+            let root_subset_refresh = self.root_subset_refresh.as_mut()?;
+            root_subset_refresh.apply_subset_rows(&affected_root_keys, rows)?
+        };
+        let summary = QueryResultSummary::from_rows(&rows);
+        let changed = !query_results_equal(&self.root_summary, &summary, &self.root_rows, &rows);
+        self.root_rows = rows;
+        self.root_summary = summary;
+        Some(SnapshotRootRefreshOutcome {
+            changed,
+            dirty_root_rows: affected_root_ids,
+        })
     }
 
     fn materialize_response_if_dirty(&mut self) -> Option<bool> {

@@ -8,6 +8,8 @@ use crate::convert::{gql_response_to_js, js_to_gql_variables};
 use crate::dataflow_compiler::compile_to_dataflow;
 use crate::live_runtime::{
     collect_trace_bootstrap_source_bindings, LiveDependencySet, LivePlan, LiveRegistry,
+    RowsSnapshotDependencyGraph, RowsSnapshotDirectedJoinEdge, RowsSnapshotLookupPrimitive,
+    RowsSnapshotRootSubsetMetadata, RowsSnapshotRootSubsetPlan, RowsSnapshotRootSubsetVariants,
 };
 #[cfg(feature = "benchmark")]
 use crate::profiling::SnapshotInitProfile;
@@ -22,9 +24,12 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use cynos_core::schema::{IndexType, Table};
 use cynos_core::Row;
+use cynos_gql::bind::{BoundFilter, BoundRootField, BoundRootFieldKind};
 use cynos_gql::{PreparedQuery as GqlPreparedQuery, SchemaCache as GraphqlSchemaCache};
 use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, Delta};
+use cynos_query::planner::PhysicalPlan;
 use cynos_query::plan_cache::PlanCache;
 use cynos_reactive::TableId;
 #[cfg(feature = "benchmark")]
@@ -1554,8 +1559,15 @@ fn compile_graphql_live_plan(
     let compiled_plan = crate::query_engine::compile_cached_plan(
         &cache_borrow,
         &root_plan.table_name,
-        root_plan.logical_plan,
+        root_plan.logical_plan.clone(),
     );
+    let root_subset_refresh = build_graphql_root_subset_plan(
+        &cache_borrow,
+        &table_id_map.borrow(),
+        &field,
+        &root_plan,
+        &compiled_plan,
+    )?;
     let initial_output = crate::query_engine::execute_compiled_physical_plan_with_summary(
         &cache_borrow,
         &compiled_plan,
@@ -1570,6 +1582,7 @@ fn compile_graphql_live_plan(
         catalog,
         field,
         dependency_table_bindings,
+        root_subset_refresh,
     ))
 }
 
@@ -1618,6 +1631,334 @@ fn build_graphql_dependency_set(
         dependency_table_ids,
         root_table_ids,
     ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GraphqlSnapshotJoinEdge {
+    left_table: String,
+    left_column: String,
+    right_table: String,
+    right_column: String,
+}
+
+fn graphql_snapshot_compiled_lookup_primitive(
+    schema: &Table,
+    column_name: &str,
+) -> RowsSnapshotLookupPrimitive {
+    if let Some(primary_key) = schema.primary_key() {
+        if primary_key.columns().len() == 1
+            && primary_key
+                .columns()
+                .first()
+                .map(|column| column.name.as_str())
+                == Some(column_name)
+        {
+            return RowsSnapshotLookupPrimitive::PrimaryKey;
+        }
+    }
+
+    if let Some(index_name) = schema
+        .indices()
+        .iter()
+        .find(|index| {
+            index.get_index_type() != IndexType::Gin
+                && index.columns().len() == 1
+                && index.columns().first().map(|column| column.name.as_str()) == Some(column_name)
+        })
+        .map(|index| index.name().to_string())
+    {
+        return RowsSnapshotLookupPrimitive::SingleColumnIndex { index_name };
+    }
+
+    RowsSnapshotLookupPrimitive::ScanFallback
+}
+
+fn graphql_snapshot_plan_allows_root_subset_refresh(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::TableScan { .. }
+        | PhysicalPlan::IndexScan { .. }
+        | PhysicalPlan::IndexGet { .. }
+        | PhysicalPlan::IndexInGet { .. }
+        | PhysicalPlan::GinIndexScan { .. }
+        | PhysicalPlan::GinIndexScanMulti { .. }
+        | PhysicalPlan::Empty => true,
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::NoOp { input } => graphql_snapshot_plan_allows_root_subset_refresh(input),
+        PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::SortMergeJoin { left, right, .. }
+        | PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+            graphql_snapshot_plan_allows_root_subset_refresh(left)
+                && graphql_snapshot_plan_allows_root_subset_refresh(right)
+        }
+        PhysicalPlan::IndexNestedLoopJoin { outer, .. } => {
+            graphql_snapshot_plan_allows_root_subset_refresh(outer)
+        }
+        PhysicalPlan::HashAggregate { .. }
+        | PhysicalPlan::Sort { .. }
+        | PhysicalPlan::TopN { .. }
+        | PhysicalPlan::Limit { .. }
+        | PhysicalPlan::CrossProduct { .. }
+        | PhysicalPlan::Union { .. } => false,
+    }
+}
+
+fn graphql_snapshot_plan_supports_root_subset_refresh(
+    plan: &PhysicalPlan,
+    root_table: &str,
+) -> bool {
+    plan.collect_tables().iter().any(|table| table == root_table)
+        && graphql_snapshot_plan_allows_root_subset_refresh(plan)
+}
+
+fn collect_graphql_filter_join_edges(
+    filter: &BoundFilter,
+    edges: &mut hashbrown::HashSet<GraphqlSnapshotJoinEdge>,
+) {
+    match filter {
+        BoundFilter::And(filters) | BoundFilter::Or(filters) => {
+            for child in filters {
+                collect_graphql_filter_join_edges(child, edges);
+            }
+        }
+        BoundFilter::Column(_) => {}
+        BoundFilter::Relation(predicate) => {
+            edges.insert(GraphqlSnapshotJoinEdge {
+                left_table: predicate.relation.child_table.clone(),
+                left_column: predicate.relation.child_column.clone(),
+                right_table: predicate.relation.parent_table.clone(),
+                right_column: predicate.relation.parent_column.clone(),
+            });
+            collect_graphql_filter_join_edges(predicate.filter.as_ref(), edges);
+        }
+    }
+}
+
+fn compile_graphql_snapshot_dependency_graph(
+    cache: &TableCache,
+    table_id_map: &hashbrown::HashMap<String, TableId>,
+    root_table: &str,
+    join_edges: &[GraphqlSnapshotJoinEdge],
+) -> Result<RowsSnapshotDependencyGraph, JsValue> {
+    let root_table_id = table_id_map
+        .get(root_table)
+        .copied()
+        .ok_or_else(|| JsValue::from_str(&alloc::format!("Table ID not found: {}", root_table)))?;
+    let mut table_names = hashbrown::HashMap::new();
+    table_names.insert(root_table_id, root_table.to_string());
+
+    let mut undirected_edges_by_source =
+        hashbrown::HashMap::<TableId, Vec<RowsSnapshotDirectedJoinEdge>>::new();
+    for edge in join_edges {
+        let left_table_id = table_id_map.get(&edge.left_table).copied().ok_or_else(|| {
+            JsValue::from_str(&alloc::format!("Table ID not found: {}", edge.left_table))
+        })?;
+        let right_table_id = table_id_map
+            .get(&edge.right_table)
+            .copied()
+            .ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Table ID not found: {}", edge.right_table))
+            })?;
+
+        let left_store = cache.get_table(&edge.left_table).ok_or_else(|| {
+            JsValue::from_str(&alloc::format!("Table not found: {}", edge.left_table))
+        })?;
+        let right_store = cache.get_table(&edge.right_table).ok_or_else(|| {
+            JsValue::from_str(&alloc::format!("Table not found: {}", edge.right_table))
+        })?;
+
+        let left_column_index = left_store
+            .schema()
+            .get_column_index(&edge.left_column)
+            .ok_or_else(|| {
+                JsValue::from_str(&alloc::format!(
+                    "Column not found: {}.{}",
+                    edge.left_table,
+                    edge.left_column
+                ))
+            })?;
+        let right_column_index = right_store
+            .schema()
+            .get_column_index(&edge.right_column)
+            .ok_or_else(|| {
+                JsValue::from_str(&alloc::format!(
+                    "Column not found: {}.{}",
+                    edge.right_table,
+                    edge.right_column
+                ))
+            })?;
+
+        table_names.insert(left_table_id, edge.left_table.clone());
+        table_names.insert(right_table_id, edge.right_table.clone());
+
+        undirected_edges_by_source
+            .entry(left_table_id)
+            .or_insert_with(Vec::new)
+            .push(RowsSnapshotDirectedJoinEdge {
+                source_column_index: left_column_index,
+                target_table_id: right_table_id,
+                target_table: edge.right_table.clone(),
+                target_column_index: right_column_index,
+                lookup: graphql_snapshot_compiled_lookup_primitive(
+                    right_store.schema(),
+                    &edge.right_column,
+                ),
+            });
+        undirected_edges_by_source
+            .entry(right_table_id)
+            .or_insert_with(Vec::new)
+            .push(RowsSnapshotDirectedJoinEdge {
+                source_column_index: right_column_index,
+                target_table_id: left_table_id,
+                target_table: edge.left_table.clone(),
+                target_column_index: left_column_index,
+                lookup: graphql_snapshot_compiled_lookup_primitive(
+                    left_store.schema(),
+                    &edge.left_column,
+                ),
+            });
+    }
+
+    let mut distance_to_root = hashbrown::HashMap::<TableId, usize>::new();
+    let mut queue = alloc::collections::VecDeque::new();
+    distance_to_root.insert(root_table_id, 0);
+    queue.push_back(root_table_id);
+
+    while let Some(table_id) = queue.pop_front() {
+        let next_distance = distance_to_root.get(&table_id).copied().unwrap_or(0) + 1;
+        for edge in undirected_edges_by_source
+            .get(&table_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            if distance_to_root.contains_key(&edge.target_table_id) {
+                continue;
+            }
+            distance_to_root.insert(edge.target_table_id, next_distance);
+            queue.push_back(edge.target_table_id);
+        }
+    }
+
+    if distance_to_root.len() != table_names.len() {
+        return Err(JsValue::from_str(
+            "graphql snapshot dependency graph is disconnected from the root table",
+        ));
+    }
+
+    let mut edges_by_source =
+        hashbrown::HashMap::<TableId, Vec<RowsSnapshotDirectedJoinEdge>>::new();
+    for (source_table_id, candidate_edges) in undirected_edges_by_source {
+        let Some(source_distance) = distance_to_root.get(&source_table_id).copied() else {
+            continue;
+        };
+        let directed_edges: Vec<_> = candidate_edges
+            .into_iter()
+            .filter(|edge| {
+                distance_to_root
+                    .get(&edge.target_table_id)
+                    .map(|target_distance| *target_distance < source_distance)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !directed_edges.is_empty() {
+            edges_by_source.insert(source_table_id, directed_edges);
+        }
+    }
+
+    Ok(RowsSnapshotDependencyGraph {
+        root_table_id,
+        table_names,
+        edges_by_source,
+    })
+}
+
+fn build_graphql_root_subset_plan(
+    cache: &TableCache,
+    table_id_map: &hashbrown::HashMap<String, TableId>,
+    field: &BoundRootField,
+    root_plan: &cynos_gql::RootFieldPlan,
+    compiled_plan: &crate::query_engine::CompiledPhysicalPlan,
+) -> Result<Option<RowsSnapshotRootSubsetPlan>, JsValue> {
+    let (root_table, query) = match &field.kind {
+        BoundRootFieldKind::Collection {
+            table_name, query, ..
+        } => (table_name.clone(), query),
+        _ => return Ok(None),
+    };
+
+    if !query.order_by.is_empty() || query.limit.is_some() || query.offset > 0 {
+        return Ok(None);
+    }
+
+    if !graphql_snapshot_plan_supports_root_subset_refresh(
+        compiled_plan.physical_plan(),
+        &root_table,
+    ) {
+        return Ok(None);
+    }
+
+    let root_store = cache
+        .get_table(&root_table)
+        .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", root_table)))?;
+    let root_pk = match root_store.schema().primary_key() {
+        Some(pk) if !pk.columns().is_empty() => pk,
+        _ => return Ok(None),
+    };
+
+    let mut root_pk_store_indices = Vec::with_capacity(root_pk.columns().len());
+    for pk_column in root_pk.columns() {
+        let Some(store_index) = root_store.schema().get_column_index(&pk_column.name) else {
+            return Ok(None);
+        };
+        root_pk_store_indices.push(store_index);
+    }
+    let root_pk_output_indices = root_pk_store_indices.clone();
+
+    let mut edge_set = hashbrown::HashSet::new();
+    if let Some(filter) = &query.filter {
+        collect_graphql_filter_join_edges(filter, &mut edge_set);
+    }
+    let mut join_edges: Vec<_> = edge_set.into_iter().collect();
+    join_edges.sort_unstable_by(|left, right| {
+        left.left_table
+            .cmp(&right.left_table)
+            .then_with(|| left.left_column.cmp(&right.left_column))
+            .then_with(|| left.right_table.cmp(&right.right_table))
+            .then_with(|| left.right_column.cmp(&right.right_column))
+    });
+
+    let dependency_graph =
+        compile_graphql_snapshot_dependency_graph(cache, table_id_map, &root_table, &join_edges)?;
+
+    let subset_compiled_plan_small = crate::query_engine::compile_cached_plan_with_profile(
+        cache,
+        &root_table,
+        root_plan.logical_plan.clone(),
+        crate::query_engine::CompilePlanProfile::RootSubset(
+            crate::query_engine::RootSubsetPlanningProfile::small(),
+        ),
+    );
+    let subset_compiled_plan_large = crate::query_engine::compile_cached_plan_with_profile(
+        cache,
+        &root_table,
+        root_plan.logical_plan.clone(),
+        crate::query_engine::CompilePlanProfile::RootSubset(
+            crate::query_engine::RootSubsetPlanningProfile::large(),
+        ),
+    );
+
+    Ok(Some(RowsSnapshotRootSubsetPlan {
+        metadata: RowsSnapshotRootSubsetMetadata {
+            root_table,
+            root_pk_store_indices,
+            root_pk_output_indices,
+            dependency_graph,
+        },
+        compiled_plans: RowsSnapshotRootSubsetVariants {
+            small: subset_compiled_plan_small,
+            large: subset_compiled_plan_large,
+        },
+    }))
 }
 
 fn build_graphql_delta_live_plan(
@@ -2841,6 +3182,86 @@ mod tests {
 
         let query = "subscription IssueFeed { issues(where: { AND: [{ status: { eq: \"open\" } }, { project: { AND: [{ healthScore: { gte: 45 } }, { counter: { openIssueCount: { gte: 5 } } }, { snapshot: { velocity: { gte: 18 } } }] } }] }) { id title project { id counter(limit: 1) { openIssueCount } snapshot(limit: 1) { velocity } } } }";
         assert_eq!(compile_subscription_engine(&db, query), LiveEngineKind::Delta);
+
+        let subscription = db.subscribe_graphql(query, None, None).unwrap();
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(initial_issues.length(), 0);
+
+        db.graphql(
+            "mutation { updateProjects(where: { id: { eq: 1 } }, set: { healthScore: 50 }) { id } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let inserted = subscription.get_result();
+        let inserted_data = js_sys::Reflect::get(&inserted, &JsValue::from_str("data")).unwrap();
+        let inserted_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&inserted_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(collect_ids(&inserted_issues, "id"), vec![100]);
+
+        db.graphql(
+            "mutation { updateProjectSnapshots(where: { projectId: { eq: 1 } }, set: { velocity: 5 }) { projectId } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let removed = subscription.get_result();
+        let removed_data = js_sys::Reflect::get(&removed, &JsValue::from_str("data")).unwrap();
+        let removed_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&removed_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(removed_issues.length(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_snapshot_subscription_tracks_relation_filtered_root_membership() {
+        let db = setup_graphql_issue_filter_db();
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projects")
+            .unwrap()
+            .insert(Row::new(1, alloc::vec![Value::Int64(1), Value::Int32(30)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projectCounters")
+            .unwrap()
+            .insert(Row::new(10, alloc::vec![Value::Int64(1), Value::Int32(6)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projectSnapshots")
+            .unwrap()
+            .insert(Row::new(11, alloc::vec![Value::Int64(1), Value::Int32(20)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("issues")
+            .unwrap()
+            .insert(Row::new(
+                100,
+                alloc::vec![
+                    Value::Int64(100),
+                    Value::Int64(1),
+                    Value::String("Issue".into()),
+                    Value::String("open".into()),
+                ],
+            ))
+            .unwrap();
+
+        let query = "subscription IssueFeedSnapshot { issues(where: { AND: [{ status: { eq: \"open\" } }, { project: { AND: [{ healthScore: { gte: 45 } }, { counter: { openIssueCount: { gte: 5 } } }, { snapshot: { velocity: { gte: 18 } } }] } }] }) { id title project { id counter(orderBy: [{ field: OPENISSUECOUNT, direction: DESC }], limit: 1) { openIssueCount } snapshot(limit: 1) { velocity } } } }";
+        assert_eq!(compile_subscription_engine(&db, query), LiveEngineKind::Snapshot);
 
         let subscription = db.subscribe_graphql(query, None, None).unwrap();
 

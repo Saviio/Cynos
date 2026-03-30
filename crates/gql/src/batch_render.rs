@@ -114,7 +114,9 @@ impl GraphqlBatchState {
             }
             if invalidation.dirty_root_rows.is_empty() {
                 self.collect_node_rows(plan.root_node(), &mut pending);
-            } else {
+            } else if invalidation.dirty_table_rows.is_empty()
+                && invalidation.dirty_edge_keys.is_empty()
+            {
                 for row_id in &invalidation.dirty_root_rows {
                     self.collect_row_id_entries(plan.root_node(), *row_id, &mut pending);
                 }
@@ -411,7 +413,7 @@ fn render_root_field<R: RowRenderRef>(
                 let row = row.row_rc();
                 if !row_is_cached(state, plan.root_node(), row) {
                     let singleton = [row];
-                    prefetch_node_edges(
+                    prefetch_node_edges_with_children(
                         cache,
                         catalog,
                         plan,
@@ -519,7 +521,14 @@ fn try_render_root_node_list_cached<R: RowRenderRef>(
                         }
                         if !row_is_cached(state, node_id, row) {
                             let singleton = [row];
-                            prefetch_node_edges(cache, catalog, plan, state, node_id, &singleton)?;
+                            prefetch_node_edges_with_children(
+                                cache,
+                                catalog,
+                                plan,
+                                state,
+                                node_id,
+                                &singleton,
+                            )?;
                         }
                         let rendered =
                             render_node_object(cache, catalog, plan, state, node_id, row)?;
@@ -641,7 +650,7 @@ fn try_render_root_node_list_splice<R: RowRenderRef>(
         .filter(|row| !row_is_cached(state, node_id, row))
         .collect::<Vec<_>>();
     if !uncached_rows.is_empty() {
-        prefetch_node_edges(cache, catalog, plan, state, node_id, &uncached_rows)?;
+        prefetch_node_edges_with_children(cache, catalog, plan, state, node_id, &uncached_rows)?;
     }
 
     let positions_needing_render = positions_needing_render
@@ -703,7 +712,7 @@ fn render_node_list<R: RowRenderRef>(
         .filter(|row| !row_is_cached(state, node_id, row))
         .collect::<Vec<_>>();
     if !uncached_rows.is_empty() {
-        prefetch_node_edges(cache, catalog, plan, state, node_id, &uncached_rows)?;
+        prefetch_node_edges_with_children(cache, catalog, plan, state, node_id, &uncached_rows)?;
     }
 
     let mut values = Vec::with_capacity(rows.len());
@@ -792,7 +801,7 @@ fn render_forward_relation(
         Some(child_row) => {
             if !row_is_cached(state, edge.child_node, &child_row) {
                 let singleton = [&child_row];
-                prefetch_node_edges(
+                prefetch_node_edges_with_children(
                     cache,
                     catalog,
                     plan,
@@ -888,6 +897,63 @@ fn prefetch_node_edges(
             let rows = fetched.get(key).cloned().unwrap_or_default();
             edge_cache.insert(key.clone(), rows);
         }
+    }
+
+    Ok(())
+}
+
+fn prefetch_node_edges_with_children(
+    cache: &TableCache,
+    catalog: &GraphqlCatalog,
+    plan: &GraphqlBatchPlan,
+    state: &mut GraphqlBatchState,
+    node_id: NodeId,
+    rows: &[&Rc<Row>],
+) -> GqlResult<()> {
+    prefetch_node_edges(cache, catalog, plan, state, node_id, rows)?;
+
+    let mut child_rows_by_node = HashMap::<NodeId, Vec<Rc<Row>>>::new();
+    let mut seen_child_rows = HashSet::<RowCacheKey>::new();
+
+    for field in &plan.node(node_id).fields {
+        let edge_id = match field.kind {
+            RenderFieldKind::ForwardRelation { edge_id }
+            | RenderFieldKind::ReverseRelation { edge_id } => edge_id,
+            RenderFieldKind::Typename { .. } | RenderFieldKind::Column { .. } => continue,
+        };
+
+        let edge = plan.edge(edge_id);
+        let keys = collect_edge_keys(edge, rows);
+        if keys.is_empty() {
+            continue;
+        }
+
+        let Some(edge_cache) = state.edge_bucket_cache.get(&edge_id) else {
+            continue;
+        };
+        for key in keys {
+            let Some(child_rows) = edge_cache.get(&key) else {
+                continue;
+            };
+            for child_row in child_rows {
+                if row_is_cached(state, edge.child_node, child_row) {
+                    continue;
+                }
+                let child_row_key = RowCacheKey::new(edge.child_node, child_row);
+                if !seen_child_rows.insert(child_row_key) {
+                    continue;
+                }
+                child_rows_by_node
+                    .entry(edge.child_node)
+                    .or_insert_with(Vec::new)
+                    .push(child_row.clone());
+            }
+        }
+    }
+
+    for (child_node, child_rows) in child_rows_by_node {
+        let child_row_refs = child_rows.iter().collect::<Vec<_>>();
+        prefetch_node_edges(cache, catalog, plan, state, child_node, &child_row_refs)?;
     }
 
     Ok(())
