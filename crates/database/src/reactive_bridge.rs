@@ -599,28 +599,6 @@ fn build_graphql_response_batched(
     cynos_gql::batch_render::render_graphql_response(cache, catalog, field, plan, state, rows)
 }
 
-fn build_graphql_response_from_owned_rows(
-    cache: &TableCache,
-    catalog: &cynos_gql::GraphqlCatalog,
-    field: &cynos_gql::bind::BoundRootField,
-    rows: &[Row],
-) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
-    let rows: Vec<Rc<Row>> = rows.iter().cloned().map(Rc::new).collect();
-    build_graphql_response(cache, catalog, field, &rows)
-}
-
-fn build_graphql_response_from_owned_rows_batched(
-    cache: &TableCache,
-    catalog: &cynos_gql::GraphqlCatalog,
-    field: &cynos_gql::bind::BoundRootField,
-    plan: &cynos_gql::GraphqlBatchPlan,
-    state: &mut cynos_gql::GraphqlBatchState,
-    rows: &[Row],
-) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
-    let rows: Vec<Rc<Row>> = rows.iter().cloned().map(Rc::new).collect();
-    build_graphql_response_batched(cache, catalog, field, plan, state, &rows)
-}
-
 fn root_field_has_relations(field: &cynos_gql::bind::BoundRootField) -> bool {
     match &field.kind {
         cynos_gql::bind::BoundRootFieldKind::Typename => false,
@@ -1741,10 +1719,10 @@ impl GraphqlDeltaObservable {
             return Some(false);
         }
 
-        let rows = self.view.result();
+        let rows = self.view.result_rc();
         let cache = self.cache.borrow();
         let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_from_owned_rows_batched(
+            Some(plan) => build_graphql_response_batched(
                 &cache,
                 &self.catalog,
                 &self.field,
@@ -1753,10 +1731,7 @@ impl GraphqlDeltaObservable {
                 &rows,
             )
             .ok()?,
-            None => {
-                build_graphql_response_from_owned_rows(&cache, &self.catalog, &self.field, &rows)
-                    .ok()?
-            }
+            None => build_graphql_response(&cache, &self.catalog, &self.field, &rows).ok()?,
         };
         let changed = self
             .response
@@ -1776,10 +1751,10 @@ impl GraphqlDeltaObservable {
     }
 
     fn render_response_js_value(&mut self) -> JsValue {
-        let rows = self.view.result();
+        let rows = self.view.result_rc();
         let cache = self.cache.borrow();
         let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_from_owned_rows_batched(
+            Some(plan) => build_graphql_response_batched(
                 &cache,
                 &self.catalog,
                 &self.field,
@@ -1787,9 +1762,7 @@ impl GraphqlDeltaObservable {
                 &mut self.batch_state,
                 &rows,
             ),
-            None => {
-                build_graphql_response_from_owned_rows(&cache, &self.catalog, &self.field, &rows)
-            }
+            None => build_graphql_response(&cache, &self.catalog, &self.field, &rows),
         };
         match response {
             Ok(response) => graphql_response_to_js_value(&response),

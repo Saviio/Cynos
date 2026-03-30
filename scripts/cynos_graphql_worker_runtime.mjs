@@ -574,7 +574,14 @@ function flushPendingSnapshot(active, rows) {
   active.pending = null
 }
 
+function cancelScheduledReattach(active) {
+  if (active.reattachHandle == null) return
+  clearTimeout(active.reattachHandle)
+  active.reattachHandle = null
+}
+
 function detachSubscription(active) {
+  cancelScheduledReattach(active)
   active.unsubscribe?.()
   active.subscription?.free?.()
   active.unsubscribe = null
@@ -600,6 +607,15 @@ function attachSubscription(active, variables = scenarioVariables(active.scenari
   })
 }
 
+function scheduleAttachSubscription(active, variables) {
+  cancelScheduledReattach(active)
+  active.reattachHandle = setTimeout(() => {
+    active.reattachHandle = null
+    if (runtime.active !== active) return
+    attachSubscription(active, variables)
+  }, 0)
+}
+
 function refreshIssueScenarioSnapshot(active) {
   active.subscriptionMuted = true
   const variables = scenarioVariables(active.scenarioId)
@@ -607,7 +623,7 @@ function refreshIssueScenarioSnapshot(active) {
   const rows = syncActiveRows(active, payload)
   flushPendingSnapshot(active, rows)
   active.subscriptionMuted = false
-  attachSubscription(active, variables)
+  scheduleAttachSubscription(active, variables)
 }
 
 async function initRuntime() {
@@ -697,6 +713,7 @@ function subscribeScenario(message) {
     variables: null,
     subscriptionGeneration: 0,
     subscriptionMuted: false,
+    reattachHandle: null,
   }
 
   runtime.active = active
