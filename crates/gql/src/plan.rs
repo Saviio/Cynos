@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -18,13 +19,102 @@ use crate::bind::{
     BoundCollectionQuery, BoundFilter, BoundRootField, BoundRootFieldKind, JsonPredicate,
     PredicateOp,
 };
-use crate::catalog::{GraphqlCatalog, TableMeta};
+use crate::catalog::{GraphqlCatalog, RelationMeta, TableMeta};
 use crate::error::{GqlError, GqlErrorKind, GqlResult};
 
 #[derive(Clone, Debug)]
 pub struct RootFieldPlan {
     pub table_name: String,
     pub logical_plan: LogicalPlan,
+}
+
+struct RelationLoweringState<'a> {
+    root_table_name: &'a str,
+    plan: LogicalPlan,
+    joins_by_path: BTreeMap<Vec<String>, String>,
+    paths_by_table: BTreeMap<String, Vec<String>>,
+}
+
+impl<'a> RelationLoweringState<'a> {
+    fn new(root_table_name: &'a str, root_table: &'a TableMeta, _catalog: &'a GraphqlCatalog) -> Self {
+        let root_path = Vec::new();
+        let mut paths_by_table = BTreeMap::new();
+        paths_by_table.insert(root_table.table_name.clone(), root_path.clone());
+        Self {
+            root_table_name,
+            plan: LogicalPlan::Scan {
+                table: root_table_name.to_string(),
+            },
+            joins_by_path: BTreeMap::new(),
+            paths_by_table,
+        }
+    }
+
+    fn into_plan(self) -> LogicalPlan {
+        self.plan
+    }
+
+    fn has_joins(&self) -> bool {
+        !self.joins_by_path.is_empty()
+    }
+
+    fn ensure_join(
+        &mut self,
+        current_table_name: &str,
+        current_table: &TableMeta,
+        relation: &RelationMeta,
+        target_table: &TableMeta,
+        path: Vec<String>,
+    ) -> GqlResult<String> {
+        if let Some(existing) = self.joins_by_path.get(&path) {
+            return Ok(existing.clone());
+        }
+
+        if target_table.table_name == current_table.table_name || target_table.table_name == self.root_table_name
+        {
+            return Err(GqlError::new(
+                GqlErrorKind::Unsupported,
+                format!(
+                    "relation filter path `{}` requires a self-join or alias, which is not supported yet",
+                    render_relation_path(&path)
+                ),
+            ));
+        }
+
+        if let Some(existing_path) = self.paths_by_table.get(&target_table.table_name) {
+            if existing_path != &path {
+                return Err(GqlError::new(
+                    GqlErrorKind::Unsupported,
+                    format!(
+                        "relation filter path `{}` reuses table `{}` through a second alias-less path, which is not supported yet",
+                        render_relation_path(&path),
+                        target_table.table_name
+                    ),
+                ));
+            }
+            return Ok(target_table.table_name.clone());
+        }
+
+        let condition = build_relation_join_condition(
+            current_table_name,
+            current_table,
+            relation,
+            &target_table.table_name,
+            target_table,
+        )?;
+        let left = core::mem::replace(&mut self.plan, LogicalPlan::Empty);
+        self.plan = LogicalPlan::left_join(
+            left,
+            LogicalPlan::Scan {
+                table: target_table.table_name.clone(),
+            },
+            condition,
+        );
+        self.joins_by_path.insert(path.clone(), target_table.table_name.clone());
+        self.paths_by_table
+            .insert(target_table.table_name.clone(), path);
+        Ok(target_table.table_name.clone())
+    }
 }
 
 pub fn build_root_field_plan(
@@ -43,7 +133,7 @@ pub fn build_root_field_plan(
             })?;
             Ok(RootFieldPlan {
                 table_name: table_name.clone(),
-                logical_plan: build_table_query_plan(table_name, table, query)?,
+                logical_plan: build_table_query_plan(catalog, table_name, table, query)?,
             })
         }
         BoundRootFieldKind::ByPk {
@@ -70,19 +160,35 @@ pub fn build_root_field_plan(
 }
 
 pub(crate) fn build_table_query_plan(
+    catalog: &GraphqlCatalog,
     table_name: &str,
     table: &TableMeta,
     query: &BoundCollectionQuery,
 ) -> GqlResult<LogicalPlan> {
-    let mut plan = LogicalPlan::Scan {
-        table: table_name.to_string(),
+    let mut lowering = RelationLoweringState::new(table_name, table, catalog);
+    let filter_expr = if let Some(filter) = &query.filter {
+        Some(build_filter_expr(
+            catalog,
+            table_name,
+            table,
+            filter,
+            &mut lowering,
+            &[],
+        )?)
+    } else {
+        None
     };
+    let has_joins = lowering.has_joins();
+    let mut plan = lowering.into_plan();
 
-    if let Some(filter) = &query.filter {
+    if let Some(predicate) = filter_expr {
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
-            predicate: build_filter_expr(table_name, table, filter)?,
+            predicate,
         };
+        if has_joins {
+            plan = build_root_projection(table_name, table, plan);
+        }
     }
 
     if !query.order_by.is_empty() {
@@ -186,22 +292,39 @@ fn build_by_pk_plan(
 }
 
 fn build_filter_expr(
+    catalog: &GraphqlCatalog,
     table_name: &str,
     table: &TableMeta,
     filter: &BoundFilter,
+    lowering: &mut RelationLoweringState<'_>,
+    current_path: &[String],
 ) -> GqlResult<AstExpr> {
     match filter {
         BoundFilter::And(filters) => {
             let mut expressions = Vec::with_capacity(filters.len());
             for filter in filters {
-                expressions.push(build_filter_expr(table_name, table, filter)?);
+                expressions.push(build_filter_expr(
+                    catalog,
+                    table_name,
+                    table,
+                    filter,
+                    lowering,
+                    current_path,
+                )?);
             }
             Ok(and_all(expressions))
         }
         BoundFilter::Or(filters) => {
             let mut expressions = Vec::with_capacity(filters.len());
             for filter in filters {
-                expressions.push(build_filter_expr(table_name, table, filter)?);
+                expressions.push(build_filter_expr(
+                    catalog,
+                    table_name,
+                    table,
+                    filter,
+                    lowering,
+                    current_path,
+                )?);
             }
             Ok(or_all(expressions))
         }
@@ -224,7 +347,143 @@ fn build_filter_expr(
             }
             Ok(and_all(expressions))
         }
+        BoundFilter::Relation(predicate) => {
+            let target_table = catalog.table(&predicate.target_table).ok_or_else(|| {
+                GqlError::new(
+                    GqlErrorKind::Binding,
+                    format!("table `{}` is not available", predicate.target_table),
+                )
+            })?;
+            let mut path = current_path.to_vec();
+            path.push(predicate.relation.name.clone());
+            let joined_table_name =
+                lowering.ensure_join(table_name, table, &predicate.relation, target_table, path.clone())?;
+            let nested = build_filter_expr(
+                catalog,
+                &joined_table_name,
+                target_table,
+                predicate.filter.as_ref(),
+                lowering,
+                &path,
+            )?;
+            Ok(AstExpr::and(
+                relation_exists_expr(&joined_table_name, target_table)?,
+                nested,
+            ))
+        }
     }
+}
+
+fn build_root_projection(table_name: &str, table: &TableMeta, input: LogicalPlan) -> LogicalPlan {
+    let columns = table
+        .columns()
+        .iter()
+        .map(|column| AstExpr::column(table_name, &column.name, column.index))
+        .collect();
+    LogicalPlan::Project {
+        input: Box::new(input),
+        columns,
+    }
+}
+
+fn relation_exists_expr(table_name: &str, table: &TableMeta) -> GqlResult<AstExpr> {
+    let column = table
+        .primary_key()
+        .and_then(|pk| pk.columns.first())
+        .or_else(|| table.columns().iter().find(|column| !column.nullable))
+        .ok_or_else(|| {
+            GqlError::new(
+                GqlErrorKind::Unsupported,
+                format!(
+                    "relation filter target `{}` must expose a primary key or a non-null column",
+                    table.table_name
+                ),
+            )
+        })?;
+    Ok(AstExpr::is_not_null(AstExpr::column(
+        table_name,
+        &column.name,
+        column.index,
+    )))
+}
+
+fn build_relation_join_condition(
+    current_table_name: &str,
+    current_table: &TableMeta,
+    relation: &RelationMeta,
+    target_table_name: &str,
+    target_table: &TableMeta,
+) -> GqlResult<AstExpr> {
+    if current_table.table_name == relation.child_table && target_table.table_name == relation.parent_table
+    {
+        let left = current_table.column_by_index(relation.child_column_index).ok_or_else(|| {
+            GqlError::new(
+                GqlErrorKind::Binding,
+                format!(
+                    "column index {} was not found on `{}`",
+                    relation.child_column_index,
+                    current_table.table_name
+                ),
+            )
+        })?;
+        let right = target_table.column_by_index(relation.parent_column_index).ok_or_else(|| {
+            GqlError::new(
+                GqlErrorKind::Binding,
+                format!(
+                    "column index {} was not found on `{}`",
+                    relation.parent_column_index,
+                    target_table.table_name
+                ),
+            )
+        })?;
+        return Ok(AstExpr::eq(
+            AstExpr::column(current_table_name, &left.name, left.index),
+            AstExpr::column(target_table_name, &right.name, right.index),
+        ));
+    }
+
+    if current_table.table_name == relation.parent_table && target_table.table_name == relation.child_table
+    {
+        let left = current_table.column_by_index(relation.parent_column_index).ok_or_else(|| {
+            GqlError::new(
+                GqlErrorKind::Binding,
+                format!(
+                    "column index {} was not found on `{}`",
+                    relation.parent_column_index,
+                    current_table.table_name
+                ),
+            )
+        })?;
+        let right = target_table.column_by_index(relation.child_column_index).ok_or_else(|| {
+            GqlError::new(
+                GqlErrorKind::Binding,
+                format!(
+                    "column index {} was not found on `{}`",
+                    relation.child_column_index,
+                    target_table.table_name
+                ),
+            )
+        })?;
+        return Ok(AstExpr::eq(
+            AstExpr::column(current_table_name, &left.name, left.index),
+            AstExpr::column(target_table_name, &right.name, right.index),
+        ));
+    }
+
+    Err(GqlError::new(
+        GqlErrorKind::Binding,
+        format!(
+            "relation `{}` does not connect `{}` to `{}`",
+            relation.name, current_table.table_name, target_table.table_name
+        ),
+    ))
+}
+
+fn render_relation_path(path: &[String]) -> String {
+    if path.is_empty() {
+        return "<root>".to_string();
+    }
+    path.join(".")
 }
 
 fn build_predicate_expr(column_expr: AstExpr, op: &PredicateOp) -> GqlResult<AstExpr> {
@@ -628,6 +887,81 @@ mod tests {
         (cache, catalog, field)
     }
 
+    fn build_relation_filter_cache() -> TableCache {
+        let mut cache = build_cache();
+        let profiles = TableBuilder::new("profiles")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("user_id", DataType::Int64)
+            .unwrap()
+            .add_column("bio", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_profiles_user_id", &["user_id"], true)
+            .unwrap()
+            .add_foreign_key_with_graphql_names(
+                "fk_profiles_user",
+                "user_id",
+                "users",
+                "id",
+                Some("user"),
+                Some("profile"),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        cache.create_table(profiles).unwrap();
+        cache
+            .get_table_mut("profiles")
+            .unwrap()
+            .insert(Row::new(
+                10,
+                alloc::vec![
+                    Value::Int64(10),
+                    Value::Int64(1),
+                    Value::String("Alpha".into()),
+                ],
+            ))
+            .unwrap();
+        cache
+            .get_table_mut("profiles")
+            .unwrap()
+            .insert(Row::new(
+                11,
+                alloc::vec![
+                    Value::Int64(11),
+                    Value::Int64(2),
+                    Value::String("Builder".into()),
+                ],
+            ))
+            .unwrap();
+        cache
+    }
+
+    fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join { .. } => true,
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => logical_plan_contains_join(input),
+            LogicalPlan::CrossProduct { left, right } | LogicalPlan::Union { left, right, .. } => {
+                logical_plan_contains_join(left) || logical_plan_contains_join(right)
+            }
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::IndexScan { .. }
+            | LogicalPlan::IndexGet { .. }
+            | LogicalPlan::IndexInGet { .. }
+            | LogicalPlan::GinIndexScan { .. }
+            | LogicalPlan::GinIndexScanMulti { .. }
+            | LogicalPlan::Empty => false,
+        }
+    }
+
     #[test]
     fn root_where_eq_lowers_to_index_get() {
         let (cache, catalog, field) =
@@ -675,6 +1009,26 @@ mod tests {
         let rows = execute_logical_plan(&cache, &plan.table_name, plan.logical_plan).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0), Some(&Value::Int64(2)));
+    }
+
+    #[test]
+    fn unique_reverse_relation_filter_lowers_to_join_and_executes() {
+        let cache = build_relation_filter_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let prepared = PreparedQuery::parse(
+            "{ users(where: { profile: { bio: { eq: \"Builder\" } } }) { id name } }",
+        )
+        .unwrap();
+        let bound = prepared.bind(&catalog, None).unwrap();
+        let field = bound.fields.first().unwrap();
+
+        let plan = build_root_field_plan(&catalog, field).unwrap();
+        assert!(logical_plan_contains_join(&plan.logical_plan));
+
+        let rows = execute_logical_plan(&cache, &plan.table_name, plan.logical_plan).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&Value::Int64(2)));
+        assert_eq!(rows[0].get(1), Some(&Value::String("Bob".into())));
     }
 
     #[test]

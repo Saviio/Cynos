@@ -1,16 +1,14 @@
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use cynos_core::schema::{ForeignKey, Table};
 use cynos_core::DataType;
 use cynos_storage::TableCache;
 use hashbrown::HashSet;
 
-use crate::catalog::table_type_name;
+use crate::catalog::{GraphqlCatalog, TableFieldMeta, TableMeta};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphqlSchema {
@@ -114,26 +112,14 @@ enum ScalarFilterKind {
 
 impl GraphqlSchema {
     pub fn from_table_cache(cache: &TableCache) -> Self {
-        let table_names = cache.table_names();
-        let mut tables = Vec::with_capacity(table_names.len());
-        let mut type_names = BTreeMap::new();
-
-        for table_name in table_names {
-            if let Some(store) = cache.get_table(table_name) {
-                let table = store.schema();
-                type_names.insert(table.name().to_string(), table_type_name(table.name()));
-                tables.push(table.clone());
-            }
-        }
-
-        let reverse_relations = build_reverse_relations(&tables);
+        let catalog = GraphqlCatalog::from_table_cache(cache);
         let mut scalar_names = HashSet::new();
         scalar_names.insert("Long".to_string());
         scalar_names.insert("DateTime".to_string());
         scalar_names.insert("Bytes".to_string());
         scalar_names.insert("JSON".to_string());
 
-        let mut objects = Vec::with_capacity(tables.len());
+        let mut objects = Vec::with_capacity(catalog.tables().len());
         let mut input_objects = Vec::new();
         let mut enums = vec![EnumTypeDef {
             name: "SortDirection".to_string(),
@@ -141,24 +127,24 @@ impl GraphqlSchema {
         }];
         let scalar_filter_defs = scalar_filter_definitions();
 
-        for table in &tables {
-            objects.push(build_object_type(table, &type_names, &reverse_relations));
-            enums.push(build_order_enum(table, &type_names));
-            input_objects.push(build_where_input(table));
-            input_objects.push(build_order_input(table, &type_names));
-            input_objects.push(build_insert_input(table, &type_names));
-            input_objects.push(build_patch_input(table, &type_names));
+        for table in catalog.tables() {
+            objects.push(build_object_type(table, &catalog));
+            enums.push(build_order_enum(table));
+            input_objects.push(build_where_input(table, &catalog));
+            input_objects.push(build_order_input(table));
+            input_objects.push(build_insert_input(table));
+            input_objects.push(build_patch_input(table));
 
-            if let Some(pk_input) = build_pk_input(table, &type_names) {
+            if let Some(pk_input) = build_pk_input(table) {
                 input_objects.push(pk_input);
             }
         }
 
         input_objects.extend(scalar_filter_defs);
 
-        let query_fields = build_query_fields(&tables, &type_names);
-        let mutation_fields = build_mutation_fields(&tables, &type_names);
-        let subscription_fields = build_subscription_fields(&tables, &type_names);
+        let query_fields = build_query_fields(catalog.tables());
+        let mutation_fields = build_mutation_fields(catalog.tables());
+        let subscription_fields = build_subscription_fields(catalog.tables());
 
         let mut scalars: Vec<ScalarTypeDef> = scalar_names
             .into_iter()
@@ -266,83 +252,50 @@ fn render_object(out: &mut String, object: &ObjectTypeDef) {
     out.push_str("}\n\n");
 }
 
-fn build_object_type(
-    table: &Table,
-    type_names: &BTreeMap<String, String>,
-    reverse_relations: &BTreeMap<String, Vec<ForeignKey>>,
-) -> ObjectTypeDef {
+fn build_object_type(table: &TableMeta, catalog: &GraphqlCatalog) -> ObjectTypeDef {
     let mut fields = Vec::new();
-    let mut used_names = HashSet::new();
 
-    for column in table.columns() {
-        let field_name = column.name().to_string();
-        used_names.insert(field_name.clone());
-        fields.push(FieldDef {
-            name: field_name,
-            args: Vec::new(),
-            ty: graphql_type_for_column(column.data_type(), !column.is_nullable()),
-        });
-    }
-
-    for fk in table.constraints().get_foreign_keys() {
-        let parent_type = type_names
-            .get(&fk.parent_table)
-            .cloned()
-            .unwrap_or_else(|| table_type_name(&fk.parent_table));
-        let mut name = fk
-            .graphql_forward_field()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| fk.parent_table.clone());
-        if used_names.contains(&name) {
-            name = format!("{}_rel", name);
-        }
-        used_names.insert(name.clone());
-        fields.push(FieldDef {
-            name,
-            args: Vec::new(),
-            ty: TypeRef::named(parent_type, false),
-        });
-    }
-
-    if let Some(reverse) = reverse_relations.get(table.name()) {
-        for fk in reverse {
-            let child_type = type_names
-                .get(&fk.child_table)
-                .cloned()
-                .unwrap_or_else(|| table_type_name(&fk.child_table));
-            let mut name = fk
-                .graphql_reverse_field()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| fk.child_table.clone());
-            if used_names.contains(&name) {
-                name = format!("{}_rel", name);
+    for field in table.fields() {
+        match field {
+            TableFieldMeta::Column(column) => fields.push(FieldDef {
+                name: column.name.clone(),
+                args: Vec::new(),
+                ty: graphql_type_for_column(column.data_type, !column.nullable),
+            }),
+            TableFieldMeta::ForwardRelation(relation) => {
+                let target = catalog
+                    .table(&relation.parent_table)
+                    .expect("forward relation target must exist");
+                fields.push(FieldDef {
+                    name: relation.name.clone(),
+                    args: Vec::new(),
+                    ty: TypeRef::named(target.graphql_name.clone(), false),
+                });
             }
-            used_names.insert(name.clone());
-            fields.push(FieldDef {
-                name,
-                args: collection_arguments(&child_type),
-                ty: TypeRef::list(TypeRef::named(child_type, true), true),
-            });
+            TableFieldMeta::ReverseRelation(relation) => {
+                let target = catalog
+                    .table(&relation.child_table)
+                    .expect("reverse relation target must exist");
+                fields.push(FieldDef {
+                    name: relation.name.clone(),
+                    args: collection_arguments(&target.graphql_name),
+                    ty: TypeRef::list(TypeRef::named(target.graphql_name.clone(), true), true),
+                });
+            }
         }
     }
 
     ObjectTypeDef {
-        name: type_names
-            .get(table.name())
-            .cloned()
-            .unwrap_or_else(|| table_type_name(table.name())),
+        name: table.graphql_name.clone(),
         fields,
     }
 }
 
-fn build_query_fields(tables: &[Table], type_names: &BTreeMap<String, String>) -> Vec<FieldDef> {
+fn build_query_fields(tables: &[TableMeta]) -> Vec<FieldDef> {
     let mut fields = Vec::new();
     for table in tables {
-        let table_name = table.name().to_string();
-        let type_name = type_names
-            .get(&table_name)
-            .cloned()
-            .unwrap_or_else(|| table_type_name(&table_name));
+        let table_name = table.table_name.clone();
+        let type_name = table.graphql_name.clone();
         fields.push(FieldDef {
             name: table_name.clone(),
             args: collection_arguments(&type_name),
@@ -363,14 +316,10 @@ fn build_query_fields(tables: &[Table], type_names: &BTreeMap<String, String>) -
     fields
 }
 
-fn build_mutation_fields(tables: &[Table], type_names: &BTreeMap<String, String>) -> Vec<FieldDef> {
+fn build_mutation_fields(tables: &[TableMeta]) -> Vec<FieldDef> {
     let mut fields = Vec::new();
     for table in tables {
-        let table_name = table.name().to_string();
-        let type_name = type_names
-            .get(&table_name)
-            .cloned()
-            .unwrap_or_else(|| table_type_name(&table_name));
+        let type_name = table.graphql_name.clone();
 
         fields.push(FieldDef {
             name: format!("insert{}", type_name),
@@ -407,11 +356,8 @@ fn build_mutation_fields(tables: &[Table], type_names: &BTreeMap<String, String>
     fields
 }
 
-fn build_subscription_fields(
-    tables: &[Table],
-    type_names: &BTreeMap<String, String>,
-) -> Vec<FieldDef> {
-    build_query_fields(tables, type_names)
+fn build_subscription_fields(tables: &[TableMeta]) -> Vec<FieldDef> {
+    build_query_fields(tables)
 }
 
 fn collection_arguments(type_name: &str) -> Vec<InputValueDef> {
@@ -438,8 +384,8 @@ fn collection_arguments(type_name: &str) -> Vec<InputValueDef> {
     ]
 }
 
-fn build_where_input(table: &Table) -> InputObjectTypeDef {
-    let type_name = table_type_name(table.name());
+fn build_where_input(table: &TableMeta, catalog: &GraphqlCatalog) -> InputObjectTypeDef {
+    let type_name = table.graphql_name.clone();
     let mut fields = vec![
         InputValueDef {
             name: "AND".to_string(),
@@ -457,12 +403,35 @@ fn build_where_input(table: &Table) -> InputObjectTypeDef {
         },
     ];
 
-    for column in table.columns() {
-        let filter_name = scalar_filter_name(column.data_type());
-        fields.push(InputValueDef {
-            name: column.name().to_string(),
-            ty: TypeRef::named(filter_name, false),
-        });
+    for field in table.fields() {
+        match field {
+            TableFieldMeta::Column(column) => {
+                let filter_name = scalar_filter_name(column.data_type);
+                fields.push(InputValueDef {
+                    name: column.name.clone(),
+                    ty: TypeRef::named(filter_name, false),
+                });
+            }
+            TableFieldMeta::ForwardRelation(relation) => {
+                let target = catalog
+                    .table(&relation.parent_table)
+                    .expect("forward relation target must exist");
+                fields.push(InputValueDef {
+                    name: relation.name.clone(),
+                    ty: TypeRef::named(format!("{}WhereInput", target.graphql_name), false),
+                });
+            }
+            TableFieldMeta::ReverseRelation(relation) if relation.child_column_unique => {
+                let target = catalog
+                    .table(&relation.child_table)
+                    .expect("reverse relation target must exist");
+                fields.push(InputValueDef {
+                    name: relation.name.clone(),
+                    ty: TypeRef::named(format!("{}WhereInput", target.graphql_name), false),
+                });
+            }
+            TableFieldMeta::ReverseRelation(_) => {}
+        }
     }
 
     InputObjectTypeDef {
@@ -471,28 +440,19 @@ fn build_where_input(table: &Table) -> InputObjectTypeDef {
     }
 }
 
-fn build_order_enum(table: &Table, type_names: &BTreeMap<String, String>) -> EnumTypeDef {
+fn build_order_enum(table: &TableMeta) -> EnumTypeDef {
     EnumTypeDef {
-        name: format!(
-            "{}OrderField",
-            type_names
-                .get(table.name())
-                .cloned()
-                .unwrap_or_else(|| table_type_name(table.name()))
-        ),
+        name: format!("{}OrderField", table.graphql_name),
         values: table
             .columns()
             .iter()
-            .map(|column| to_graphql_enum_value(column.name()))
+            .map(|column| to_graphql_enum_value(&column.name))
             .collect(),
     }
 }
 
-fn build_order_input(table: &Table, type_names: &BTreeMap<String, String>) -> InputObjectTypeDef {
-    let type_name = type_names
-        .get(table.name())
-        .cloned()
-        .unwrap_or_else(|| table_type_name(table.name()));
+fn build_order_input(table: &TableMeta) -> InputObjectTypeDef {
+    let type_name = table.graphql_name.clone();
     InputObjectTypeDef {
         name: format!("{}OrderByInput", type_name),
         fields: vec![
@@ -508,84 +468,50 @@ fn build_order_input(table: &Table, type_names: &BTreeMap<String, String>) -> In
     }
 }
 
-fn build_pk_input(
-    table: &Table,
-    type_names: &BTreeMap<String, String>,
-) -> Option<InputObjectTypeDef> {
+fn build_pk_input(table: &TableMeta) -> Option<InputObjectTypeDef> {
     let pk = table.primary_key()?;
-    let mut fields = Vec::new();
-    for column in pk.columns() {
-        if let Some(table_column) = table.get_column(&column.name) {
-            fields.push(InputValueDef {
-                name: column.name.clone(),
-                ty: graphql_type_for_column(table_column.data_type(), true),
-            });
-        }
-    }
+    let fields = pk
+        .columns
+        .iter()
+        .map(|column| InputValueDef {
+            name: column.name.clone(),
+            ty: graphql_type_for_column(column.data_type, true),
+        })
+        .collect();
     Some(InputObjectTypeDef {
-        name: format!(
-            "{}PkInput",
-            type_names
-                .get(table.name())
-                .cloned()
-                .unwrap_or_else(|| table_type_name(table.name()))
-        ),
+        name: format!("{}PkInput", table.graphql_name),
         fields,
     })
 }
 
-fn build_insert_input(table: &Table, type_names: &BTreeMap<String, String>) -> InputObjectTypeDef {
+fn build_insert_input(table: &TableMeta) -> InputObjectTypeDef {
     let fields = table
         .columns()
         .iter()
         .map(|column| InputValueDef {
-            name: column.name().to_string(),
-            ty: graphql_type_for_column(column.data_type(), !column.is_nullable()),
+            name: column.name.clone(),
+            ty: graphql_type_for_column(column.data_type, !column.nullable),
         })
         .collect();
     InputObjectTypeDef {
-        name: format!(
-            "{}InsertInput",
-            type_names
-                .get(table.name())
-                .cloned()
-                .unwrap_or_else(|| table_type_name(table.name()))
-        ),
+        name: format!("{}InsertInput", table.graphql_name),
         fields,
     }
 }
 
-fn build_patch_input(table: &Table, type_names: &BTreeMap<String, String>) -> InputObjectTypeDef {
+fn build_patch_input(table: &TableMeta) -> InputObjectTypeDef {
     let fields = table
         .columns()
         .iter()
         .map(|column| InputValueDef {
-            name: column.name().to_string(),
-            ty: graphql_type_for_column(column.data_type(), false),
+            name: column.name.clone(),
+            ty: graphql_type_for_column(column.data_type, false),
         })
         .collect();
     InputObjectTypeDef {
-        name: format!(
-            "{}PatchInput",
-            type_names
-                .get(table.name())
-                .cloned()
-                .unwrap_or_else(|| table_type_name(table.name()))
-        ),
+        name: format!("{}PatchInput", table.graphql_name),
         fields,
     }
-}
-
-fn build_reverse_relations(tables: &[Table]) -> BTreeMap<String, Vec<ForeignKey>> {
-    let mut map: BTreeMap<String, Vec<ForeignKey>> = BTreeMap::new();
-    for table in tables {
-        for fk in table.constraints().get_foreign_keys() {
-            map.entry(fk.parent_table.clone())
-                .or_default()
-                .push(fk.clone());
-        }
-    }
-    map
 }
 
 fn scalar_filter_definitions() -> Vec<InputObjectTypeDef> {
@@ -790,6 +716,35 @@ mod tests {
         cache
     }
 
+    fn build_unique_reverse_cache() -> TableCache {
+        let mut cache = build_cache();
+        let profiles = TableBuilder::new("profiles")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("user_id", DataType::Int64)
+            .unwrap()
+            .add_column("bio", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_profiles_user_id", &["user_id"], true)
+            .unwrap()
+            .add_foreign_key_with_graphql_names(
+                "fk_profiles_user",
+                "user_id",
+                "users",
+                "id",
+                Some("user"),
+                Some("profile"),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        cache.create_table(profiles).unwrap();
+        cache
+    }
+
     #[test]
     fn schema_includes_query_mutation_and_subscription_roots() {
         let cache = build_cache();
@@ -816,5 +771,15 @@ mod tests {
         assert!(sdl.contains("users: Users"));
         assert!(sdl.contains("input UsersInsertInput"));
         assert!(sdl.contains("input UsersPatchInput"));
+    }
+
+    #[test]
+    fn schema_includes_single_valued_relation_filters_in_where_inputs() {
+        let cache = build_unique_reverse_cache();
+        let sdl = render_schema_sdl(&cache);
+
+        assert!(sdl.contains("input OrdersWhereInput"));
+        assert!(sdl.contains("user: UsersWhereInput") || sdl.contains("users: UsersWhereInput"));
+        assert!(sdl.contains("profile: ProfilesWhereInput"));
     }
 }

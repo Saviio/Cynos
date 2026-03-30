@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -118,6 +119,7 @@ pub enum BoundFilter {
     And(Vec<BoundFilter>),
     Or(Vec<BoundFilter>),
     Column(ColumnPredicate),
+    Relation(RelationPredicate),
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +127,13 @@ pub struct ColumnPredicate {
     pub column_index: usize,
     pub data_type: DataType,
     pub ops: Vec<PredicateOp>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RelationPredicate {
+    pub relation: RelationMeta,
+    pub target_table: String,
+    pub filter: Box<BoundFilter>,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +178,10 @@ pub fn is_delta_capable_root_field(field: &BoundRootField) -> bool {
             query.order_by.is_empty()
                 && query.limit.is_none()
                 && query.offset == 0
+                && query
+                    .filter
+                    .as_ref()
+                    .map_or(true, is_delta_capable_filter)
                 && is_delta_capable_selection(selection)
         }
         BoundRootFieldKind::ByPk { selection, .. } => is_delta_capable_selection(selection),
@@ -195,12 +208,26 @@ fn is_delta_capable_field(field: &BoundField) -> bool {
     }
 }
 
+fn is_delta_capable_filter(filter: &BoundFilter) -> bool {
+    match filter {
+        BoundFilter::And(filters) | BoundFilter::Or(filters) => {
+            filters.iter().all(is_delta_capable_filter)
+        }
+        BoundFilter::Column(_) => true,
+        BoundFilter::Relation(predicate) => is_delta_capable_filter(predicate.filter.as_ref()),
+    }
+}
+
 fn reverse_relation_query_is_delta_capable(
     relation: &RelationMeta,
     query: &BoundCollectionQuery,
 ) -> bool {
     query.order_by.is_empty()
         && query.offset == 0
+        && query
+            .filter
+            .as_ref()
+            .map_or(true, is_delta_capable_filter)
         && match query.limit {
             None => true,
             Some(1) => relation.child_column_unique,
@@ -240,6 +267,14 @@ fn collect_root_field_dependency_tables(
             ..
         } => {
             tables.insert(table_name.clone());
+            if let BoundRootFieldKind::Collection { query, .. }
+            | BoundRootFieldKind::Update { query, .. }
+            | BoundRootFieldKind::Delete { query, .. } = &field.kind
+            {
+                if let Some(filter) = &query.filter {
+                    collect_filter_dependency_tables(filter, tables);
+                }
+            }
             collect_selection_dependency_tables(selection, tables);
         }
     }
@@ -261,13 +296,35 @@ fn collect_selection_dependency_tables(
                 collect_selection_dependency_tables(selection, tables);
             }
             BoundField::ReverseRelation {
+                query,
                 relation,
                 selection,
                 ..
             } => {
                 tables.insert(relation.child_table.clone());
+                if let Some(filter) = &query.filter {
+                    collect_filter_dependency_tables(filter, tables);
+                }
                 collect_selection_dependency_tables(selection, tables);
             }
+        }
+    }
+}
+
+fn collect_filter_dependency_tables(
+    filter: &BoundFilter,
+    tables: &mut hashbrown::HashSet<String>,
+) {
+    match filter {
+        BoundFilter::And(filters) | BoundFilter::Or(filters) => {
+            for filter in filters {
+                collect_filter_dependency_tables(filter, tables);
+            }
+        }
+        BoundFilter::Column(_) => {}
+        BoundFilter::Relation(predicate) => {
+            tables.insert(predicate.target_table.clone());
+            collect_filter_dependency_tables(predicate.filter.as_ref(), tables);
         }
     }
 }
@@ -367,7 +424,7 @@ fn bind_operation(
         let kind = match root_field.kind {
             RootFieldKind::List => BoundRootFieldKind::Collection {
                 table_name: root_field.table_name.clone(),
-                query: bind_collection_arguments(field, table, variables)?,
+                query: bind_collection_arguments(field, table, catalog, variables)?,
                 selection: bind_required_selection_set(field, table, catalog, variables)?,
             },
             RootFieldKind::ByPk => BoundRootFieldKind::ByPk {
@@ -384,14 +441,20 @@ fn bind_operation(
                 let arguments = materialize_argument_map(field, variables)?;
                 BoundRootFieldKind::Update {
                     table_name: root_field.table_name.clone(),
-                    query: bind_collection_arguments_from_map(field, table, &arguments, &["set"])?,
+                    query: bind_collection_arguments_from_map(
+                        field,
+                        table,
+                        catalog,
+                        &arguments,
+                        &["set"],
+                    )?,
                     assignments: bind_assignments_from_map(field, table, &arguments)?,
                     selection: bind_required_selection_set(field, table, catalog, variables)?,
                 }
             }
             RootFieldKind::Delete => BoundRootFieldKind::Delete {
                 table_name: root_field.table_name.clone(),
-                query: bind_collection_arguments(field, table, variables)?,
+                query: bind_collection_arguments(field, table, catalog, variables)?,
                 selection: bind_required_selection_set(field, table, catalog, variables)?,
             },
         };
@@ -487,7 +550,7 @@ fn bind_selection_set(
                     )
                 })?;
                 let nested = bind_required_selection_set(field, target_table, catalog, variables)?;
-                let query = bind_collection_arguments(field, target_table, variables)?;
+                let query = bind_collection_arguments(field, target_table, catalog, variables)?;
                 fields.push(BoundField::ReverseRelation {
                     response_key: field.response_key().to_string(),
                     relation: relation.clone(),
@@ -503,15 +566,17 @@ fn bind_selection_set(
 fn bind_collection_arguments(
     field: &Field,
     table: &TableMeta,
+    catalog: &GraphqlCatalog,
     variables: &VariableValues,
 ) -> GqlResult<BoundCollectionQuery> {
     let arguments = materialize_argument_map(field, variables)?;
-    bind_collection_arguments_from_map(field, table, &arguments, &[])
+    bind_collection_arguments_from_map(field, table, catalog, &arguments, &[])
 }
 
 fn bind_collection_arguments_from_map(
     field: &Field,
     table: &TableMeta,
+    catalog: &GraphqlCatalog,
     arguments: &BTreeMap<String, InputValue>,
     extra_allowed: &[&str],
 ) -> GqlResult<BoundCollectionQuery> {
@@ -521,7 +586,7 @@ fn bind_collection_arguments_from_map(
 
     let filter = arguments
         .get("where")
-        .map(|value| bind_where(value, table))
+        .map(|value| bind_where(value, table, catalog))
         .transpose()?
         .flatten();
     let order_by = arguments
@@ -820,28 +885,75 @@ fn materialize_input_value(
     }
 }
 
-fn bind_where(value: &InputValue, table: &TableMeta) -> GqlResult<Option<BoundFilter>> {
+fn bind_where(
+    value: &InputValue,
+    table: &TableMeta,
+    catalog: &GraphqlCatalog,
+) -> GqlResult<Option<BoundFilter>> {
     let fields = expect_object(value, "where")?;
     let mut predicates = Vec::new();
 
     for field in fields {
         match field.name.as_str() {
-            "AND" => predicates.push(bind_logical_filter(&field.value, table, true)?),
-            "OR" => predicates.push(bind_logical_filter(&field.value, table, false)?),
-            column_name => {
-                let column = table.column(column_name).ok_or_else(|| {
+            "AND" => predicates.push(bind_logical_filter(&field.value, table, catalog, true)?),
+            "OR" => predicates.push(bind_logical_filter(&field.value, table, catalog, false)?),
+            field_name => {
+                let table_field = table.field(field_name).ok_or_else(|| {
                     GqlError::new(
                         GqlErrorKind::Validation,
                         format!(
-                            "unknown filter column `{}` on `{}`",
-                            column_name, table.graphql_name
+                            "unknown filter field `{}` on `{}`",
+                            field_name, table.graphql_name
                         ),
                     )
                 })?;
-                predicates.push(BoundFilter::Column(bind_column_predicate(
-                    column,
-                    &field.value,
-                )?));
+                match table_field {
+                    TableFieldMeta::Column(column) => {
+                        predicates.push(BoundFilter::Column(bind_column_predicate(
+                            column,
+                            &field.value,
+                        )?));
+                    }
+                    TableFieldMeta::ForwardRelation(relation) => {
+                        let target_table = catalog.table(&relation.parent_table).ok_or_else(|| {
+                            GqlError::new(
+                                GqlErrorKind::Binding,
+                                format!("table `{}` is not available", relation.parent_table),
+                            )
+                        })?;
+                        predicates.push(bind_single_relation_predicate(
+                            relation,
+                            target_table,
+                            &field.value,
+                            catalog,
+                            field_name,
+                        )?);
+                    }
+                    TableFieldMeta::ReverseRelation(relation) => {
+                        if !relation.child_column_unique {
+                            return Err(GqlError::new(
+                                GqlErrorKind::Unsupported,
+                                format!(
+                                    "multi-row reverse relation filter `{}` on `{}` is not supported yet",
+                                    field_name, table.graphql_name
+                                ),
+                            ));
+                        }
+                        let target_table = catalog.table(&relation.child_table).ok_or_else(|| {
+                            GqlError::new(
+                                GqlErrorKind::Binding,
+                                format!("table `{}` is not available", relation.child_table),
+                            )
+                        })?;
+                        predicates.push(bind_single_relation_predicate(
+                            relation,
+                            target_table,
+                            &field.value,
+                            catalog,
+                            field_name,
+                        )?);
+                    }
+                }
             }
         }
     }
@@ -853,11 +965,32 @@ fn bind_where(value: &InputValue, table: &TableMeta) -> GqlResult<Option<BoundFi
     }
 }
 
-fn bind_logical_filter(value: &InputValue, table: &TableMeta, and: bool) -> GqlResult<BoundFilter> {
+fn bind_single_relation_predicate(
+    relation: &RelationMeta,
+    target_table: &TableMeta,
+    value: &InputValue,
+    catalog: &GraphqlCatalog,
+    field_name: &str,
+) -> GqlResult<BoundFilter> {
+    let filter = bind_where(value, target_table, catalog)?.unwrap_or(BoundFilter::And(Vec::new()));
+    let _ = field_name;
+    Ok(BoundFilter::Relation(RelationPredicate {
+        relation: relation.clone(),
+        target_table: target_table.table_name.clone(),
+        filter: Box::new(filter),
+    }))
+}
+
+fn bind_logical_filter(
+    value: &InputValue,
+    table: &TableMeta,
+    catalog: &GraphqlCatalog,
+    and: bool,
+) -> GqlResult<BoundFilter> {
     let values = expect_list(value, if and { "AND" } else { "OR" })?;
     let mut predicates = Vec::with_capacity(values.len());
     for value in values {
-        let predicate = bind_where(value, table)?.ok_or_else(|| {
+        let predicate = bind_where(value, table, catalog)?.ok_or_else(|| {
             GqlError::new(
                 GqlErrorKind::Validation,
                 if and {

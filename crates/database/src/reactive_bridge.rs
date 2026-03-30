@@ -12,7 +12,7 @@
 //! Otherwise, falls back to re-query.
 
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
-use crate::convert::{gql_response_to_js, value_to_js};
+use crate::convert::{gql_response_to_js_with_cache, value_to_js, GraphqlJsEncodeCache};
 use crate::live_runtime::{
     RowsSnapshotDependencyGraph, RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey,
     RowsSnapshotPartialRefreshMetadata, RowsSnapshotPartialRefreshState,
@@ -694,8 +694,11 @@ fn build_delta_batch_invalidation(
     Ok(invalidation)
 }
 
-fn graphql_response_to_js_value(response: &cynos_gql::GraphqlResponse) -> JsValue {
-    gql_response_to_js(response).unwrap_or(JsValue::NULL)
+fn graphql_response_to_js_value(
+    response: &cynos_gql::GraphqlResponse,
+    encode_cache: &mut GraphqlJsEncodeCache,
+) -> JsValue {
+    gql_response_to_js_with_cache(response, encode_cache).unwrap_or(JsValue::NULL)
 }
 
 /// A re-query based observable that re-executes the query on each change.
@@ -1243,6 +1246,7 @@ pub struct GraphqlSubscriptionObservable {
     root_summary: QueryResultSummary,
     response: Option<cynos_gql::GraphqlResponse>,
     response_js: Option<JsValue>,
+    response_encode_cache: GraphqlJsEncodeCache,
     response_dirty: bool,
     subscribers: GraphqlSubscribers,
 }
@@ -1273,6 +1277,7 @@ impl GraphqlSubscriptionObservable {
             root_summary: initial_summary,
             response: None,
             response_js: None,
+            response_encode_cache: GraphqlJsEncodeCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1288,7 +1293,10 @@ impl GraphqlSubscriptionObservable {
                 return payload.clone();
             }
 
-            let payload = graphql_response_to_js_value(self.response.as_ref().unwrap());
+            let payload = graphql_response_to_js_value(
+                self.response.as_ref().unwrap(),
+                &mut self.response_encode_cache,
+            );
             self.response_js = Some(payload.clone());
             return payload;
         }
@@ -1304,7 +1312,10 @@ impl GraphqlSubscriptionObservable {
         if let Some(payload) = &self.response_js {
             payload.clone()
         } else {
-            let payload = graphql_response_to_js_value(self.response.as_ref().unwrap());
+            let payload = graphql_response_to_js_value(
+                self.response.as_ref().unwrap(),
+                &mut self.response_encode_cache,
+            );
             self.response_js = Some(payload.clone());
             payload
         }
@@ -1465,7 +1476,7 @@ impl GraphqlSubscriptionObservable {
             None => build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows),
         };
         match response {
-            Ok(response) => graphql_response_to_js_value(&response),
+            Ok(response) => graphql_response_to_js_value(&response, &mut self.response_encode_cache),
             Err(_) => JsValue::NULL,
         }
     }
@@ -1482,6 +1493,7 @@ pub struct GraphqlDeltaObservable {
     has_nested_relations: bool,
     response: Option<cynos_gql::GraphqlResponse>,
     response_js: Option<JsValue>,
+    response_encode_cache: GraphqlJsEncodeCache,
     response_dirty: bool,
     subscribers: GraphqlSubscribers,
 }
@@ -1508,6 +1520,7 @@ impl GraphqlDeltaObservable {
             field,
             response: None,
             response_js: None,
+            response_encode_cache: GraphqlJsEncodeCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1535,6 +1548,7 @@ impl GraphqlDeltaObservable {
             field,
             response: None,
             response_js: None,
+            response_encode_cache: GraphqlJsEncodeCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1573,6 +1587,7 @@ impl GraphqlDeltaObservable {
             field,
             response: None,
             response_js: None,
+            response_encode_cache: GraphqlJsEncodeCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1611,6 +1626,7 @@ impl GraphqlDeltaObservable {
             field,
             response: None,
             response_js: None,
+            response_encode_cache: GraphqlJsEncodeCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1626,7 +1642,10 @@ impl GraphqlDeltaObservable {
                 return payload.clone();
             }
 
-            let payload = graphql_response_to_js_value(self.response.as_ref().unwrap());
+            let payload = graphql_response_to_js_value(
+                self.response.as_ref().unwrap(),
+                &mut self.response_encode_cache,
+            );
             self.response_js = Some(payload.clone());
             return payload;
         }
@@ -1642,7 +1661,10 @@ impl GraphqlDeltaObservable {
         if let Some(payload) = &self.response_js {
             payload.clone()
         } else {
-            let payload = graphql_response_to_js_value(self.response.as_ref().unwrap());
+            let payload = graphql_response_to_js_value(
+                self.response.as_ref().unwrap(),
+                &mut self.response_encode_cache,
+            );
             self.response_js = Some(payload.clone());
             payload
         }
@@ -1765,7 +1787,7 @@ impl GraphqlDeltaObservable {
             None => build_graphql_response(&cache, &self.catalog, &self.field, &rows),
         };
         match response {
-            Ok(response) => graphql_response_to_js_value(&response),
+            Ok(response) => graphql_response_to_js_value(&response, &mut self.response_encode_cache),
             Err(_) => JsValue::NULL,
         }
     }

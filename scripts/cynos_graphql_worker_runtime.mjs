@@ -29,7 +29,6 @@ const runtime = {
   initialized: false,
   db: null,
   server: null,
-  lookups: null,
   prepared: null,
   active: null,
 }
@@ -250,11 +249,10 @@ async function insertTableInBatches(db, tableName, rows) {
 }
 
 const ISSUE_FEED_SUBSCRIPTION = `
-  subscription IssueFeed($rootLimit: Int!, $projectIds: [Long!]!) {
+  subscription IssueFeed($rootLimit: Int!) {
     issues(
       where: {
         AND: [
-          { projectId: { in: $projectIds } }
           { OR: [{ status: { eq: "open" } }, { status: { eq: "in_progress" } }] }
           { estimate: { gte: 3 } }
           {
@@ -262,6 +260,21 @@ const ISSUE_FEED_SUBSCRIPTION = `
               { metadata: { path: "$.customer.tier", eq: "enterprise" } }
               { metadata: { path: "$.customer.tier", eq: "mid_market" } }
             ]
+          }
+          {
+            project: {
+              AND: [
+                { healthScore: { gte: 45 } }
+                {
+                  OR: [
+                    { metadata: { path: "$.risk.bucket", eq: "high" } }
+                    { metadata: { path: "$.risk.bucket", eq: "critical" } }
+                  ]
+                }
+                { counter: { openIssueCount: { gte: 5 } } }
+                { snapshot: { velocity: { gte: 18 } } }
+              ]
+            }
           }
         ]
       }
@@ -318,11 +331,10 @@ const ISSUE_FEED_QUERY = ISSUE_FEED_SUBSCRIPTION.replace(
 )
 
 const ISSUE_FEED_STREAM_SUBSCRIPTION = `
-  subscription IssueFeedStream($projectIds: [Long!]!) {
+  subscription IssueFeedStream {
     issues(
       where: {
         AND: [
-          { projectId: { in: $projectIds } }
           { OR: [{ status: { eq: "open" } }, { status: { eq: "in_progress" } }] }
           { estimate: { gte: 3 } }
           {
@@ -330,6 +342,21 @@ const ISSUE_FEED_STREAM_SUBSCRIPTION = `
               { metadata: { path: "$.customer.tier", eq: "enterprise" } }
               { metadata: { path: "$.customer.tier", eq: "mid_market" } }
             ]
+          }
+          {
+            project: {
+              AND: [
+                { healthScore: { gte: 45 } }
+                {
+                  OR: [
+                    { metadata: { path: "$.risk.bucket", eq: "high" } }
+                    { metadata: { path: "$.risk.bucket", eq: "critical" } }
+                  ]
+                }
+                { counter: { openIssueCount: { gte: 5 } } }
+                { snapshot: { velocity: { gte: 18 } } }
+              ]
+            }
           }
         ]
       }
@@ -518,60 +545,19 @@ function scenarioVisibleLimit(scenarioId) {
   throw new Error(`Unknown scenario: ${scenarioId}`)
 }
 
-function isIssueScenario(scenarioId) {
-  return (
-    scenarioId === 'issue_window_500' ||
-    scenarioId === 'issue_window_5000' ||
-    scenarioId === 'issue_stream_all'
-  )
-}
-
-function byProjectId(rows) {
-  const map = new Map()
-  for (const row of rows ?? []) {
-    map.set(row.projectId, row)
-  }
-  return map
-}
-
-function eligibleIssueProjectIds() {
-  const countersByProjectId = runtime.lookups?.projectCounters
-  const snapshotsByProjectId = runtime.lookups?.projectSnapshots
-  const ids = []
-
-  for (const project of runtime.server.tables.projects) {
-    const counter = countersByProjectId?.get(project.id)
-    const snapshot = snapshotsByProjectId?.get(project.id)
-    const riskBucket = project.metadata?.risk?.bucket
-
-    if (project.healthScore < 45) continue
-    if (riskBucket !== 'high' && riskBucket !== 'critical') continue
-    if (!counter || counter.openIssueCount < 5) continue
-    if (!snapshot || snapshot.velocity < 18) continue
-
-    ids.push(project.id)
-  }
-
-  return ids.length > 0 ? ids : [-1]
-}
-
 function scenarioVariables(scenarioId) {
   if (scenarioId === 'issue_window_500') {
     return {
       rootLimit: issueRootLimit(500),
-      projectIds: eligibleIssueProjectIds(),
     }
   }
   if (scenarioId === 'issue_window_5000') {
     return {
       rootLimit: issueRootLimit(5_000),
-      projectIds: eligibleIssueProjectIds(),
     }
   }
   if (scenarioId === 'issue_stream_all') {
-    return {
-      projectIds: eligibleIssueProjectIds(),
-    }
+    return {}
   }
   if (scenarioId === 'project_board_2000') {
     return { rootLimit: boardRootLimit() }
@@ -778,16 +764,6 @@ function scheduleAttachSubscription(active, variables) {
   }, 0)
 }
 
-function refreshIssueScenarioSnapshot(active) {
-  active.subscriptionMuted = true
-  const variables = scenarioVariables(active.scenarioId)
-  const payload = executeScenarioQuery(active.scenarioId, variables)
-  const rows = syncActiveRows(active, payload)
-  flushPendingSnapshot(active, rows)
-  active.subscriptionMuted = false
-  scheduleAttachSubscription(active, variables)
-}
-
 async function initRuntime() {
   if (runtime.initialized) {
     return {
@@ -800,10 +776,6 @@ async function initRuntime() {
   await initWasm({ module_or_path: await fs.readFile(WASM_PATH) })
 
   runtime.server = buildServerDataset(DATASET_CONFIG)
-  runtime.lookups = {
-    projectCounters: byProjectId(runtime.server.tables.projectCounters),
-    projectSnapshots: byProjectId(runtime.server.tables.projectSnapshots),
-  }
   runtime.db = new Database(`cynos_bench_${Date.now()}`)
   createTables(runtime.db)
 
@@ -958,14 +930,7 @@ function runSocketPatchBurst(message) {
       col('id').eq(next.id),
     )
   }
-  const shouldRefreshIssueScenario = isIssueScenario(runtime.active.scenarioId)
-  if (shouldRefreshIssueScenario) {
-    detachSubscription(runtime.active)
-  }
   tx.commit()
-  if (shouldRefreshIssueScenario) {
-    refreshIssueScenarioSnapshot(runtime.active)
-  }
 }
 
 function runApiRefresh(message) {
@@ -1014,14 +979,7 @@ function runApiRefresh(message) {
       col('id').eq(next.id),
     )
   }
-  const shouldRefreshIssueScenario = isIssueScenario(runtime.active.scenarioId)
-  if (shouldRefreshIssueScenario) {
-    detachSubscription(runtime.active)
-  }
   tx.commit()
-  if (shouldRefreshIssueScenario) {
-    refreshIssueScenarioSnapshot(runtime.active)
-  }
 }
 
 function handleError(error, context) {

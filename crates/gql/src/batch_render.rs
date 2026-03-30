@@ -533,11 +533,21 @@ fn fetch_edge_buckets(
     }
 
     let mut buckets = match edge.strategy {
-        RelationFetchStrategy::PlannerBatch => planner_batch_fetch(cache, catalog, edge, keys)
-            .or_else(|_| scan_and_bucket_fetch(cache, edge, keys)),
-        RelationFetchStrategy::IndexedProbeBatch => indexed_probe_fetch(cache, edge, keys)
-            .or_else(|_| planner_batch_fetch(cache, catalog, edge, keys))
-            .or_else(|_| scan_and_bucket_fetch(cache, edge, keys)),
+        RelationFetchStrategy::PlannerBatch => match planner_batch_fetch(cache, catalog, edge, keys)
+        {
+            Ok(buckets) => Ok(buckets),
+            Err(error) if edge_query_uses_relations(edge) => Err(error),
+            Err(_) => scan_and_bucket_fetch(cache, edge, keys),
+        },
+        RelationFetchStrategy::IndexedProbeBatch => match indexed_probe_fetch(cache, edge, keys) {
+            Ok(buckets) => Ok(buckets),
+            Err(error) if edge_query_uses_relations(edge) => Err(error),
+            Err(_) => match planner_batch_fetch(cache, catalog, edge, keys) {
+                Ok(buckets) => Ok(buckets),
+                Err(error) if edge_query_uses_relations(edge) => Err(error),
+                Err(_) => scan_and_bucket_fetch(cache, edge, keys),
+            },
+        },
         RelationFetchStrategy::ScanAndBucket => scan_and_bucket_fetch(cache, edge, keys),
     }?;
 
@@ -545,6 +555,23 @@ fn fetch_edge_buckets(
         buckets.entry(key.clone()).or_insert_with(Vec::new);
     }
     Ok(buckets)
+}
+
+fn edge_query_uses_relations(edge: &RelationEdgePlan) -> bool {
+    edge.query
+        .as_ref()
+        .and_then(|query| query.filter.as_ref())
+        .is_some_and(filter_uses_relations)
+}
+
+fn filter_uses_relations(filter: &BoundFilter) -> bool {
+    match filter {
+        BoundFilter::And(filters) | BoundFilter::Or(filters) => {
+            filters.iter().any(filter_uses_relations)
+        }
+        BoundFilter::Column(_) => false,
+        BoundFilter::Relation(_) => true,
+    }
 }
 
 fn planner_batch_fetch(
@@ -561,7 +588,7 @@ fn planner_batch_fetch(
         )
     })?;
     let query = build_batch_query(table, edge, keys)?;
-    let plan = build_table_query_plan(table_name, table, &query)?;
+    let plan = build_table_query_plan(catalog, table_name, table, &query)?;
     let rows = execute_logical_plan(cache, table_name, plan)?;
 
     let mut buckets = bucket_rows(rows, edge_target_column_index(edge));
@@ -617,6 +644,12 @@ fn indexed_probe_fetch(
                     "reverse indexed probe fetch requires a bound collection query",
                 )
             })?;
+            if query.filter.as_ref().is_some_and(filter_uses_relations) {
+                return Err(GqlError::new(
+                    GqlErrorKind::Unsupported,
+                    "reverse indexed probe fetch cannot evaluate relation filters without planner support",
+                ));
+            }
             let index_name = if store.schema().get_index(&edge.relation.fk_name).is_some() {
                 Some(edge.relation.fk_name.as_str())
             } else {
@@ -669,6 +702,12 @@ fn scan_and_bucket_fetch(
     }
 
     if let Some(query) = edge.query.as_ref() {
+        if query.filter.as_ref().is_some_and(filter_uses_relations) {
+            return Err(GqlError::new(
+                GqlErrorKind::Unsupported,
+                "scan-and-bucket fetch cannot evaluate relation filters without planner support",
+            ));
+        }
         for rows in buckets.values_mut() {
             let materialized = apply_collection_query(core::mem::take(rows), query);
             *rows = materialized;

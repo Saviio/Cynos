@@ -178,14 +178,14 @@ mod tests {
 
     fn object_fields(value: &ResponseValue) -> &[ResponseField] {
         match value {
-            ResponseValue::Object(fields) => fields,
+            ResponseValue::Object(fields) => fields.as_ref(),
             other => panic!("expected object, got {other:?}"),
         }
     }
 
     fn list_items(value: &ResponseValue) -> &[ResponseValue] {
         match value {
-            ResponseValue::List(items) => items,
+            ResponseValue::List(items) => items.as_ref(),
             other => panic!("expected list, got {other:?}"),
         }
     }
@@ -193,13 +193,13 @@ mod tests {
     fn field<'a>(fields: &'a [ResponseField], name: &str) -> &'a ResponseValue {
         fields
             .iter()
-            .find(|field| field.name == name)
+            .find(|field| field.name.as_ref() == name)
             .map(|field| &field.value)
             .unwrap_or_else(|| panic!("missing field `{name}`"))
     }
 
     fn has_field(fields: &[ResponseField], name: &str) -> bool {
-        fields.iter().any(|field| field.name == name)
+        fields.iter().any(|field| field.name.as_ref() == name)
     }
 
     fn int64(value: &ResponseValue) -> i64 {

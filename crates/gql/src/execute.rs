@@ -402,9 +402,12 @@ fn select_collection_rows(
         )
     })?;
 
-    match build_table_query_plan(table_name, table, query) {
+    match build_table_query_plan(catalog, table_name, table, query) {
         Ok(plan) => execute_logical_plan(cache, table_name, plan),
         Err(error) if error.kind() == GqlErrorKind::Unsupported => {
+            if query.filter.as_ref().is_some_and(filter_uses_relations) {
+                return Err(error);
+            }
             select_collection_rows_fallback(cache, table_name, query)
         }
         Err(error) => Err(error),
@@ -658,11 +661,22 @@ fn compare_rows(left: &Row, right: &Row, order_by: &[crate::bind::OrderSpec]) ->
     left.id().cmp(&right.id())
 }
 
+fn filter_uses_relations(filter: &BoundFilter) -> bool {
+    match filter {
+        BoundFilter::And(filters) | BoundFilter::Or(filters) => {
+            filters.iter().any(filter_uses_relations)
+        }
+        BoundFilter::Column(_) => false,
+        BoundFilter::Relation(_) => true,
+    }
+}
+
 fn matches_filter(row: &Row, filter: &BoundFilter) -> bool {
     match filter {
         BoundFilter::And(filters) => filters.iter().all(|filter| matches_filter(row, filter)),
         BoundFilter::Or(filters) => filters.iter().any(|filter| matches_filter(row, filter)),
         BoundFilter::Column(predicate) => matches_column_predicate(row, predicate),
+        BoundFilter::Relation(_) => false,
     }
 }
 

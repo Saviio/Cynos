@@ -52,7 +52,7 @@ const ENGINE_DEFS = {
     notes: [
       'Worker initializes local Cynos WASM tables directly from the same synthetic server dataset and subscribes through generated GraphQL documents.',
       'GraphQL subscriptions can route through the engine’s delta-backed live planner when the query shape allows it, while still presenting full payload snapshots to the benchmark host.',
-      'For the issue feed, the worker precomputes eligible `projectId` values from project/counter/snapshot state, applies them as a root `in(...)` filter, and refreshes the subscription after project-field bursts.',
+      'Issue-feed filters are expressed directly through GraphQL single-valued relation predicates on `project`, `counter`, and `snapshot`, so membership changes can flow through the planner/live runtime instead of a JS-side root-id workaround.',
     ],
   },
   'cynos-query': {

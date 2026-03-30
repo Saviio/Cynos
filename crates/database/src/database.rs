@@ -1761,6 +1761,87 @@ mod tests {
         db
     }
 
+    fn setup_graphql_issue_filter_db() -> Database {
+        let db = Database::new("graphql_issue_filter");
+
+        let projects = db
+            .create_table("projects")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("healthScore", JsDataType::Int32, None);
+        db.register_table(&projects).unwrap();
+
+        let project_counters = db
+            .create_table("projectCounters")
+            .column(
+                "projectId",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("openIssueCount", JsDataType::Int32, None)
+            .foreign_key(
+                "fk_project_counters_project",
+                "projectId",
+                "projects",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("project")
+                        .set_reverse_field_name("counter"),
+                ),
+            );
+        db.register_table(&project_counters).unwrap();
+
+        let project_snapshots = db
+            .create_table("projectSnapshots")
+            .column(
+                "projectId",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("velocity", JsDataType::Int32, None)
+            .foreign_key(
+                "fk_project_snapshots_project",
+                "projectId",
+                "projects",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("project")
+                        .set_reverse_field_name("snapshot"),
+                ),
+            );
+        db.register_table(&project_snapshots).unwrap();
+
+        let issues = db
+            .create_table("issues")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("projectId", JsDataType::Int64, None)
+            .column("title", JsDataType::String, None)
+            .column("status", JsDataType::String, None)
+            .foreign_key(
+                "fk_issues_project",
+                "projectId",
+                "projects",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("project")
+                        .set_reverse_field_name("issues"),
+                ),
+            );
+        db.register_table(&issues).unwrap();
+
+        db
+    }
+
     fn collect_titles(array: &js_sys::Array) -> Vec<String> {
         let mut titles = Vec::with_capacity(array.length() as usize);
         for index in 0..array.length() {
@@ -1773,6 +1854,20 @@ mod tests {
         }
         titles.sort();
         titles
+    }
+
+    fn collect_ids(array: &js_sys::Array, field_name: &str) -> Vec<i64> {
+        let mut ids = Vec::with_capacity(array.length() as usize);
+        for index in 0..array.length() {
+            let item = array.get(index);
+            let id = js_sys::Reflect::get(&item, &JsValue::from_str(field_name))
+                .unwrap()
+                .as_f64()
+                .unwrap() as i64;
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids
     }
 
     fn compile_subscription_engine(db: &Database, query: &str) -> LiveEngineKind {
@@ -2191,6 +2286,16 @@ mod tests {
         let engine = compile_subscription_engine(
             &db,
             "subscription UserCard { usersByPk(pk: { id: 1 }) { id name profile(limit: 1) { id bio } } }",
+        );
+        assert_eq!(engine, LiveEngineKind::Delta);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_graphql_live_selector_chooses_delta_for_relation_filtered_root_subscription() {
+        let db = setup_graphql_issue_filter_db();
+        let engine = compile_subscription_engine(
+            &db,
+            "subscription IssueFeed { issues(where: { AND: [{ status: { eq: \"open\" } }, { project: { AND: [{ healthScore: { gte: 45 } }, { counter: { openIssueCount: { gte: 5 } } }, { snapshot: { velocity: { gte: 18 } } }] } }] }) { id title project { id counter(limit: 1) { openIssueCount } snapshot(limit: 1) { velocity } } } }",
         );
         assert_eq!(engine, LiveEngineKind::Delta);
     }
@@ -2635,6 +2740,86 @@ mod tests {
             .as_string()
             .unwrap();
         assert_eq!(updated_bio, "Updated");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_delta_subscription_tracks_relation_filtered_root_membership() {
+        let db = setup_graphql_issue_filter_db();
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projects")
+            .unwrap()
+            .insert(Row::new(1, alloc::vec![Value::Int64(1), Value::Int32(30)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projectCounters")
+            .unwrap()
+            .insert(Row::new(10, alloc::vec![Value::Int64(1), Value::Int32(6)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projectSnapshots")
+            .unwrap()
+            .insert(Row::new(11, alloc::vec![Value::Int64(1), Value::Int32(20)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("issues")
+            .unwrap()
+            .insert(Row::new(
+                100,
+                alloc::vec![
+                    Value::Int64(100),
+                    Value::Int64(1),
+                    Value::String("Issue".into()),
+                    Value::String("open".into()),
+                ],
+            ))
+            .unwrap();
+
+        let query = "subscription IssueFeed { issues(where: { AND: [{ status: { eq: \"open\" } }, { project: { AND: [{ healthScore: { gte: 45 } }, { counter: { openIssueCount: { gte: 5 } } }, { snapshot: { velocity: { gte: 18 } } }] } }] }) { id title project { id counter(limit: 1) { openIssueCount } snapshot(limit: 1) { velocity } } } }";
+        assert_eq!(compile_subscription_engine(&db, query), LiveEngineKind::Delta);
+
+        let subscription = db.subscribe_graphql(query, None, None).unwrap();
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(initial_issues.length(), 0);
+
+        db.graphql(
+            "mutation { updateProjects(where: { id: { eq: 1 } }, set: { healthScore: 50 }) { id } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let inserted = subscription.get_result();
+        let inserted_data = js_sys::Reflect::get(&inserted, &JsValue::from_str("data")).unwrap();
+        let inserted_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&inserted_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(collect_ids(&inserted_issues, "id"), vec![100]);
+
+        db.graphql(
+            "mutation { updateProjectSnapshots(where: { projectId: { eq: 1 } }, set: { velocity: 5 }) { projectId } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let removed = subscription.get_result();
+        let removed_data = js_sys::Reflect::get(&removed, &JsValue::from_str("data")).unwrap();
+        let removed_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&removed_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(removed_issues.length(), 0);
     }
 
     #[wasm_bindgen_test]

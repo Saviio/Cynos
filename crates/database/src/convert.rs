@@ -4,7 +4,7 @@
 //! internal types (Value, Row, etc.).
 
 use alloc::collections::BTreeMap;
-use alloc::rc::Rc;
+use alloc::rc::{Rc, Weak};
 use alloc::string::String;
 use alloc::vec::Vec;
 use cynos_core::schema::Table;
@@ -13,6 +13,34 @@ use hashbrown::HashMap;
 use wasm_bindgen::prelude::*;
 
 type JsonbJsCache = HashMap<Vec<u8>, JsValue>;
+type GraphqlFieldKeyCache = HashMap<Rc<str>, JsValue>;
+type GraphqlObjectJsCache =
+    HashMap<*const [cynos_gql::ResponseField], GraphqlSharedJsCacheEntry<cynos_gql::ResponseField>>;
+type GraphqlListJsCache =
+    HashMap<*const [cynos_gql::ResponseValue], GraphqlSharedJsCacheEntry<cynos_gql::ResponseValue>>;
+
+struct GraphqlSharedJsCacheEntry<T> {
+    weak: Weak<[T]>,
+    value: JsValue,
+}
+
+#[derive(Default)]
+pub(crate) struct GraphqlJsEncodeCache {
+    jsonb_cache: JsonbJsCache,
+    field_key_cache: GraphqlFieldKeyCache,
+    object_cache: GraphqlObjectJsCache,
+    list_cache: GraphqlListJsCache,
+}
+
+impl GraphqlJsEncodeCache {
+    fn maybe_prune(&mut self) {
+        const MAX_SHARED_JS_CACHE_ENTRIES: usize = 65_536;
+        if self.object_cache.len() + self.list_cache.len() > MAX_SHARED_JS_CACHE_ENTRIES {
+            self.object_cache.clear();
+            self.list_cache.clear();
+        }
+    }
+}
 
 /// Converts a JavaScript value to an Cynos Value.
 ///
@@ -368,8 +396,16 @@ pub fn js_to_gql_variables(js: Option<&JsValue>) -> Result<cynos_gql::VariableVa
 
 /// Converts a GraphQL execution response into the standard `{ data }` object shape.
 pub fn gql_response_to_js(response: &cynos_gql::GraphqlResponse) -> Result<JsValue, JsValue> {
+    let mut cache = GraphqlJsEncodeCache::default();
+    gql_response_to_js_with_cache(response, &mut cache)
+}
+
+pub(crate) fn gql_response_to_js_with_cache(
+    response: &cynos_gql::GraphqlResponse,
+    cache: &mut GraphqlJsEncodeCache,
+) -> Result<JsValue, JsValue> {
     let obj = js_sys::Object::new();
-    let data = gql_value_to_js(&response.data);
+    let data = gql_value_to_js_with_cache(&response.data, cache);
     js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &data)?;
     Ok(obj.into())
 }
@@ -451,28 +487,70 @@ fn js_to_gql_input_value(js: &JsValue) -> Result<cynos_gql::InputValue, JsValue>
     Err(JsValue::from_str("Unsupported GraphQL input value"))
 }
 
-fn gql_value_to_js(value: &cynos_gql::ResponseValue) -> JsValue {
+fn gql_value_to_js_with_cache(
+    value: &cynos_gql::ResponseValue,
+    cache: &mut GraphqlJsEncodeCache,
+) -> JsValue {
     match value {
         cynos_gql::ResponseValue::Null => JsValue::NULL,
-        cynos_gql::ResponseValue::Scalar(value) => value_to_js(value),
+        cynos_gql::ResponseValue::Scalar(value) => value_to_js_with_cache(value, &mut cache.jsonb_cache),
         cynos_gql::ResponseValue::List(values) => {
+            let cache_key = Rc::as_ptr(values);
+            if let Some(cached) = cache.list_cache.get(&cache_key) {
+                if let Some(shared) = cached.weak.upgrade() {
+                    if Rc::ptr_eq(&shared, values) {
+                        return cached.value.clone();
+                    }
+                }
+            }
             let array = js_sys::Array::new_with_length(values.len() as u32);
             for (index, value) in values.iter().enumerate() {
-                array.set(index as u32, gql_value_to_js(value));
+                array.set(index as u32, gql_value_to_js_with_cache(value, cache));
             }
-            array.into()
+            let js_value: JsValue = array.into();
+            cache.list_cache.insert(
+                cache_key,
+                GraphqlSharedJsCacheEntry {
+                    weak: Rc::downgrade(values),
+                    value: js_value.clone(),
+                },
+            );
+            cache.maybe_prune();
+            js_value
         }
         cynos_gql::ResponseValue::Object(fields) => {
+            let cache_key = Rc::as_ptr(fields);
+            if let Some(cached) = cache.object_cache.get(&cache_key) {
+                if let Some(shared) = cached.weak.upgrade() {
+                    if Rc::ptr_eq(&shared, fields) {
+                        return cached.value.clone();
+                    }
+                }
+            }
             let object = js_sys::Object::new();
-            for field in fields {
+            for field in fields.as_ref() {
+                let key = cache
+                    .field_key_cache
+                    .entry(field.name.clone())
+                    .or_insert_with(|| JsValue::from_str(field.name.as_ref()))
+                    .clone();
                 js_sys::Reflect::set(
                     &object,
-                    &JsValue::from_str(&field.name),
-                    &gql_value_to_js(&field.value),
+                    &key,
+                    &gql_value_to_js_with_cache(&field.value, cache),
                 )
                 .ok();
             }
-            object.into()
+            let js_value: JsValue = object.into();
+            cache.object_cache.insert(
+                cache_key,
+                GraphqlSharedJsCacheEntry {
+                    weak: Rc::downgrade(fields),
+                    value: js_value.clone(),
+                },
+            );
+            cache.maybe_prune();
+            js_value
         }
     }
 }
