@@ -7,6 +7,7 @@
 use crate::dataflow::node::JoinType;
 use crate::dataflow::{AggregateType, ColumnId, DataflowNode, JoinKeySpec, TableId};
 use crate::delta::Delta;
+use crate::operators::{filter_incremental, map_incremental, project_incremental};
 use crate::trace::{TraceDeltaBatch, TraceTupleArena, TraceTupleHandle, VisibleResultStore};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -3286,8 +3287,27 @@ impl MaterializedView {
         deltas: Vec<Delta<Row>>,
         now_fn: Option<fn() -> f64>,
     ) -> (Vec<Delta<Row>>, TraceUpdateProfile) {
-        let (batch, profile) = self.on_table_change_batch_profiled(table_id, deltas, now_fn);
-        (batch.materialize_rows(), profile)
+        if !self.depends_on(table_id) {
+            return (Vec::new(), TraceUpdateProfile::default());
+        }
+
+        let mut profile = TraceUpdateProfile::default();
+        let output_deltas = propagate_row_deltas(
+            &self.dataflow,
+            &self.compiled_plan.node,
+            &mut self.join_states,
+            &mut self.aggregate_states,
+            table_id,
+            deltas,
+            now_fn,
+            &mut profile,
+        );
+
+        timed_block(now_fn, &mut profile.result_apply_ms, || {
+            self.visible_rows.apply_rows(&output_deltas);
+        });
+
+        (output_deltas, profile)
     }
 
     pub fn on_table_change_batch(
@@ -3337,6 +3357,227 @@ impl MaterializedView {
 
     pub fn set_result_rc(&mut self, rows: Vec<Rc<Row>>) {
         self.visible_rows.replace_rc_rows(rows);
+    }
+}
+
+fn propagate_row_deltas(
+    node: &DataflowNode,
+    meta: &CompiledIvmNode,
+    join_states: &mut HashMap<usize, JoinState>,
+    aggregate_states: &mut HashMap<usize, GroupAggregateState>,
+    source_table: TableId,
+    deltas: Vec<Delta<Row>>,
+    now_fn: Option<fn() -> f64>,
+    profile: &mut TraceUpdateProfile,
+) -> Vec<Delta<Row>> {
+    match (node, &meta.kind) {
+        (DataflowNode::Source { table_id }, CompiledIvmNodeKind::Source) => {
+            if *table_id == source_table {
+                deltas
+            } else {
+                Vec::new()
+            }
+        }
+        (
+            DataflowNode::Filter { input, predicate, .. },
+            CompiledIvmNodeKind::Filter { input: input_meta },
+        ) => {
+            let input_deltas = propagate_row_deltas(
+                input,
+                input_meta,
+                join_states,
+                aggregate_states,
+                source_table,
+                deltas,
+                now_fn,
+                profile,
+            );
+            let mut output = Vec::new();
+            timed_block(now_fn, &mut profile.unary_execute_ms, || {
+                output = filter_incremental(&input_deltas, |row| predicate(row));
+            });
+            output
+        }
+        (
+            DataflowNode::Project { input, columns },
+            CompiledIvmNodeKind::Project { input: input_meta, .. },
+        ) => {
+            let input_deltas = propagate_row_deltas(
+                input,
+                input_meta,
+                join_states,
+                aggregate_states,
+                source_table,
+                deltas,
+                now_fn,
+                profile,
+            );
+            let mut output = Vec::new();
+            timed_block(now_fn, &mut profile.unary_execute_ms, || {
+                output = project_incremental(&input_deltas, columns);
+            });
+            output
+        }
+        (
+            DataflowNode::Map { input, mapper, .. },
+            CompiledIvmNodeKind::Map { input: input_meta },
+        ) => {
+            let input_deltas = propagate_row_deltas(
+                input,
+                input_meta,
+                join_states,
+                aggregate_states,
+                source_table,
+                deltas,
+                now_fn,
+                profile,
+            );
+            let mut output = Vec::new();
+            timed_block(now_fn, &mut profile.unary_execute_ms, || {
+                output = map_incremental(&input_deltas, |row| mapper(row));
+            });
+            output
+        }
+        (
+            DataflowNode::Join {
+                left,
+                right,
+                left_key,
+                right_key,
+                join_type,
+                left_width,
+                right_width,
+            },
+            CompiledIvmNodeKind::Join {
+                state_id,
+                left: left_meta,
+                right: right_meta,
+            },
+        ) => {
+            if !join_states.contains_key(state_id) {
+                join_states.insert(
+                    *state_id,
+                    JoinState::with_col_counts(*left_width, *right_width),
+                );
+            }
+
+            let is_left_side = left_meta.depends_on(source_table);
+            let is_right_side = right_meta.depends_on(source_table);
+
+            let left_deltas = if is_left_side {
+                propagate_row_deltas(
+                    left,
+                    left_meta,
+                    join_states,
+                    aggregate_states,
+                    source_table,
+                    deltas.clone(),
+                    now_fn,
+                    profile,
+                )
+            } else {
+                Vec::new()
+            };
+
+            let right_deltas = if is_right_side {
+                propagate_row_deltas(
+                    right,
+                    right_meta,
+                    join_states,
+                    aggregate_states,
+                    source_table,
+                    deltas,
+                    now_fn,
+                    profile,
+                )
+            } else {
+                Vec::new()
+            };
+
+            let mut output_deltas = Vec::new();
+            timed_block(now_fn, &mut profile.join_execute_ms, || {
+                let join_state = join_states
+                    .get_mut(state_id)
+                    .expect("join state should exist after initialization");
+                let arena = TraceTupleArena;
+                let left_trace = left_deltas
+                    .into_iter()
+                    .map(|delta| Delta::new(arena.owned(delta.data), delta.diff))
+                    .collect::<Vec<_>>();
+                let right_trace = right_deltas
+                    .into_iter()
+                    .map(|delta| Delta::new(arena.owned(delta.data), delta.diff))
+                    .collect::<Vec<_>>();
+                let mut trace_output = Vec::new();
+
+                process_left_join_trace_deltas(
+                    join_state,
+                    left_key,
+                    *join_type,
+                    &arena,
+                    &left_trace,
+                    &mut trace_output,
+                );
+                process_right_join_trace_deltas(
+                    join_state,
+                    right_key,
+                    *join_type,
+                    &arena,
+                    &right_trace,
+                    &mut trace_output,
+                );
+
+                output_deltas = trace_output
+                    .into_iter()
+                    .map(|delta| Delta::new(arena.materialize_row(&delta.data), delta.diff))
+                    .collect();
+            });
+
+            output_deltas
+        }
+        (
+            DataflowNode::Aggregate {
+                input,
+                group_by,
+                functions,
+            },
+            CompiledIvmNodeKind::Aggregate {
+                state_id,
+                input: input_meta,
+            },
+        ) => {
+            let input_deltas = propagate_row_deltas(
+                input,
+                input_meta,
+                join_states,
+                aggregate_states,
+                source_table,
+                deltas,
+                now_fn,
+                profile,
+            );
+
+            if input_deltas.is_empty() {
+                return Vec::new();
+            }
+
+            if !aggregate_states.contains_key(state_id) {
+                aggregate_states.insert(
+                    *state_id,
+                    GroupAggregateState::new(group_by.clone(), functions.clone()),
+                );
+            }
+
+            let mut output = Vec::new();
+            timed_block(now_fn, &mut profile.aggregate_execute_ms, || {
+                output = aggregate_states
+                    .get_mut(state_id)
+                    .expect("aggregate state should exist after initialization")
+                    .process_deltas(&input_deltas);
+            });
+            output
+        }
+        _ => Vec::new(),
     }
 }
 

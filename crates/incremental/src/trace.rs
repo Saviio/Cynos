@@ -362,6 +362,16 @@ impl VisibleResultStore {
         }
     }
 
+    pub fn apply_rows(&mut self, deltas: &[Delta<Row>]) {
+        for delta in deltas {
+            if delta.is_insert() {
+                self.upsert_rc(Rc::new(delta.data.clone()));
+            } else if delta.is_delete() {
+                self.remove(delta.data.id());
+            }
+        }
+    }
+
     pub fn replace_rows(&mut self, rows: Vec<Row>) {
         self.clear();
         for row in rows {
