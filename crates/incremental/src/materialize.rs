@@ -1065,7 +1065,7 @@ struct CompiledIvmNode {
 
 pub struct CompiledIvmPlan {
     node: CompiledIvmNode,
-    program: CompiledTraceProgram,
+    program: Option<CompiledTraceProgram>,
 }
 
 type TraceSlotId = usize;
@@ -1309,25 +1309,25 @@ enum CompiledIvmNodeKind {
 
 impl CompiledIvmPlan {
     pub fn compile(node: &DataflowNode) -> Self {
-        let mut next_trace_node_index = 0usize;
-        let mut next_trace_slot = 0usize;
-        let mut trace_instructions = Vec::new();
-        let root_slot = compile_trace_program_node(
-            node,
-            0,
-            &mut next_trace_node_index,
-            &mut next_trace_slot,
-            &mut trace_instructions,
-        );
         Self {
             node: compile_ivm_node(node, 0),
-            program: CompiledTraceProgram {
-                instructions: trace_instructions.into_boxed_slice(),
-                slot_count: next_trace_slot,
-                root_slot,
-                scratch_slots: vec![Vec::new(); next_trace_slot],
-            },
+            program: None,
         }
+    }
+
+    pub fn compile_with_trace_program(node: &DataflowNode) -> Self {
+        let mut plan = Self::compile(node);
+        plan.ensure_trace_program(node);
+        plan
+    }
+
+    fn ensure_trace_program(&mut self, node: &DataflowNode) -> &mut CompiledTraceProgram {
+        self.program.get_or_insert_with(|| compile_trace_program(node))
+    }
+
+    #[cfg(test)]
+    fn trace_program(&self) -> Option<&CompiledTraceProgram> {
+        self.program.as_ref()
     }
 
     #[inline]
@@ -1338,6 +1338,25 @@ impl CompiledIvmPlan {
     #[inline]
     pub fn depends_on(&self, table_id: TableId) -> bool {
         self.node.sources.binary_search(&table_id).is_ok()
+    }
+}
+
+fn compile_trace_program(node: &DataflowNode) -> CompiledTraceProgram {
+    let mut next_trace_node_index = 0usize;
+    let mut next_trace_slot = 0usize;
+    let mut trace_instructions = Vec::new();
+    let root_slot = compile_trace_program_node(
+        node,
+        0,
+        &mut next_trace_node_index,
+        &mut next_trace_slot,
+        &mut trace_instructions,
+    );
+    CompiledTraceProgram {
+        instructions: trace_instructions.into_boxed_slice(),
+        slot_count: next_trace_slot,
+        root_slot,
+        scratch_slots: vec![Vec::new(); next_trace_slot],
     }
 }
 
@@ -2975,11 +2994,7 @@ impl MaterializedView {
         compiled_plan: CompiledIvmPlan,
         initial: Vec<Row>,
     ) -> Self {
-        Self::with_compiled_initial_rc(
-            dataflow,
-            compiled_plan,
-            initial.into_iter().map(Rc::new).collect(),
-        )
+        Self::with_compiled_initial_rows_only(dataflow, compiled_plan, initial)
     }
 
     pub fn with_compiled_initial_rc(
@@ -3004,6 +3019,22 @@ impl MaterializedView {
             dataflow,
             compiled_plan,
             visible_rows: VisibleResultStore::from_rc_rows(initial),
+            dependencies,
+            join_states: HashMap::new(),
+            aggregate_states: HashMap::new(),
+        }
+    }
+
+    fn with_compiled_initial_rows_only(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        initial: Vec<Row>,
+    ) -> Self {
+        let dependencies = compiled_plan.sources().to_vec();
+        Self {
+            dataflow,
+            compiled_plan,
+            visible_rows: VisibleResultStore::from_rows(initial),
             dependencies,
             join_states: HashMap::new(),
             aggregate_states: HashMap::new(),
@@ -3330,9 +3361,10 @@ impl MaterializedView {
         }
 
         let input_batch = TraceDeltaBatch::from_row_deltas(deltas);
+        let program = self.compiled_plan.ensure_trace_program(&self.dataflow);
         let (output_deltas, mut profile) = execute_compiled_trace_program(
             &self.dataflow,
-            &mut self.compiled_plan.program,
+            program,
             &mut self.join_states,
             &mut self.aggregate_states,
             table_id,
@@ -4091,7 +4123,8 @@ mod tests {
     }
 
     fn unary_block_op_counts(plan: &CompiledIvmPlan) -> Vec<usize> {
-        plan.program
+        plan.trace_program()
+            .expect("trace program should be compiled for unary block tests")
             .instructions
             .iter()
             .filter_map(|instruction| match instruction {
@@ -4759,19 +4792,19 @@ mod tests {
 
     #[test]
     fn test_compiled_trace_program_fuses_filter_project_trace_map_chain() {
-        let plan = CompiledIvmPlan::compile(&make_trace_unary_fusion_dataflow());
+        let plan = CompiledIvmPlan::compile_with_trace_program(&make_trace_unary_fusion_dataflow());
         assert_eq!(unary_block_op_counts(&plan), vec![3]);
     }
 
     #[test]
     fn test_compiled_trace_program_fuses_consecutive_filters_and_projects() {
-        let plan = CompiledIvmPlan::compile(&make_trace_filter_project_chain());
+        let plan = CompiledIvmPlan::compile_with_trace_program(&make_trace_filter_project_chain());
         assert_eq!(unary_block_op_counts(&plan), vec![4]);
     }
 
     #[test]
     fn test_compiled_trace_program_keeps_dynamic_map_barrier_split() {
-        let plan = CompiledIvmPlan::compile(&make_dynamic_map_barrier_chain());
+        let plan = CompiledIvmPlan::compile_with_trace_program(&make_dynamic_map_barrier_chain());
         assert_eq!(unary_block_op_counts(&plan), vec![2, 1]);
     }
 

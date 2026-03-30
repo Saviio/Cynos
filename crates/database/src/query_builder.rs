@@ -2374,7 +2374,7 @@ impl SelectBuilder {
         trace_init_profile.compile_to_dataflow_ms = now_ms() - compile_to_dataflow_started_at;
 
         let compile_trace_program_started_at = now_ms();
-        let compiled_ivm_plan = CompiledIvmPlan::compile(&compile_result.dataflow);
+        let compiled_ivm_plan = CompiledIvmPlan::compile_with_trace_program(&compile_result.dataflow);
         let compile_ivm_finished_at = now_ms();
         trace_init_profile.compile_ivm_plan_ms =
             compile_ivm_finished_at - compile_trace_program_started_at;

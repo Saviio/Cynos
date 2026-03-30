@@ -374,15 +374,32 @@ impl VisibleResultStore {
 
     pub fn replace_rows(&mut self, rows: Vec<Row>) {
         self.clear();
+        self.slots.reserve(rows.len());
+        self.row_to_slot.reserve(rows.len());
         for row in rows {
-            self.upsert_rc(Rc::new(row));
+            let row = Rc::new(row);
+            if let Some(slot_id) = self.row_to_slot.get(&row.id()).copied() {
+                self.slots[slot_id] = Some(row);
+            } else {
+                let slot_id = self.slots.len();
+                self.slots.push(Some(row.clone()));
+                self.row_to_slot.insert(row.id(), slot_id);
+            }
         }
     }
 
     pub fn replace_rc_rows(&mut self, rows: Vec<Rc<Row>>) {
         self.clear();
+        self.slots.reserve(rows.len());
+        self.row_to_slot.reserve(rows.len());
         for row in rows {
-            self.upsert_rc(row);
+            if let Some(slot_id) = self.row_to_slot.get(&row.id()).copied() {
+                self.slots[slot_id] = Some(row);
+            } else {
+                let slot_id = self.slots.len();
+                self.slots.push(Some(row.clone()));
+                self.row_to_slot.insert(row.id(), slot_id);
+            }
         }
     }
 
