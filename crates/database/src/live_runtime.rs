@@ -1266,7 +1266,11 @@ impl LiveRegistry {
         }
     }
 
-    fn flush_snapshot_lane(&self, changes: HashMap<TableId, HashSet<u64>>) {
+    fn flush_snapshot_lane(
+        &self,
+        changes: HashMap<TableId, HashSet<u64>>,
+        delta_changes: &HashMap<TableId, Vec<Delta<Row>>>,
+    ) {
         let started_at = now_ms();
         let mut profile = SnapshotFlushProfile {
             changed_table_count: changes.len(),
@@ -1316,7 +1320,9 @@ impl LiveRegistry {
 
         for (_, (query, changes)) in merged_rows {
             let query_started_at = now_ms();
-            let sample = query.borrow_mut().on_change_profiled(&changes);
+            let sample = query
+                .borrow_mut()
+                .on_change_with_deltas_profiled(&changes, delta_changes);
             profile.rows_query_on_change_ms += now_ms() - query_started_at;
             profile.record_rows_query(&sample);
         }
@@ -1324,9 +1330,11 @@ impl LiveRegistry {
         for (_, (query, changes)) in merged_graphql {
             let query_started_at = now_ms();
             #[cfg(feature = "benchmark")]
-            let sample = query.borrow_mut().on_change_profiled(&changes);
+            let sample = query
+                .borrow_mut()
+                .on_change_with_deltas_profiled(&changes, delta_changes);
             #[cfg(not(feature = "benchmark"))]
-            query.borrow_mut().on_change(&changes);
+            query.borrow_mut().on_change_with_deltas(&changes, delta_changes);
             profile.graphql_query_count += 1;
             profile.graphql_query_on_change_ms += now_ms() - query_started_at;
             #[cfg(feature = "benchmark")]
@@ -1459,7 +1467,7 @@ impl LiveRegistry {
                         {
                             let registry = self_ref_clone.borrow();
                             registry.flush_delta_lane(&delta_changes);
-                            registry.flush_snapshot_lane(changes);
+                            registry.flush_snapshot_lane(changes, &delta_changes);
                         }
 
                         {
@@ -1492,7 +1500,7 @@ impl LiveRegistry {
 
         let changes: HashMap<TableId, HashSet<u64>> =
             self.pending_changes.borrow_mut().drain().collect();
-        self.flush_snapshot_lane(changes);
+        self.flush_snapshot_lane(changes, &delta_changes);
 
         self.gc_dead_queries();
     }
@@ -1507,7 +1515,7 @@ impl LiveRegistry {
 
         let changes: HashMap<TableId, HashSet<u64>> =
             self.pending_changes.borrow_mut().drain().collect();
-        self.flush_snapshot_lane(changes);
+        self.flush_snapshot_lane(changes, &delta_changes);
 
         self.gc_dead_queries();
     }

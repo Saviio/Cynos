@@ -500,6 +500,27 @@ fn collect_join_values_by_row_ids(
     });
 }
 
+fn collect_join_values_by_row_ids_and_deltas(
+    store: &RowStore,
+    row_ids: &[u64],
+    deltas: Option<&Vec<Delta<Row>>>,
+    column_index: usize,
+    join_values: &mut HashSet<Value>,
+) {
+    collect_join_values_by_row_ids(store, row_ids, column_index, join_values);
+    let Some(deltas) = deltas else {
+        return;
+    };
+
+    for delta in deltas {
+        if let Some(value) = delta.data().get(column_index) {
+            if !value.is_null() {
+                join_values.insert(value.clone());
+            }
+        }
+    }
+}
+
 fn resolve_root_row_id_for_output_row(
     cache: &TableCache,
     metadata: &RowsSnapshotPartialRefreshMetadata,
@@ -900,12 +921,29 @@ impl ReQueryObservable {
     /// only when the underlying patch table changed; all other plans fall back
     /// to deterministic full-result comparison.
     pub fn on_change(&mut self, changes: &HashMap<TableId, HashSet<u64>>) {
-        let _ = self.on_change_profiled(changes);
+        let _ = self.on_change_profiled_inner(changes, None);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn on_change_profiled(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
+    ) -> SnapshotQueryProfile {
+        self.on_change_profiled_inner(changes, None)
+    }
+
+    pub(crate) fn on_change_with_deltas_profiled(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: &HashMap<TableId, Vec<Delta<Row>>>,
+    ) -> SnapshotQueryProfile {
+        self.on_change_profiled_inner(changes, Some(delta_changes))
+    }
+
+    fn on_change_profiled_inner(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
     ) -> SnapshotQueryProfile {
         let started_at = now_ms();
         let mut profile = SnapshotQueryProfile::default();
@@ -948,7 +986,9 @@ impl ReQueryObservable {
             }
         }
 
-        if let Some(changed) = self.try_partial_refresh_profiled(changes, &mut profile) {
+        if let Some(changed) =
+            self.try_partial_refresh_profiled(changes, delta_changes, &mut profile)
+        {
             if changed {
                 let callback_started_at = now_ms();
                 for (_, callback) in &self.subscriptions {
@@ -960,7 +1000,9 @@ impl ReQueryObservable {
             return profile;
         }
 
-        if let Some(changed) = self.try_root_subset_refresh_profiled(changes, &mut profile) {
+        if let Some(changed) =
+            self.try_root_subset_refresh_profiled(changes, delta_changes, &mut profile)
+        {
             if changed {
                 let callback_started_at = now_ms();
                 for (_, callback) in &self.subscriptions {
@@ -1075,6 +1117,7 @@ impl ReQueryObservable {
     fn try_partial_refresh_profiled(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
         profile: &mut SnapshotQueryProfile,
     ) -> Option<bool> {
         profile.partial_refresh_attempted = self.partial_refresh.is_some();
@@ -1084,6 +1127,7 @@ impl ReQueryObservable {
             let affected_root_ids = Self::collect_affected_root_row_ids(
                 &self.cache,
                 changes,
+                delta_changes,
                 &partial_refresh.metadata.dependency_graph,
             )?;
             if affected_root_ids.is_empty() {
@@ -1167,6 +1211,7 @@ impl ReQueryObservable {
     fn try_root_subset_refresh_profiled(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
         profile: &mut SnapshotQueryProfile,
     ) -> Option<bool> {
         profile.root_subset_attempted = self.root_subset_refresh.is_some();
@@ -1176,6 +1221,7 @@ impl ReQueryObservable {
             let affected_root_ids = Self::collect_affected_root_row_ids(
                 &self.cache,
                 changes,
+                delta_changes,
                 &root_subset_refresh.metadata.dependency_graph,
             )?;
             if affected_root_ids.is_empty() {
@@ -1239,6 +1285,7 @@ impl ReQueryObservable {
     fn collect_affected_root_row_ids(
         cache_ref: &Rc<RefCell<TableCache>>,
         changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
         dependency_graph: &RowsSnapshotDependencyGraph,
     ) -> Option<HashSet<u64>> {
         let cache = cache_ref.borrow();
@@ -1272,16 +1319,19 @@ impl ReQueryObservable {
                 continue;
             };
             let store = cache.get_table(table_name)?;
+            let table_deltas = delta_changes.and_then(|changes| changes.get(&table_id));
             if table_id != dependency_graph.root_table_id
                 && store.count_existing_rows_by_ids(&dirty_row_ids) != dirty_row_ids.len()
+                && table_deltas.is_none_or(Vec::is_empty)
             {
                 return None;
             }
 
             for edge in dependency_graph.edges_from(table_id) {
-                collect_join_values_by_row_ids(
+                collect_join_values_by_row_ids_and_deltas(
                     store,
                     &dirty_row_ids,
+                    table_deltas,
                     edge.source_column_index,
                     &mut join_values,
                 );
@@ -1448,6 +1498,7 @@ impl GraphqlSubscriptionObservable {
     pub fn on_change(&mut self, changes: &HashMap<TableId, HashSet<u64>>) {
         self.on_change_inner(
             changes,
+            None,
             #[cfg(feature = "benchmark")]
             None,
         );
@@ -1459,13 +1510,38 @@ impl GraphqlSubscriptionObservable {
         changes: &HashMap<TableId, HashSet<u64>>,
     ) -> GraphqlSnapshotQueryProfile {
         let mut profile = GraphqlSnapshotQueryProfile::default();
-        self.on_change_inner(changes, Some(&mut profile));
+        self.on_change_inner(changes, None, Some(&mut profile));
+        profile
+    }
+
+    pub(crate) fn on_change_with_deltas(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: &HashMap<TableId, Vec<Delta<Row>>>,
+    ) {
+        self.on_change_inner(
+            changes,
+            Some(delta_changes),
+            #[cfg(feature = "benchmark")]
+            None,
+        );
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub(crate) fn on_change_with_deltas_profiled(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: &HashMap<TableId, Vec<Delta<Row>>>,
+    ) -> GraphqlSnapshotQueryProfile {
+        let mut profile = GraphqlSnapshotQueryProfile::default();
+        self.on_change_inner(changes, Some(delta_changes), Some(&mut profile));
         profile
     }
 
     fn on_change_inner(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
         #[cfg(feature = "benchmark")] mut profile: Option<&mut GraphqlSnapshotQueryProfile>,
     ) {
         if self.subscribers.total_count() == 0 {
@@ -1488,7 +1564,8 @@ impl GraphqlSubscriptionObservable {
         if should_refresh_roots {
             #[cfg(feature = "benchmark")]
             let refresh_started_at = now_ms();
-            let refresh_outcome = match self.refresh_root_rows(changes, &root_changed_ids) {
+            let refresh_outcome =
+                match self.refresh_root_rows(changes, delta_changes, &root_changed_ids) {
                 Some(outcome) => outcome,
                 None => return,
             };
@@ -1564,6 +1641,7 @@ impl GraphqlSubscriptionObservable {
     fn refresh_root_rows(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
         changed_ids: &HashSet<u64>,
     ) -> Option<SnapshotRootRefreshOutcome> {
         let only_root_table_changes = !changes.is_empty()
@@ -1594,7 +1672,7 @@ impl GraphqlSubscriptionObservable {
             }
         }
 
-        if let Some(outcome) = self.try_root_subset_refresh(changes) {
+        if let Some(outcome) = self.try_root_subset_refresh(changes, delta_changes) {
             return Some(outcome);
         }
 
@@ -1624,12 +1702,14 @@ impl GraphqlSubscriptionObservable {
     fn try_root_subset_refresh(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
     ) -> Option<SnapshotRootRefreshOutcome> {
         let (affected_root_ids, affected_root_keys) = {
             let root_subset_refresh = self.root_subset_refresh.as_mut()?;
             let affected_root_ids = ReQueryObservable::collect_affected_root_row_ids(
                 &self.cache,
                 changes,
+                delta_changes,
                 &root_subset_refresh.metadata.dependency_graph,
             )?;
             if affected_root_ids.is_empty() {
@@ -3709,6 +3789,26 @@ mod tests {
             .find(|row| row.get(0) == Some(&Value::Int64(3)))
             .expect("issue 3 should still be visible");
         assert_eq!(updated_row.get(3), Some(&Value::Int64(300)));
+    }
+
+    #[test]
+    fn test_root_subset_refresh_keeps_fast_path_for_deleted_intermediate_rows() {
+        let (cache, mut observable) = root_subset_test_observable();
+        observable.subscribe(|_| {});
+
+        let project_delete = {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("projects").unwrap();
+            store.delete_with_delta(3).unwrap()
+        };
+
+        let changes = HashMap::from([(2, HashSet::from([3u64]))]);
+        let deltas = HashMap::from([(2, alloc::vec![project_delete])]);
+        let profile = observable.on_change_with_deltas_profiled(&changes, &deltas);
+
+        assert_eq!(profile.refresh_mode, SnapshotRefreshMode::RootSubsetRefresh);
+        assert!(profile.root_subset_hit);
+        assert_eq!(visible_issue_ids(&observable), alloc::vec![1, 2, 4, 5]);
     }
 
     #[test]
