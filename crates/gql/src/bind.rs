@@ -188,14 +188,24 @@ fn is_delta_capable_field(field: &BoundField) -> bool {
         BoundField::Typename { .. } | BoundField::Column { .. } => true,
         BoundField::ForwardRelation { selection, .. } => is_delta_capable_selection(selection),
         BoundField::ReverseRelation {
+            relation,
             query, selection, ..
-        } => {
-            query.order_by.is_empty()
-                && query.limit.is_none()
-                && query.offset == 0
-                && is_delta_capable_selection(selection)
-        }
+        } => reverse_relation_query_is_delta_capable(relation, query)
+            && is_delta_capable_selection(selection),
     }
+}
+
+fn reverse_relation_query_is_delta_capable(
+    relation: &RelationMeta,
+    query: &BoundCollectionQuery,
+) -> bool {
+    query.order_by.is_empty()
+        && query.offset == 0
+        && match query.limit {
+            None => true,
+            Some(1) => relation.child_column_unique,
+            Some(_) => false,
+        }
 }
 
 fn collect_root_field_dependency_tables(

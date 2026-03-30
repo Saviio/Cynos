@@ -39,6 +39,26 @@ function createGraphqlDb(): Database {
   return db;
 }
 
+function createGraphqlUniqueProfileDb(): Database {
+  const db = createGraphqlDb();
+
+  const profiles = db
+    .createTable('profiles')
+    .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+    .column('user_id', JsDataType.Int64, new ColumnOptions().setUnique(true))
+    .column('bio', JsDataType.String, null)
+    .foreignKey(
+      'fk_profiles_user',
+      'user_id',
+      'users',
+      'id',
+      new ForeignKeyOptions().fieldName('user').reverseFieldName('profile')
+    );
+  db.registerTable(profiles);
+
+  return db;
+}
+
 async function flushGraphqlReactivity(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
@@ -287,6 +307,71 @@ describe('GraphQL', () => {
     ]);
 
     unsubscribe();
+  });
+
+  it('keeps unique reverse relation limit(1) subscriptions live without snapshot fallback semantics', async () => {
+    const db = createGraphqlUniqueProfileDb();
+
+    await db.insert('users').values([
+      { id: 1, name: 'Alice' },
+    ]).exec();
+
+    const subscription = db.subscribeGraphql(`
+      subscription UserCard {
+        usersByPk(pk: { id: 1 }) {
+          id
+          name
+          profile(limit: 1) {
+            id
+            bio
+          }
+        }
+      }
+    `);
+
+    expect(dataOf(subscription.getResult())).toEqual({
+      usersByPk: {
+        id: 1,
+        name: 'Alice',
+        profile: [],
+      },
+    });
+
+    db.graphql(`
+      mutation {
+        insertProfiles(input: [{ id: 10, user_id: 1, bio: "First" }]) {
+          id
+          bio
+        }
+      }
+    `);
+
+    await flushGraphqlReactivity();
+    expect(dataOf(subscription.getResult())).toEqual({
+      usersByPk: {
+        id: 1,
+        name: 'Alice',
+        profile: [{ id: 10, bio: 'First' }],
+      },
+    });
+
+    db.graphql(`
+      mutation {
+        updateProfiles(where: { id: { eq: 10 } }, set: { bio: "Updated" }) {
+          id
+          bio
+        }
+      }
+    `);
+
+    await flushGraphqlReactivity();
+    expect(dataOf(subscription.getResult())).toEqual({
+      usersByPk: {
+        id: 1,
+        name: 'Alice',
+        profile: [{ id: 10, bio: 'Updated' }],
+      },
+    });
   });
 
   it('pushes nested relation updates for GraphQL subscriptions', async () => {

@@ -317,6 +317,72 @@ const ISSUE_FEED_QUERY = ISSUE_FEED_SUBSCRIPTION.replace(
   'query IssueFeed',
 )
 
+const ISSUE_FEED_STREAM_SUBSCRIPTION = `
+  subscription IssueFeedStream($projectIds: [Long!]!) {
+    issues(
+      where: {
+        AND: [
+          { projectId: { in: $projectIds } }
+          { OR: [{ status: { eq: "open" } }, { status: { eq: "in_progress" } }] }
+          { estimate: { gte: 3 } }
+          {
+            OR: [
+              { metadata: { path: "$.customer.tier", eq: "enterprise" } }
+              { metadata: { path: "$.customer.tier", eq: "mid_market" } }
+            ]
+          }
+        ]
+      }
+    ) {
+      id
+      title
+      status
+      priority
+      estimate
+      updatedAt
+      metadata
+      project {
+        id
+        name
+        state
+        healthScore
+        updatedAt
+        metadata
+        organization {
+          name
+        }
+        team {
+          name
+        }
+        counter(where: { openIssueCount: { gte: 5 } }, limit: 1) {
+          openIssueCount
+          blockerCount
+          staleIssueCount
+          updatedAt
+        }
+        snapshot(where: { velocity: { gte: 18 } }, limit: 1) {
+          velocity
+          blockedRatio
+          completionRate
+          updatedAt
+        }
+      }
+      assignee {
+        name
+      }
+      currentMilestone {
+        name
+        status
+      }
+    }
+  }
+`
+
+const ISSUE_FEED_STREAM_QUERY = ISSUE_FEED_STREAM_SUBSCRIPTION.replace(
+  'subscription IssueFeedStream',
+  'query IssueFeedStream',
+)
+
 const PROJECT_BOARD_SUBSCRIPTION = `
   subscription ProjectBoard($rootLimit: Int!) {
     projects(
@@ -377,6 +443,64 @@ const PROJECT_BOARD_QUERY = PROJECT_BOARD_SUBSCRIPTION.replace(
   'query ProjectBoard',
 )
 
+const PROJECT_BOARD_STREAM_SUBSCRIPTION = `
+  subscription ProjectBoardStream {
+    projects(
+      where: {
+        AND: [
+          { OR: [{ state: { eq: "active" } }, { state: { eq: "at_risk" } }] }
+          { healthScore: { gte: 45 } }
+          {
+            OR: [
+              { metadata: { path: "$.risk.bucket", eq: "high" } }
+              { metadata: { path: "$.risk.bucket", eq: "critical" } }
+            ]
+          }
+        ]
+      }
+    ) {
+      id
+      name
+      state
+      healthScore
+      updatedAt
+      metadata
+      organization {
+        region
+        name
+      }
+      team {
+        name
+      }
+      lead {
+        name
+        role
+      }
+      counter(where: { openIssueCount: { gte: 4 } }, limit: 1) {
+        openIssueCount
+        blockerCount
+        staleIssueCount
+        updatedAt
+      }
+      snapshot(where: { velocity: { gte: 20 } }, limit: 1) {
+        velocity
+        blockedRatio
+        completionRate
+        updatedAt
+      }
+      milestone(limit: 1) {
+        name
+        status
+      }
+    }
+  }
+`
+
+const PROJECT_BOARD_STREAM_QUERY = PROJECT_BOARD_STREAM_SUBSCRIPTION.replace(
+  'subscription ProjectBoardStream',
+  'query ProjectBoardStream',
+)
+
 function issueRootLimit(visibleLimit) {
   return visibleLimit
 }
@@ -388,12 +512,18 @@ function boardRootLimit() {
 function scenarioVisibleLimit(scenarioId) {
   if (scenarioId === 'issue_window_500') return 500
   if (scenarioId === 'issue_window_5000') return 5_000
+  if (scenarioId === 'issue_stream_all') return Number.POSITIVE_INFINITY
   if (scenarioId === 'project_board_2000') return 2_000
+  if (scenarioId === 'project_board_stream_all') return Number.POSITIVE_INFINITY
   throw new Error(`Unknown scenario: ${scenarioId}`)
 }
 
 function isIssueScenario(scenarioId) {
-  return scenarioId === 'issue_window_500' || scenarioId === 'issue_window_5000'
+  return (
+    scenarioId === 'issue_window_500' ||
+    scenarioId === 'issue_window_5000' ||
+    scenarioId === 'issue_stream_all'
+  )
 }
 
 function byProjectId(rows) {
@@ -438,31 +568,51 @@ function scenarioVariables(scenarioId) {
       projectIds: eligibleIssueProjectIds(),
     }
   }
+  if (scenarioId === 'issue_stream_all') {
+    return {
+      projectIds: eligibleIssueProjectIds(),
+    }
+  }
   if (scenarioId === 'project_board_2000') {
     return { rootLimit: boardRootLimit() }
+  }
+  if (scenarioId === 'project_board_stream_all') {
+    return {}
   }
   throw new Error(`Unknown scenario: ${scenarioId}`)
 }
 
 function buildScenarioSubscription(scenarioId, variables) {
-  if (isIssueScenario(scenarioId)) {
+  if (scenarioId === 'issue_window_500' || scenarioId === 'issue_window_5000') {
     return runtime.prepared.issueFeed.subscribe(variables)
+  }
+  if (scenarioId === 'issue_stream_all') {
+    return runtime.prepared.issueFeedStream.subscribe(variables)
   }
 
   if (scenarioId === 'project_board_2000') {
     return runtime.prepared.projectBoard.subscribe(variables)
+  }
+  if (scenarioId === 'project_board_stream_all') {
+    return runtime.prepared.projectBoardStream.subscribe(variables)
   }
 
   throw new Error(`Unknown scenario: ${scenarioId}`)
 }
 
 function executeScenarioQuery(scenarioId, variables) {
-  if (isIssueScenario(scenarioId)) {
+  if (scenarioId === 'issue_window_500' || scenarioId === 'issue_window_5000') {
     return runtime.prepared.issueFeedQuery.exec(variables)
+  }
+  if (scenarioId === 'issue_stream_all') {
+    return runtime.prepared.issueFeedStreamQuery.exec(variables)
   }
 
   if (scenarioId === 'project_board_2000') {
     return runtime.prepared.projectBoardQuery.exec(variables)
+  }
+  if (scenarioId === 'project_board_stream_all') {
+    return runtime.prepared.projectBoardStreamQuery.exec(variables)
   }
 
   throw new Error(`Unknown scenario: ${scenarioId}`)
@@ -501,8 +651,12 @@ function mapIssuePayloadRows(rows, visibleLimit) {
     })
   }
 
-  result.sort((left, right) => right.updatedAt - left.updatedAt)
-  return result.slice(0, visibleLimit)
+  if (Number.isFinite(visibleLimit)) {
+    result.sort((left, right) => right.updatedAt - left.updatedAt)
+    return result.slice(0, visibleLimit)
+  }
+
+  return result
 }
 
 function mapProjectBoardPayloadRows(rows, visibleLimit) {
@@ -537,18 +691,26 @@ function mapProjectBoardPayloadRows(rows, visibleLimit) {
     })
   }
 
-  result.sort((left, right) => right.projectHealth - left.projectHealth)
-  return result.slice(0, visibleLimit)
+  if (Number.isFinite(visibleLimit)) {
+    result.sort((left, right) => right.projectHealth - left.projectHealth)
+    return result.slice(0, visibleLimit)
+  }
+
+  return result
 }
 
 function mapPayloadForScenario(scenarioId, payload, visibleLimit) {
   const data = payload?.data ?? {}
 
-  if (scenarioId === 'issue_window_500' || scenarioId === 'issue_window_5000') {
+  if (
+    scenarioId === 'issue_window_500' ||
+    scenarioId === 'issue_window_5000' ||
+    scenarioId === 'issue_stream_all'
+  ) {
     return mapIssuePayloadRows(data.issues ?? [], visibleLimit)
   }
 
-  if (scenarioId === 'project_board_2000') {
+  if (scenarioId === 'project_board_2000' || scenarioId === 'project_board_stream_all') {
     return mapProjectBoardPayloadRows(data.projects ?? [], visibleLimit)
   }
 
@@ -652,6 +814,14 @@ async function initRuntime() {
   runtime.prepared = {
     issueFeed: runtime.db.prepareGraphql(ISSUE_FEED_SUBSCRIPTION, 'IssueFeed'),
     issueFeedQuery: runtime.db.prepareGraphql(ISSUE_FEED_QUERY, 'IssueFeed'),
+    issueFeedStream: runtime.db.prepareGraphql(
+      ISSUE_FEED_STREAM_SUBSCRIPTION,
+      'IssueFeedStream',
+    ),
+    issueFeedStreamQuery: runtime.db.prepareGraphql(
+      ISSUE_FEED_STREAM_QUERY,
+      'IssueFeedStream',
+    ),
     projectBoard: runtime.db.prepareGraphql(
       PROJECT_BOARD_SUBSCRIPTION,
       'ProjectBoard',
@@ -659,6 +829,14 @@ async function initRuntime() {
     projectBoardQuery: runtime.db.prepareGraphql(
       PROJECT_BOARD_QUERY,
       'ProjectBoard',
+    ),
+    projectBoardStream: runtime.db.prepareGraphql(
+      PROJECT_BOARD_STREAM_SUBSCRIPTION,
+      'ProjectBoardStream',
+    ),
+    projectBoardStreamQuery: runtime.db.prepareGraphql(
+      PROJECT_BOARD_STREAM_QUERY,
+      'ProjectBoardStream',
     ),
   }
 

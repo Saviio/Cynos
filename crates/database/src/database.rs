@@ -1731,6 +1731,36 @@ mod tests {
         db
     }
 
+    fn setup_graphql_users_profiles_db() -> Database {
+        let db = setup_graphql_users_db();
+        let profiles = db
+            .create_table("profiles")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column(
+                "user_id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_unique(true)),
+            )
+            .column("bio", JsDataType::String, None)
+            .foreign_key(
+                "fk_profiles_user",
+                "user_id",
+                "users",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("user")
+                        .set_reverse_field_name("profile"),
+                ),
+            );
+        db.register_table(&profiles).unwrap();
+        db
+    }
+
     fn collect_titles(array: &js_sys::Array) -> Vec<String> {
         let mut titles = Vec::with_capacity(array.length() as usize);
         for index in 0..array.length() {
@@ -2156,6 +2186,26 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn test_graphql_live_selector_chooses_delta_for_unique_reverse_limit_one() {
+        let db = setup_graphql_users_profiles_db();
+        let engine = compile_subscription_engine(
+            &db,
+            "subscription UserCard { usersByPk(pk: { id: 1 }) { id name profile(limit: 1) { id bio } } }",
+        );
+        assert_eq!(engine, LiveEngineKind::Delta);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_graphql_live_selector_falls_back_to_snapshot_for_non_unique_reverse_limit_one() {
+        let db = setup_graphql_users_posts_db();
+        let engine = compile_subscription_engine(
+            &db,
+            "subscription UserCard { usersByPk(pk: { id: 1 }) { id name posts(limit: 1) { id title } } }",
+        );
+        assert_eq!(engine, LiveEngineKind::Snapshot);
+    }
+
+    #[wasm_bindgen_test]
     fn test_database_graphql_delta_subscription_tracks_scalar_root_updates() {
         let db = setup_graphql_users_db();
 
@@ -2501,6 +2551,90 @@ mod tests {
             .as_string()
             .unwrap();
         assert_eq!(title, "Updated");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_delta_subscription_tracks_unique_reverse_limit_one_updates() {
+        let db = setup_graphql_users_profiles_db();
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                1,
+                alloc::vec![Value::Int64(1), Value::String("Alice".into())],
+            ))
+            .unwrap();
+
+        let subscription = db
+            .subscribe_graphql(
+                "subscription UserCard { usersByPk(pk: { id: 1 }) { id name profile(limit: 1) { id bio } } }",
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            compile_subscription_engine(
+                &db,
+                "subscription UserCard { usersByPk(pk: { id: 1 }) { id name profile(limit: 1) { id bio } } }",
+            ),
+            LiveEngineKind::Delta
+        );
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_user = js_sys::Reflect::get(&initial_data, &JsValue::from_str("usersByPk"))
+            .unwrap();
+        let initial_profile = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_user, &JsValue::from_str("profile")).unwrap(),
+        );
+        assert_eq!(initial_profile.length(), 0);
+
+        db.graphql(
+            "mutation { insertProfiles(input: [{ id: 10, user_id: 1, bio: \"First\" }]) { id bio } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let inserted = subscription.get_result();
+        let inserted_data = js_sys::Reflect::get(&inserted, &JsValue::from_str("data")).unwrap();
+        let inserted_user =
+            js_sys::Reflect::get(&inserted_data, &JsValue::from_str("usersByPk")).unwrap();
+        let inserted_profile = js_sys::Array::from(
+            &js_sys::Reflect::get(&inserted_user, &JsValue::from_str("profile")).unwrap(),
+        );
+        assert_eq!(inserted_profile.length(), 1);
+        let inserted_bio = js_sys::Reflect::get(&inserted_profile.get(0), &JsValue::from_str("bio"))
+            .unwrap()
+            .as_string()
+            .unwrap();
+        assert_eq!(inserted_bio, "First");
+
+        db.graphql(
+            "mutation { updateProfiles(where: { id: { eq: 10 } }, set: { bio: \"Updated\" }) { id bio } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let updated = subscription.get_result();
+        let updated_data = js_sys::Reflect::get(&updated, &JsValue::from_str("data")).unwrap();
+        let updated_user =
+            js_sys::Reflect::get(&updated_data, &JsValue::from_str("usersByPk")).unwrap();
+        let updated_profile = js_sys::Array::from(
+            &js_sys::Reflect::get(&updated_user, &JsValue::from_str("profile")).unwrap(),
+        );
+        assert_eq!(updated_profile.length(), 1);
+        let updated_bio = js_sys::Reflect::get(&updated_profile.get(0), &JsValue::from_str("bio"))
+            .unwrap()
+            .as_string()
+            .unwrap();
+        assert_eq!(updated_bio, "Updated");
     }
 
     #[wasm_bindgen_test]
