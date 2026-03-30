@@ -1044,10 +1044,7 @@ fn planner_batch_fetch(
     let plan = build_table_query_plan(catalog, table_name, table, &query)?;
     let rows = execute_logical_plan(cache, table_name, plan)?;
 
-    let mut buckets = bucket_rows(rows, edge_target_column_index(edge));
-    if let Some(query) = edge.query.as_ref() {
-        apply_bucket_window(&mut buckets, query);
-    }
+    let buckets = bucket_rows_for_query(rows, edge_target_column_index(edge), edge.query.as_ref());
     Ok(buckets)
 }
 
@@ -1116,13 +1113,19 @@ fn indexed_probe_fetch(
             };
 
             for key in keys {
-                let rows = fetch_rows_by_known_index_or_scan(
+                let rows = fetch_rows_by_known_index_or_scan_windowed(
                     store,
                     index_name,
                     &edge.relation.child_column,
                     key,
+                    (query.filter.is_none() && query.order_by.is_empty()).then_some(query),
                 );
-                buckets.insert(key.clone(), apply_collection_query(rows, query));
+                let rows = if query.filter.is_none() && query.order_by.is_empty() {
+                    rows
+                } else {
+                    apply_collection_query(rows, query)
+                };
+                buckets.insert(key.clone(), rows);
             }
         }
     }
@@ -1227,21 +1230,6 @@ fn relation_key_filter(
     }))
 }
 
-fn apply_bucket_window(buckets: &mut HashMap<Value, Vec<Rc<Row>>>, query: &BoundCollectionQuery) {
-    if query.limit.is_none() && query.offset == 0 {
-        return;
-    }
-
-    for rows in buckets.values_mut() {
-        let start = core::cmp::min(query.offset, rows.len());
-        let end = match query.limit {
-            Some(limit) => start.saturating_add(limit).min(rows.len()),
-            None => rows.len(),
-        };
-        *rows = rows[start..end].to_vec();
-    }
-}
-
 fn bucket_rows(rows: Vec<Rc<Row>>, key_column_index: usize) -> HashMap<Value, Vec<Rc<Row>>> {
     let mut buckets: HashMap<Value, Vec<Rc<Row>>> = HashMap::new();
     for row in rows {
@@ -1253,6 +1241,41 @@ fn bucket_rows(rows: Vec<Rc<Row>>, key_column_index: usize) -> HashMap<Value, Ve
         }
         buckets.entry(key).or_insert_with(Vec::new).push(row);
     }
+    buckets
+}
+
+fn bucket_rows_for_query(
+    rows: Vec<Rc<Row>>,
+    key_column_index: usize,
+    query: Option<&BoundCollectionQuery>,
+) -> HashMap<Value, Vec<Rc<Row>>> {
+    let Some(query) = query else {
+        return bucket_rows(rows, key_column_index);
+    };
+    if query.limit.is_none() && query.offset == 0 {
+        return bucket_rows(rows, key_column_index);
+    }
+
+    let mut buckets: HashMap<Value, Vec<Rc<Row>>> = HashMap::new();
+    let mut seen_per_bucket: HashMap<Value, usize> = HashMap::new();
+    let window_end = query.limit.map(|limit| query.offset.saturating_add(limit));
+
+    for row in rows {
+        let Some(key) = row.get(key_column_index).cloned() else {
+            continue;
+        };
+        if key.is_null() {
+            continue;
+        }
+
+        let seen = seen_per_bucket.entry(key.clone()).or_insert(0);
+        let keep = *seen >= query.offset && window_end.is_none_or(|end| *seen < end);
+        *seen += 1;
+        if keep {
+            buckets.entry(key).or_insert_with(Vec::new).push(row);
+        }
+    }
+
     buckets
 }
 
@@ -1291,6 +1314,56 @@ fn fetch_rows_by_known_index_or_scan(
                 .unwrap_or(false)
         })
         .collect()
+}
+
+fn fetch_rows_by_known_index_or_scan_windowed(
+    store: &RowStore,
+    index_name: &str,
+    column_name: &str,
+    value: &Value,
+    windowed_query: Option<&BoundCollectionQuery>,
+) -> Vec<Rc<Row>> {
+    if let Some(query) = windowed_query {
+        if store.schema().get_index(index_name).is_some() {
+            return store.index_scan_with_limit_offset(
+                index_name,
+                Some(&KeyRange::only(value.clone())),
+                query.limit,
+                query.offset,
+            );
+        }
+
+        let Some(column_index) = store.schema().get_column_index(column_name) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        let mut skipped = 0usize;
+        let mut emitted = 0usize;
+        store.visit_rows(|row| {
+            let matches = row
+                .get(column_index)
+                .map(|candidate| candidate.sql_eq(value))
+                .unwrap_or(false);
+            if !matches {
+                return true;
+            }
+            if skipped < query.offset {
+                skipped += 1;
+                return true;
+            }
+            if let Some(limit) = query.limit {
+                if emitted >= limit {
+                    return false;
+                }
+            }
+            rows.push(row.clone());
+            emitted += 1;
+            true
+        });
+        return rows;
+    }
+
+    fetch_rows_by_known_index_or_scan(store, index_name, column_name, value)
 }
 
 fn find_single_column_index_name<'a>(store: &'a RowStore, column_name: &str) -> Option<&'a str> {
@@ -1343,6 +1416,8 @@ mod tests {
                 Some("posts"),
             )
             .unwrap()
+            .add_index("idx_posts_author_id", &["author_id"], false)
+            .unwrap()
             .build()
             .unwrap();
         let comments = TableBuilder::new("comments")
@@ -1363,6 +1438,8 @@ mod tests {
                 Some("post"),
                 Some("comments"),
             )
+            .unwrap()
+            .add_index("idx_comments_post_id", &["post_id"], false)
             .unwrap()
             .build()
             .unwrap();
@@ -1522,6 +1599,38 @@ mod tests {
         let cache = build_cache();
         let catalog = GraphqlCatalog::from_table_cache(&cache);
         let query = "{ users(orderBy: [{ field: ID, direction: ASC }]) { id name posts(orderBy: [{ field: ID, direction: DESC }], limit: 1) { id title } } }";
+
+        let expected = execute_query(&cache, &catalog, query, None, None).unwrap();
+        let actual = execute_with_batch(&cache, &catalog, query);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn batch_plan_uses_indexed_probe_for_windowed_reverse_relation_without_order() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let prepared = PreparedQuery::parse(
+            "{ users(orderBy: [{ field: ID, direction: ASC }]) { id posts(limit: 1, offset: 1) { id title } } }",
+        )
+        .unwrap();
+        let bound = prepared.bind(&catalog, None).unwrap();
+        let field = bound.fields.into_iter().next().unwrap();
+        let plan = crate::compile_batch_plan(&catalog, &field).unwrap();
+        let posts_edge = plan
+            .edges()
+            .iter()
+            .find(|edge| edge.direct_table == "posts")
+            .expect("posts edge");
+
+        assert_eq!(posts_edge.strategy, RelationFetchStrategy::IndexedProbeBatch);
+    }
+
+    #[test]
+    fn batch_renderer_matches_recursive_execution_for_reverse_relation_limit_offset_without_order() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query = "{ users(orderBy: [{ field: ID, direction: ASC }]) { id name posts(limit: 1, offset: 1) { id title } } }";
 
         let expected = execute_query(&cache, &catalog, query, None, None).unwrap();
         let actual = execute_with_batch(&cache, &catalog, query);
