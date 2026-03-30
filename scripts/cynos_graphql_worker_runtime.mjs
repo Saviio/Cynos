@@ -11,6 +11,7 @@ import initWasm, {
   col,
 } from '../js/packages/core/dist/wasm.js'
 import { DATASET_CONFIG } from './tanstack_db_benchmark_shared.mjs'
+import { extractProjectIds } from './cynos_benchmark_row_shape.mjs'
 import {
   buildServerDataset,
   summarizeDataset,
@@ -552,18 +553,6 @@ function mapPayloadForScenario(scenarioId, payload, visibleLimit) {
   }
 
   throw new Error(`Unknown scenario: ${scenarioId}`)
-}
-
-function extractProjectIds(rows, maxCount) {
-  const result = []
-  const seen = new Set()
-  for (const row of rows) {
-    if (row.projectId == null || seen.has(row.projectId)) continue
-    seen.add(row.projectId)
-    result.push(row.projectId)
-    if (result.length >= maxCount) break
-  }
-  return result
 }
 
 function syncActiveRows(active, payload) {

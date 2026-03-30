@@ -17,6 +17,7 @@ import {
   DATASET_CONFIG,
   SOCKET_PATCH_COUNT,
 } from './tanstack_db_benchmark_shared.mjs'
+import { extractProjectIds } from './cynos_benchmark_row_shape.mjs'
 
 if (!parentPort) {
   throw new Error('This module must run inside a worker thread.')
@@ -691,18 +692,6 @@ function ensureInitialized() {
   if (!runtime.initialized || !runtime.collections || !runtime.server) {
     throw new Error('Worker runtime is not initialized.')
   }
-}
-
-function extractProjectIds(rows, maxCount) {
-  const result = []
-  const seen = new Set()
-  for (const row of rows) {
-    if (row.projectId == null || seen.has(row.projectId)) continue
-    seen.add(row.projectId)
-    result.push(row.projectId)
-    if (result.length >= maxCount) break
-  }
-  return result
 }
 
 function unsubscribeActive() {

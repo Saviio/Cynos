@@ -122,34 +122,46 @@ export function snapshotRowsForScenario(scenarioId, rawRows) {
 }
 
 export function extractProjectIds(rows, maxCount) {
-  const result = []
   const seen = new Set()
-
   for (const row of rows) {
-    if (row.projectId == null || seen.has(row.projectId)) continue
+    if (row.projectId == null) continue
     seen.add(row.projectId)
-    result.push(row.projectId)
-    if (result.length >= maxCount) break
   }
 
-  return result
+  return sortProjectIds(Array.from(seen), maxCount)
 }
 
 export function extractProjectIdsFromResultSet(scenarioId, resultSet, maxCount) {
   const columnIndex = rawProjectIdColumn(scenarioId)
-
-  const result = []
   const seen = new Set()
 
   for (let rowIndex = 0; rowIndex < resultSet.length; rowIndex += 1) {
     const projectId = resultSet.getNumber(rowIndex, columnIndex)
-    if (projectId == null || seen.has(projectId)) continue
+    if (projectId == null) continue
     seen.add(projectId)
-    result.push(projectId)
-    if (result.length >= maxCount) break
   }
 
-  return result
+  return sortProjectIds(Array.from(seen), maxCount)
+}
+
+function compareProjectIds(left, right) {
+  if (typeof left === 'bigint' || typeof right === 'bigint') {
+    if (left < right) return -1
+    if (left > right) return 1
+    return 0
+  }
+
+  return Number(left) - Number(right)
+}
+
+function sortProjectIds(projectIds, maxCount) {
+  projectIds.sort(compareProjectIds)
+
+  if (!Number.isFinite(maxCount)) {
+    return projectIds
+  }
+
+  return projectIds.slice(0, Math.max(0, maxCount))
 }
 
 function materializeIssueRowsFromResultSet(resultSet) {
