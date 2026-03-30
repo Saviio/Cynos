@@ -614,27 +614,25 @@ impl JoinState {
             slot.match_count = 0;
         }
 
-        let bucket_pairs = self
-            .left
-            .buckets
-            .iter()
-            .filter_map(|(key, left_bucket)| {
-                self.right
-                    .buckets
-                    .get(key)
-                    .map(|right_bucket| (left_bucket.clone(), right_bucket.clone()))
-            })
-            .collect::<Vec<_>>();
+        let (left_slots, left_buckets) = (&mut self.left.slots, &self.left.buckets);
+        let (right_slots, right_buckets) = (&mut self.right.slots, &self.right.buckets);
 
-        for (left_bucket, right_bucket) in bucket_pairs {
+        for (key, left_bucket) in left_buckets.iter() {
+            let Some(right_bucket) = right_buckets.get(key) else {
+                continue;
+            };
             let right_matches = right_bucket.len();
             let left_matches = left_bucket.len();
-            for left_id in left_bucket {
-                self.left.slot_mut(left_id).match_count = right_matches;
+            for &left_id in left_bucket {
+                if let Some(slot) = left_slots.get_mut(left_id).and_then(Option::as_mut) {
+                    slot.match_count = right_matches;
+                }
             }
 
-            for right_id in right_bucket {
-                self.right.slot_mut(right_id).match_count = left_matches;
+            for &right_id in right_bucket {
+                if let Some(slot) = right_slots.get_mut(right_id).and_then(Option::as_mut) {
+                    slot.match_count = left_matches;
+                }
             }
         }
     }
