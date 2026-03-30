@@ -53,6 +53,8 @@ pub struct ObservableQuery {
     raw_delta_subscriptions: RawDeltaSubscriptionManager,
     /// Trace batch subscribers used by JS delta bridge paths.
     trace_batch_subscriptions: TraceBatchSubscriptionManager,
+    /// Reused scratch buffer for plain `ChangeSet` subscribers.
+    change_set_scratch: ChangeSet,
     /// Whether initial value has been emitted
     initialized: bool,
 }
@@ -65,6 +67,7 @@ impl ObservableQuery {
             subscriptions: SubscriptionManager::new(),
             raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
             trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+            change_set_scratch: ChangeSet::new(),
             initialized: false,
         }
     }
@@ -76,6 +79,7 @@ impl ObservableQuery {
             subscriptions: SubscriptionManager::new(),
             raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
             trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+            change_set_scratch: ChangeSet::new(),
             initialized: true,
         }
     }
@@ -91,6 +95,7 @@ impl ObservableQuery {
             subscriptions: SubscriptionManager::new(),
             raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
             trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+            change_set_scratch: ChangeSet::new(),
             initialized: true,
         }
     }
@@ -117,6 +122,7 @@ impl ObservableQuery {
             subscriptions: SubscriptionManager::new(),
             raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
             trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+            change_set_scratch: ChangeSet::new(),
             initialized: true,
         }
     }
@@ -143,6 +149,7 @@ impl ObservableQuery {
             subscriptions: SubscriptionManager::new(),
             raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
             trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+            change_set_scratch: ChangeSet::new(),
             initialized: true,
         }
     }
@@ -199,6 +206,7 @@ impl ObservableQuery {
                 subscriptions: SubscriptionManager::new(),
                 raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
                 trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+                change_set_scratch: ChangeSet::new(),
                 initialized: true,
             },
             bootstrap_profile,
@@ -333,6 +341,22 @@ impl ObservableQuery {
             return TraceUpdateProfile::default();
         }
 
+        if self.trace_batch_subscriptions.is_empty() {
+            let (output_deltas, profile) = self.view.on_table_change_profiled(table_id, deltas, now_fn);
+
+            if !output_deltas.is_empty() {
+                if !self.raw_delta_subscriptions.is_empty() {
+                    self.raw_delta_subscriptions.notify_all(&output_deltas);
+                }
+                if !self.subscriptions.is_empty() {
+                    self.change_set_scratch.replace_from_deltas_only(&output_deltas);
+                    self.subscriptions.notify_all(&self.change_set_scratch);
+                }
+            }
+
+            return profile;
+        }
+
         let (output_batch, profile) = self
             .view
             .on_table_change_batch_profiled(table_id, deltas, now_fn);
@@ -356,8 +380,8 @@ impl ObservableQuery {
             }
             if !self.subscriptions.is_empty() {
                 if let Some(ref output_deltas) = materialized {
-                    let changes = ChangeSet::from_deltas_only(output_deltas);
-                    self.subscriptions.notify_all(&changes);
+                    self.change_set_scratch.replace_from_deltas_only(output_deltas);
+                    self.subscriptions.notify_all(&self.change_set_scratch);
                 }
             }
         }

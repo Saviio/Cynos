@@ -3277,8 +3277,17 @@ impl MaterializedView {
         table_id: TableId,
         deltas: Vec<Delta<Row>>,
     ) -> Vec<Delta<Row>> {
-        self.on_table_change_batch(table_id, deltas)
-            .materialize_rows()
+        self.on_table_change_profiled(table_id, deltas, None).0
+    }
+
+    pub fn on_table_change_profiled(
+        &mut self,
+        table_id: TableId,
+        deltas: Vec<Delta<Row>>,
+        now_fn: Option<fn() -> f64>,
+    ) -> (Vec<Delta<Row>>, TraceUpdateProfile) {
+        let (batch, profile) = self.on_table_change_batch_profiled(table_id, deltas, now_fn);
+        (batch.materialize_rows(), profile)
     }
 
     pub fn on_table_change_batch(
