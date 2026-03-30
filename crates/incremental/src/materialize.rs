@@ -2784,10 +2784,7 @@ where
                         unreachable!("bootstrap filter instruction must map to filter runtime node")
                     }
                 };
-                let input: Vec<TraceTupleHandle> = mem::take(&mut slots[*input_slot]);
-                let output = &mut slots[*output_slot];
-                output.clear();
-                output.reserve(input.len());
+                let mut input = mem::take(&mut slots[*input_slot]);
                 let skip_filter = covered_source_index
                     .and_then(|source_index| {
                         source_filter_coverage
@@ -2796,39 +2793,36 @@ where
                     })
                     .unwrap_or(false);
                 if skip_filter {
-                    output.extend(input);
+                    recycle_bootstrap_slot_buffer(&mut slots, *output_slot, input);
                     continue;
                 }
                 timed_block(now_fn, &mut profile.filter_bootstrap_ms, || {
-                    for handle in input {
+                    input.retain(|handle| {
                         let keep = if let Some(trace_predicate) =
-                            trace_predicate.filter(|_| !arena.has_materialized_row(&handle))
+                            trace_predicate.filter(|_| !arena.has_materialized_row(handle))
                         {
-                            trace_predicate(&arena, &handle)
+                            trace_predicate(&arena, handle)
                         } else {
-                            let row = arena.materialize_rc(&handle);
+                            let row = arena.materialize_rc(handle);
                             predicate(&row)
                         };
-                        if keep {
-                            output.push(handle);
-                        }
-                    }
+                        keep
+                    });
                 });
+                recycle_bootstrap_slot_buffer(&mut slots, *output_slot, input);
             }
             BootstrapInstruction::Project {
                 input_slot,
                 output_slot,
                 columns,
             } => {
-                let input: Vec<TraceTupleHandle> = mem::take(&mut slots[*input_slot]);
-                let output = &mut slots[*output_slot];
-                output.clear();
-                output.reserve(input.len());
+                let mut input = mem::take(&mut slots[*input_slot]);
                 timed_block(now_fn, &mut profile.project_bootstrap_ms, || {
-                    for handle in input {
-                        output.push(arena.project(handle, columns.clone()));
+                    for handle in input.iter_mut() {
+                        *handle = arena.project(handle.clone(), columns.clone());
                     }
                 });
+                recycle_bootstrap_slot_buffer(&mut slots, *output_slot, input);
             }
             BootstrapInstruction::Map {
                 node_index,
@@ -2842,25 +2836,24 @@ where
                     }) => (*mapper, *trace_mapper),
                     _ => unreachable!("bootstrap map instruction must map to map runtime node"),
                 };
-                let input: Vec<TraceTupleHandle> = mem::take(&mut slots[*input_slot]);
-                let output = &mut slots[*output_slot];
-                output.clear();
-                output.reserve(input.len());
+                let mut input = mem::take(&mut slots[*input_slot]);
                 timed_block(now_fn, &mut profile.map_bootstrap_ms, || {
-                    for handle in input {
+                    for handle in input.iter_mut() {
+                        let source = handle.clone();
                         let mut mapped = if let Some(trace_mapper) =
-                            trace_mapper.filter(|_| !arena.has_materialized_row(&handle))
+                            trace_mapper.filter(|_| !arena.has_materialized_row(&source))
                         {
-                            trace_mapper(&arena, &handle)
+                            trace_mapper(&arena, &source)
                         } else {
-                            let row = arena.materialize_rc(&handle);
+                            let row = arena.materialize_rc(&source);
                             mapper(&row)
                         };
-                        mapped.set_id(handle.row_id());
-                        mapped.set_version(handle.version());
-                        output.push(arena.owned(mapped));
+                        mapped.set_id(source.row_id());
+                        mapped.set_version(source.version());
+                        *handle = arena.owned(mapped);
                     }
                 });
+                recycle_bootstrap_slot_buffer(&mut slots, *output_slot, input);
             }
             BootstrapInstruction::Join {
                 node_index,
@@ -2943,6 +2936,16 @@ where
     }
 
     profile
+}
+
+fn recycle_bootstrap_slot_buffer(
+    slots: &mut [Vec<TraceTupleHandle>],
+    slot_id: BootstrapSlotId,
+    mut buffer: Vec<TraceTupleHandle>,
+) {
+    let target = &mut slots[slot_id];
+    target.clear();
+    mem::swap(target, &mut buffer);
 }
 
 fn extract_numeric(value: &Value) -> f64 {
