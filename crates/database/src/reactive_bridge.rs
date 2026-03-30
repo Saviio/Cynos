@@ -27,6 +27,7 @@ use crate::profiling::{
 #[cfg(feature = "benchmark")]
 use crate::profiling::{GraphqlDeltaProfile, GraphqlSnapshotQueryProfile};
 use crate::query_engine::{
+    choose_root_subset_plan_variant,
     execute_compiled_physical_plan_on_table_subset, execute_compiled_physical_plan_with_summary,
     CompiledPhysicalPlan, QueryResultSummary, RootSubsetPlanVariant,
 };
@@ -244,13 +245,7 @@ impl RootSubsetRefreshRuntime {
             .get_table(&self.metadata.root_table)
             .map(|store| store.len())
             .unwrap_or(0);
-        if affected_root_ids.len() <= 8192
-            || affected_root_ids.len().saturating_mul(4) <= table_row_count
-        {
-            RootSubsetPlanVariant::Small
-        } else {
-            RootSubsetPlanVariant::Large
-        }
+        choose_root_subset_plan_variant(affected_root_ids.len(), table_row_count)
     }
 
     fn select_compiled_plan<'a>(

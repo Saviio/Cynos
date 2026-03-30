@@ -92,11 +92,21 @@ impl RootSubsetPlanningProfile {
 
 impl SubsetExecutionMode {
     fn choose(allowed_row_count: usize, table_row_count: usize) -> Self {
-        if allowed_row_count <= 8192 || allowed_row_count.saturating_mul(4) <= table_row_count {
-            Self::SubsetDriven
-        } else {
-            Self::IndexDrivenIntersect
+        match choose_root_subset_plan_variant(allowed_row_count, table_row_count) {
+            RootSubsetPlanVariant::Small => Self::SubsetDriven,
+            RootSubsetPlanVariant::Large => Self::IndexDrivenIntersect,
         }
+    }
+}
+
+pub(crate) fn choose_root_subset_plan_variant(
+    allowed_row_count: usize,
+    table_row_count: usize,
+) -> RootSubsetPlanVariant {
+    if allowed_row_count <= 8192 || allowed_row_count.saturating_mul(4) <= table_row_count {
+        RootSubsetPlanVariant::Small
+    } else {
+        RootSubsetPlanVariant::Large
     }
 }
 
@@ -1996,6 +2006,23 @@ mod tests {
         assert!(ctx.is_restricted_relation("orders"));
         assert!(ctx.is_anchor_relation("orders"));
         assert!(ctx.restricted_relation_cbo_enabled());
+    }
+
+    #[test]
+    fn test_choose_root_subset_plan_variant_uses_shared_thresholds() {
+        assert_eq!(choose_root_subset_plan_variant(64, 10_000), RootSubsetPlanVariant::Small);
+        assert_eq!(
+            choose_root_subset_plan_variant(2_500, 10_000),
+            RootSubsetPlanVariant::Small
+        );
+        assert_eq!(
+            choose_root_subset_plan_variant(8_193, 10_000),
+            RootSubsetPlanVariant::Large
+        );
+        assert_eq!(
+            choose_root_subset_plan_variant(10_000, 30_000),
+            RootSubsetPlanVariant::Large
+        );
     }
 
     #[test]
