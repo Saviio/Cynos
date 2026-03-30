@@ -3,7 +3,7 @@
 use crate::delta::Delta;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{OnceCell, RefCell};
 use cynos_core::{join_row_id, left_join_null_row_id, right_join_null_row_id, Row, RowId, Value};
 use hashbrown::HashMap;
 
@@ -331,101 +331,123 @@ impl TraceDeltaBatch {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct VisibleResultStore {
+    storage: VisibleResultStoreStorage,
+}
+
+#[derive(Clone, Debug)]
+enum VisibleResultStoreStorage {
+    Owned(OwnedVisibleRows),
+    Shared(SharedVisibleRows),
+}
+
+#[derive(Clone, Debug, Default)]
+struct OwnedVisibleRows {
+    slots: Vec<Option<Row>>,
+    row_to_slot: HashMap<RowId, usize>,
+    free_list: Vec<usize>,
+    rc_shadow: OnceCell<Vec<Option<Rc<Row>>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SharedVisibleRows {
     slots: Vec<Option<Rc<Row>>>,
     row_to_slot: HashMap<RowId, usize>,
     free_list: Vec<usize>,
 }
 
-impl VisibleResultStore {
-    pub fn from_rows(rows: Vec<Row>) -> Self {
-        let mut store = Self::default();
-        store.replace_rows(rows);
-        store
-    }
+pub struct VisibleResultStoreRowRefs<'a> {
+    slots: &'a [Option<Rc<Row>>],
+    index: usize,
+}
 
-    pub fn from_rc_rows(rows: Vec<Rc<Row>>) -> Self {
-        let mut store = Self::default();
-        store.replace_rc_rows(rows);
-        store
+impl Default for VisibleResultStore {
+    fn default() -> Self {
+        Self {
+            storage: VisibleResultStoreStorage::Owned(OwnedVisibleRows::default()),
+        }
     }
+}
 
-    pub fn apply(&mut self, batch: &TraceDeltaBatch) {
-        for delta in batch.deltas() {
-            let row_id = batch.arena().row_id(&delta.data);
-            if delta.is_insert() {
-                self.upsert_rc(batch.arena().materialize_rc(&delta.data));
-            } else if delta.is_delete() {
-                self.remove(row_id);
+impl<'a> Iterator for VisibleResultStoreRowRefs<'a> {
+    type Item = &'a Rc<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.slots.len() {
+            let index = self.index;
+            self.index += 1;
+            if let Some(row) = self.slots[index].as_ref() {
+                return Some(row);
             }
+        }
+
+        None
+    }
+}
+
+impl OwnedVisibleRows {
+    fn from_rows(rows: Vec<Row>) -> Self {
+        let mut slots = Vec::with_capacity(rows.len());
+        let mut row_to_slot = HashMap::with_capacity(rows.len());
+        let mut free_list = Vec::new();
+        for row in rows {
+            let row_id = row.id();
+            let slot_id = slots.len();
+            slots.push(Some(row));
+            if let Some(previous_slot) = row_to_slot.insert(row_id, slot_id) {
+                slots[previous_slot] = None;
+                free_list.push(previous_slot);
+            }
+        }
+        Self {
+            slots,
+            row_to_slot,
+            free_list,
+            rc_shadow: OnceCell::new(),
         }
     }
 
-    pub fn apply_rows(&mut self, deltas: &[Delta<Row>]) {
+    fn apply_rows(&mut self, deltas: &[Delta<Row>]) {
         for delta in deltas {
             if delta.is_insert() {
-                self.upsert_rc(Rc::new(delta.data.clone()));
+                self.upsert(delta.data.clone());
             } else if delta.is_delete() {
                 self.remove(delta.data.id());
             }
         }
     }
 
-    pub fn replace_rows(&mut self, rows: Vec<Row>) {
-        self.clear();
-        self.slots.reserve(rows.len());
-        self.row_to_slot.reserve(rows.len());
-        for row in rows {
-            let row = Rc::new(row);
-            if let Some(slot_id) = self.row_to_slot.get(&row.id()).copied() {
-                self.slots[slot_id] = Some(row);
-            } else {
-                let slot_id = self.slots.len();
-                self.slots.push(Some(row.clone()));
-                self.row_to_slot.insert(row.id(), slot_id);
-            }
-        }
+    fn replace_rows(&mut self, rows: Vec<Row>) {
+        *self = Self::from_rows(rows);
     }
 
-    pub fn replace_rc_rows(&mut self, rows: Vec<Rc<Row>>) {
-        self.clear();
-        self.slots.reserve(rows.len());
-        self.row_to_slot.reserve(rows.len());
-        for row in rows {
-            if let Some(slot_id) = self.row_to_slot.get(&row.id()).copied() {
-                self.slots[slot_id] = Some(row);
-            } else {
-                let slot_id = self.slots.len();
-                self.slots.push(Some(row.clone()));
-                self.row_to_slot.insert(row.id(), slot_id);
-            }
-        }
-    }
-
-    pub fn rows(&self) -> Vec<Row> {
-        self.slots
-            .iter()
-            .filter_map(|row| row.as_ref().map(|row| (**row).clone()))
-            .collect()
-    }
-
-    pub fn rc_rows(&self) -> Vec<Rc<Row>> {
+    fn rows(&self) -> Vec<Row> {
         self.slots
             .iter()
             .filter_map(|row| row.as_ref().cloned())
             .collect()
     }
 
-    pub fn row_refs(&self) -> impl Iterator<Item = &Rc<Row>> + '_ {
-        self.slots.iter().filter_map(|row| row.as_ref())
+    fn rc_rows(&self) -> Vec<Rc<Row>> {
+        self.rc_shadow_slots()
+            .iter()
+            .filter_map(|row| row.as_ref().cloned())
+            .collect()
     }
 
-    pub fn visit_rc_rows<F>(&self, mut visitor: F)
+    fn row_refs(&self) -> VisibleResultStoreRowRefs<'_> {
+        VisibleResultStoreRowRefs {
+            slots: self.rc_shadow_slots().as_slice(),
+            index: 0,
+        }
+    }
+
+    fn visit_rc_rows<F>(&self, mut visitor: F)
     where
         F: FnMut(&Rc<Row>) -> bool,
     {
-        for row in self.row_refs() {
+        for row in self.rc_shadow_slots().iter().filter_map(|row| row.as_ref()) {
             if !visitor(row) {
                 break;
             }
@@ -433,35 +455,178 @@ impl VisibleResultStore {
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.row_to_slot.len()
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.row_to_slot.is_empty()
     }
 
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.row_to_slot.clear();
+        self.free_list.clear();
+        self.rc_shadow = OnceCell::new();
+    }
+
+    fn upsert(&mut self, row: Row) {
+        let row_id = row.id();
+        let shadow_row = self.rc_shadow.get_mut().map(|_| Rc::new(row.clone()));
+        if let Some(slot_id) = self.row_to_slot.get(&row_id).copied() {
+            self.slots[slot_id] = Some(row);
+            if let Some(shadow) = self.rc_shadow.get_mut() {
+                shadow[slot_id] = shadow_row;
+            }
+            return;
+        }
+
+        let slot_id = if let Some(slot_id) = self.free_list.pop() {
+            self.slots[slot_id] = Some(row);
+            if let Some(shadow) = self.rc_shadow.get_mut() {
+                shadow[slot_id] = shadow_row;
+            }
+            slot_id
+        } else {
+            self.slots.push(Some(row));
+            if let Some(shadow) = self.rc_shadow.get_mut() {
+                shadow.push(shadow_row);
+            }
+            self.slots.len().saturating_sub(1)
+        };
+        self.row_to_slot.insert(row_id, slot_id);
+    }
+
+    fn remove(&mut self, row_id: RowId) {
+        if let Some(slot_id) = self.row_to_slot.remove(&row_id) {
+            self.slots[slot_id] = None;
+            if let Some(shadow) = self.rc_shadow.get_mut() {
+                shadow[slot_id] = None;
+            }
+            self.free_list.push(slot_id);
+        }
+    }
+
+    fn rc_shadow_slots(&self) -> &Vec<Option<Rc<Row>>> {
+        self.rc_shadow.get_or_init(|| {
+            self.slots
+                .iter()
+                .map(|row| row.as_ref().map(|row| Rc::new(row.clone())))
+                .collect()
+        })
+    }
+}
+
+impl SharedVisibleRows {
+    fn from_rc_rows(rows: Vec<Rc<Row>>) -> Self {
+        let mut slots = Vec::with_capacity(rows.len());
+        let mut row_to_slot = HashMap::with_capacity(rows.len());
+        let mut free_list = Vec::new();
+        for row in rows {
+            let row_id = row.id();
+            let slot_id = slots.len();
+            slots.push(Some(row));
+            if let Some(previous_slot) = row_to_slot.insert(row_id, slot_id) {
+                slots[previous_slot] = None;
+                free_list.push(previous_slot);
+            }
+        }
+        Self {
+            slots,
+            row_to_slot,
+            free_list,
+        }
+    }
+
+    fn apply(&mut self, batch: &TraceDeltaBatch) {
+        for delta in batch.deltas() {
+            let row_id = batch.arena().row_id(&delta.data);
+            if delta.is_insert() {
+                self.upsert(batch.arena().materialize_rc(&delta.data));
+            } else if delta.is_delete() {
+                self.remove(row_id);
+            }
+        }
+    }
+
+    fn apply_rows(&mut self, deltas: &[Delta<Row>]) {
+        for delta in deltas {
+            if delta.is_insert() {
+                self.upsert(Rc::new(delta.data.clone()));
+            } else if delta.is_delete() {
+                self.remove(delta.data.id());
+            }
+        }
+    }
+
+    fn replace_rc_rows(&mut self, rows: Vec<Rc<Row>>) {
+        *self = Self::from_rc_rows(rows);
+    }
+
+    fn rows(&self) -> Vec<Row> {
+        self.slots
+            .iter()
+            .filter_map(|row| row.as_ref().map(|row| (**row).clone()))
+            .collect()
+    }
+
+    fn rc_rows(&self) -> Vec<Rc<Row>> {
+        self.slots
+            .iter()
+            .filter_map(|row| row.as_ref().cloned())
+            .collect()
+    }
+
+    fn row_refs(&self) -> VisibleResultStoreRowRefs<'_> {
+        VisibleResultStoreRowRefs {
+            slots: self.slots.as_slice(),
+            index: 0,
+        }
+    }
+
+    fn visit_rc_rows<F>(&self, mut visitor: F)
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        for row in self.slots.iter().filter_map(|row| row.as_ref()) {
+            if !visitor(row) {
+                break;
+            }
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.row_to_slot.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.row_to_slot.is_empty()
+    }
+
+    fn clear(&mut self) {
         self.slots.clear();
         self.row_to_slot.clear();
         self.free_list.clear();
     }
 
-    fn upsert_rc(&mut self, row: Rc<Row>) {
-        if let Some(slot_id) = self.row_to_slot.get(&row.id()).copied() {
+    fn upsert(&mut self, row: Rc<Row>) {
+        let row_id = row.id();
+        if let Some(slot_id) = self.row_to_slot.get(&row_id).copied() {
             self.slots[slot_id] = Some(row);
             return;
         }
 
         let slot_id = if let Some(slot_id) = self.free_list.pop() {
-            self.slots[slot_id] = Some(row.clone());
+            self.slots[slot_id] = Some(row);
             slot_id
         } else {
-            self.slots.push(Some(row.clone()));
+            self.slots.push(Some(row));
             self.slots.len().saturating_sub(1)
         };
-        self.row_to_slot.insert(row.id(), slot_id);
+        self.row_to_slot.insert(row_id, slot_id);
     }
 
     fn remove(&mut self, row_id: RowId) {
@@ -469,5 +634,182 @@ impl VisibleResultStore {
             self.slots[slot_id] = None;
             self.free_list.push(slot_id);
         }
+    }
+}
+
+impl VisibleResultStore {
+    pub fn from_rows(rows: Vec<Row>) -> Self {
+        Self {
+            storage: VisibleResultStoreStorage::Owned(OwnedVisibleRows::from_rows(rows)),
+        }
+    }
+
+    pub fn from_rc_rows(rows: Vec<Rc<Row>>) -> Self {
+        Self {
+            storage: VisibleResultStoreStorage::Shared(SharedVisibleRows::from_rc_rows(rows)),
+        }
+    }
+
+    pub fn apply(&mut self, batch: &TraceDeltaBatch) {
+        match &mut self.storage {
+            VisibleResultStoreStorage::Owned(rows) => {
+                for delta in batch.deltas() {
+                    let row_id = batch.arena().row_id(&delta.data);
+                    if delta.is_insert() {
+                        rows.upsert(batch.arena().materialize_row(&delta.data));
+                    } else if delta.is_delete() {
+                        rows.remove(row_id);
+                    }
+                }
+            }
+            VisibleResultStoreStorage::Shared(rows) => rows.apply(batch),
+        }
+    }
+
+    pub fn apply_rows(&mut self, deltas: &[Delta<Row>]) {
+        match &mut self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.apply_rows(deltas),
+            VisibleResultStoreStorage::Shared(rows) => rows.apply_rows(deltas),
+        }
+    }
+
+    pub fn replace_rows(&mut self, rows: Vec<Row>) {
+        match &mut self.storage {
+            VisibleResultStoreStorage::Owned(store) => store.replace_rows(rows),
+            VisibleResultStoreStorage::Shared(_) => {
+                self.storage = VisibleResultStoreStorage::Owned(OwnedVisibleRows::from_rows(rows));
+            }
+        }
+    }
+
+    pub fn replace_rc_rows(&mut self, rows: Vec<Rc<Row>>) {
+        match &mut self.storage {
+            VisibleResultStoreStorage::Shared(store) => store.replace_rc_rows(rows),
+            VisibleResultStoreStorage::Owned(_) => {
+                self.storage =
+                    VisibleResultStoreStorage::Shared(SharedVisibleRows::from_rc_rows(rows));
+            }
+        }
+    }
+
+    pub fn rows(&self) -> Vec<Row> {
+        match &self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.rows(),
+            VisibleResultStoreStorage::Shared(rows) => rows.rows(),
+        }
+    }
+
+    pub fn rc_rows(&self) -> Vec<Rc<Row>> {
+        match &self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.rc_rows(),
+            VisibleResultStoreStorage::Shared(rows) => rows.rc_rows(),
+        }
+    }
+
+    pub fn row_refs(&self) -> VisibleResultStoreRowRefs<'_> {
+        match &self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.row_refs(),
+            VisibleResultStoreStorage::Shared(rows) => rows.row_refs(),
+        }
+    }
+
+    pub fn visit_rc_rows<F>(&self, visitor: F)
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        match &self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.visit_rc_rows(visitor),
+            VisibleResultStoreStorage::Shared(rows) => rows.visit_rc_rows(visitor),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match &self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.len(),
+            VisibleResultStoreStorage::Shared(rows) => rows.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        match &self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.is_empty(),
+            VisibleResultStoreStorage::Shared(rows) => rows.is_empty(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        match &mut self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.clear(),
+            VisibleResultStoreStorage::Shared(rows) => rows.clear(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use cynos_core::Value;
+
+    fn make_row(id: u64, value: i64) -> Row {
+        Row::new(id, vec![Value::Int64(id as i64), Value::Int64(value)])
+    }
+
+    #[test]
+    fn visible_result_store_keeps_owned_rows_until_rc_view_needed() {
+        let store = VisibleResultStore::from_rows(vec![make_row(1, 10), make_row(2, 20)]);
+
+        match &store.storage {
+            VisibleResultStoreStorage::Owned(rows) => {
+                assert!(rows.rc_shadow.get().is_none());
+            }
+            VisibleResultStoreStorage::Shared(_) => panic!("expected owned storage"),
+        }
+
+        let ids = store.row_refs().map(|row| row.id()).collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2]);
+
+        match &store.storage {
+            VisibleResultStoreStorage::Owned(rows) => {
+                assert!(rows.rc_shadow.get().is_some());
+            }
+            VisibleResultStoreStorage::Shared(_) => panic!("expected owned storage"),
+        }
+    }
+
+    #[test]
+    fn visible_result_store_updates_rc_shadow_after_owned_mutations() {
+        let mut store = VisibleResultStore::from_rows(vec![make_row(1, 10), make_row(2, 20)]);
+        let _ = store.row_refs().collect::<Vec<_>>();
+
+        store.apply_rows(&[
+            Delta::delete(make_row(1, 10)),
+            Delta::insert(make_row(3, 30)),
+            Delta::insert(make_row(2, 200)),
+        ]);
+
+        let rows = store
+            .rows()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.id(),
+                    row.get(1).and_then(|value| value.as_i64()).unwrap_or_default(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(rows.get(&2), Some(&200));
+        assert_eq!(rows.get(&3), Some(&30));
+        assert!(!rows.contains_key(&1));
+
+        let refs = store
+            .row_refs()
+            .map(|row| (row.id(), row.get(1).and_then(|value| value.as_i64()).unwrap_or_default()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(refs.get(&2), Some(&200));
+        assert_eq!(refs.get(&3), Some(&30));
+        assert!(!refs.contains_key(&1));
     }
 }
