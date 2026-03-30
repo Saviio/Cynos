@@ -12,7 +12,10 @@
 //! Otherwise, falls back to re-query.
 
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
-use crate::convert::{gql_response_to_js_with_cache, value_to_js, GraphqlJsEncodeCache};
+use crate::convert::{
+    gql_response_to_js_with_cache, gql_response_to_js_with_root_list_patch, value_to_js,
+    GraphqlJsEncodeCache, GraphqlRootListJsCache,
+};
 use crate::live_runtime::{
     RowsSnapshotDependencyGraph, RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey,
     RowsSnapshotPartialRefreshMetadata, RowsSnapshotPartialRefreshState,
@@ -21,6 +24,8 @@ use crate::live_runtime::{
 use crate::profiling::{
     now_ms, IvmBridgeProfile, IvmBridgeProfiler, SnapshotQueryProfile, SnapshotRefreshMode,
 };
+#[cfg(feature = "benchmark")]
+use crate::profiling::{GraphqlDeltaProfile, GraphqlSnapshotQueryProfile};
 use crate::query_engine::{
     execute_compiled_physical_plan_on_table_subset, execute_compiled_physical_plan_with_summary,
     CompiledPhysicalPlan, QueryResultSummary, RootSubsetPlanVariant,
@@ -599,6 +604,19 @@ fn build_graphql_response_batched(
     cynos_gql::batch_render::render_graphql_response(cache, catalog, field, plan, state, rows)
 }
 
+fn build_graphql_response_batched_refs(
+    cache: &TableCache,
+    catalog: &cynos_gql::GraphqlCatalog,
+    field: &cynos_gql::bind::BoundRootField,
+    plan: &cynos_gql::GraphqlBatchPlan,
+    state: &mut cynos_gql::GraphqlBatchState,
+    rows: &[&Rc<Row>],
+) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
+    cynos_gql::batch_render::render_graphql_response_refs(
+        cache, catalog, field, plan, state, rows,
+    )
+}
+
 fn root_field_has_relations(field: &cynos_gql::bind::BoundRootField) -> bool {
     match &field.kind {
         cynos_gql::bind::BoundRootFieldKind::Typename => false,
@@ -628,6 +646,7 @@ fn build_snapshot_batch_invalidation(
     table_names: &HashMap<TableId, String>,
     changes: &HashMap<TableId, HashSet<u64>>,
     root_changed: bool,
+    dirty_root_rows: &HashSet<u64>,
 ) -> Result<cynos_gql::GraphqlInvalidation, ()> {
     let mut changed_tables = Vec::with_capacity(changes.len());
     let mut dirty_table_rows = HashMap::new();
@@ -643,6 +662,8 @@ fn build_snapshot_batch_invalidation(
 
     Ok(cynos_gql::GraphqlInvalidation {
         root_changed,
+        dirty_root_rows: dirty_root_rows.clone(),
+        stable_root_positions: false,
         changed_tables,
         dirty_edge_keys: HashMap::new(),
         dirty_table_rows,
@@ -663,6 +684,8 @@ fn build_delta_batch_invalidation(
 
     let mut invalidation = cynos_gql::GraphqlInvalidation {
         root_changed,
+        dirty_root_rows: HashSet::new(),
+        stable_root_positions: false,
         changed_tables: alloc::vec![table_name.clone()],
         dirty_edge_keys: HashMap::new(),
         dirty_table_rows: HashMap::from([(table_name.clone(), dirty_row_ids)]),
@@ -694,11 +717,60 @@ fn build_delta_batch_invalidation(
     Ok(invalidation)
 }
 
+fn output_deltas_preserve_root_positions(output_deltas: &[Delta<Row>]) -> bool {
+    if output_deltas.is_empty() {
+        return true;
+    }
+
+    let mut insert_ids = HashSet::new();
+    let mut delete_ids = HashSet::new();
+    for delta in output_deltas {
+        if delta.is_insert() {
+            insert_ids.insert(delta.data.id());
+        } else {
+            delete_ids.insert(delta.data.id());
+        }
+    }
+
+    !insert_ids.is_empty()
+        && insert_ids.len() == delete_ids.len()
+        && insert_ids == delete_ids
+        && output_deltas.len() == insert_ids.len().saturating_mul(2)
+}
+
 fn graphql_response_to_js_value(
     response: &cynos_gql::GraphqlResponse,
     encode_cache: &mut GraphqlJsEncodeCache,
 ) -> JsValue {
     gql_response_to_js_with_cache(response, encode_cache).unwrap_or(JsValue::NULL)
+}
+
+fn graphql_response_to_js_value_batched(
+    response: &cynos_gql::GraphqlResponse,
+    encode_cache: &mut GraphqlJsEncodeCache,
+    root_list_cache: &mut GraphqlRootListJsCache,
+    patch: Option<&cynos_gql::GraphqlRootListPatch>,
+) -> JsValue {
+    gql_response_to_js_with_root_list_patch(response, encode_cache, root_list_cache, patch)
+        .unwrap_or(JsValue::NULL)
+}
+
+fn batch_response_changed(state: &cynos_gql::GraphqlBatchState) -> Option<bool> {
+    match state.last_root_patch() {
+        Some(cynos_gql::GraphqlRootListPatch::StablePositions(positions)) => {
+            Some(!positions.is_empty())
+        }
+        Some(cynos_gql::GraphqlRootListPatch::Splice {
+            removed_positions,
+            inserted_positions,
+            updated_positions,
+        }) => Some(
+            !removed_positions.is_empty()
+                || !inserted_positions.is_empty()
+                || !updated_positions.is_empty(),
+        ),
+        None => None,
+    }
 }
 
 /// A re-query based observable that re-executes the query on each change.
@@ -1247,6 +1319,7 @@ pub struct GraphqlSubscriptionObservable {
     response: Option<cynos_gql::GraphqlResponse>,
     response_js: Option<JsValue>,
     response_encode_cache: GraphqlJsEncodeCache,
+    response_root_list_js_cache: GraphqlRootListJsCache,
     response_dirty: bool,
     subscribers: GraphqlSubscribers,
 }
@@ -1278,6 +1351,7 @@ impl GraphqlSubscriptionObservable {
             response: None,
             response_js: None,
             response_encode_cache: GraphqlJsEncodeCache::default(),
+            response_root_list_js_cache: GraphqlRootListJsCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1293,10 +1367,18 @@ impl GraphqlSubscriptionObservable {
                 return payload.clone();
             }
 
-            let payload = graphql_response_to_js_value(
-                self.response.as_ref().unwrap(),
-                &mut self.response_encode_cache,
-            );
+            let payload = match self.batch_plan.as_ref() {
+                Some(_) => graphql_response_to_js_value_batched(
+                    self.response.as_ref().unwrap(),
+                    &mut self.response_encode_cache,
+                    &mut self.response_root_list_js_cache,
+                    self.batch_state.last_root_patch(),
+                ),
+                None => graphql_response_to_js_value(
+                    self.response.as_ref().unwrap(),
+                    &mut self.response_encode_cache,
+                ),
+            };
             self.response_js = Some(payload.clone());
             return payload;
         }
@@ -1312,10 +1394,18 @@ impl GraphqlSubscriptionObservable {
         if let Some(payload) = &self.response_js {
             payload.clone()
         } else {
-            let payload = graphql_response_to_js_value(
-                self.response.as_ref().unwrap(),
-                &mut self.response_encode_cache,
-            );
+            let payload = match self.batch_plan.as_ref() {
+                Some(_) => graphql_response_to_js_value_batched(
+                    self.response.as_ref().unwrap(),
+                    &mut self.response_encode_cache,
+                    &mut self.response_root_list_js_cache,
+                    self.batch_state.last_root_patch(),
+                ),
+                None => graphql_response_to_js_value(
+                    self.response.as_ref().unwrap(),
+                    &mut self.response_encode_cache,
+                ),
+            };
             self.response_js = Some(payload.clone());
             payload
         }
@@ -1338,6 +1428,28 @@ impl GraphqlSubscriptionObservable {
     }
 
     pub fn on_change(&mut self, changes: &HashMap<TableId, HashSet<u64>>) {
+        self.on_change_inner(
+            changes,
+            #[cfg(feature = "benchmark")]
+            None,
+        );
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub(crate) fn on_change_profiled(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+    ) -> GraphqlSnapshotQueryProfile {
+        let mut profile = GraphqlSnapshotQueryProfile::default();
+        self.on_change_inner(changes, Some(&mut profile));
+        profile
+    }
+
+    fn on_change_inner(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        #[cfg(feature = "benchmark")] mut profile: Option<&mut GraphqlSnapshotQueryProfile>,
+    ) {
         if self.subscribers.total_count() == 0 {
             return;
         }
@@ -1354,10 +1466,16 @@ impl GraphqlSubscriptionObservable {
 
         let mut root_changed = false;
         if !root_changed_ids.is_empty() {
+            #[cfg(feature = "benchmark")]
+            let refresh_started_at = now_ms();
             root_changed = match self.refresh_root_rows(&root_changed_ids) {
                 Some(changed) => changed,
                 None => return,
             };
+            #[cfg(feature = "benchmark")]
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.root_refresh_ms += now_ms() - refresh_started_at;
+            }
         }
 
         if !root_changed && !saw_nested_change {
@@ -1365,15 +1483,22 @@ impl GraphqlSubscriptionObservable {
         }
 
         if let Some(plan) = self.batch_plan.as_ref() {
+            #[cfg(feature = "benchmark")]
+            let invalidation_started_at = now_ms();
             match build_snapshot_batch_invalidation(
                 &self.dependency_table_names,
                 changes,
                 root_changed,
+                &root_changed_ids,
             ) {
                 Ok(invalidation) => self.batch_state.apply_invalidation(plan, &invalidation),
                 Err(()) => {
                     self.batch_state = cynos_gql::GraphqlBatchState::default();
                 }
+            }
+            #[cfg(feature = "benchmark")]
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.batch_invalidation_ms += now_ms() - invalidation_started_at;
             }
         }
         self.response_dirty = true;
@@ -1381,12 +1506,35 @@ impl GraphqlSubscriptionObservable {
             return;
         }
 
+        #[cfg(feature = "benchmark")]
+        let render_started_at = now_ms();
         if let Some(changed) = self.materialize_response_if_dirty() {
+            #[cfg(feature = "benchmark")]
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.render_ms += now_ms() - render_started_at;
+            }
             if changed {
                 if self.response.is_some() {
+                    #[cfg(feature = "benchmark")]
+                    let encode_started_at = now_ms();
                     let payload = self.response_js_value();
+                    #[cfg(feature = "benchmark")]
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.encode_ms += now_ms() - encode_started_at;
+                    }
+                    #[cfg(feature = "benchmark")]
+                    let emit_started_at = now_ms();
                     self.subscribers.emit(&payload);
+                    #[cfg(feature = "benchmark")]
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.emit_ms += now_ms() - emit_started_at;
+                    }
                 }
+            }
+        } else {
+            #[cfg(feature = "benchmark")]
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.render_ms += now_ms() - render_started_at;
             }
         }
     }
@@ -1445,10 +1593,17 @@ impl GraphqlSubscriptionObservable {
                 build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows).ok()?
             }
         };
-        let changed = self
-            .response
-            .as_ref()
-            .map_or(true, |current| *current != response);
+        let changed = match self.batch_plan.as_ref() {
+            Some(_) => batch_response_changed(&self.batch_state).unwrap_or_else(|| {
+                self.response
+                    .as_ref()
+                    .map_or(true, |current| *current != response)
+            }),
+            None => self
+                .response
+                .as_ref()
+                .map_or(true, |current| *current != response),
+        };
         if changed {
             self.response = Some(response);
             self.response_js = None;
@@ -1476,7 +1631,15 @@ impl GraphqlSubscriptionObservable {
             None => build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows),
         };
         match response {
-            Ok(response) => graphql_response_to_js_value(&response, &mut self.response_encode_cache),
+            Ok(response) => match self.batch_plan.as_ref() {
+                Some(_) => graphql_response_to_js_value_batched(
+                    &response,
+                    &mut self.response_encode_cache,
+                    &mut self.response_root_list_js_cache,
+                    self.batch_state.last_root_patch(),
+                ),
+                None => graphql_response_to_js_value(&response, &mut self.response_encode_cache),
+            },
             Err(_) => JsValue::NULL,
         }
     }
@@ -1494,6 +1657,7 @@ pub struct GraphqlDeltaObservable {
     response: Option<cynos_gql::GraphqlResponse>,
     response_js: Option<JsValue>,
     response_encode_cache: GraphqlJsEncodeCache,
+    response_root_list_js_cache: GraphqlRootListJsCache,
     response_dirty: bool,
     subscribers: GraphqlSubscribers,
 }
@@ -1521,6 +1685,7 @@ impl GraphqlDeltaObservable {
             response: None,
             response_js: None,
             response_encode_cache: GraphqlJsEncodeCache::default(),
+            response_root_list_js_cache: GraphqlRootListJsCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1549,6 +1714,7 @@ impl GraphqlDeltaObservable {
             response: None,
             response_js: None,
             response_encode_cache: GraphqlJsEncodeCache::default(),
+            response_root_list_js_cache: GraphqlRootListJsCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1588,6 +1754,7 @@ impl GraphqlDeltaObservable {
             response: None,
             response_js: None,
             response_encode_cache: GraphqlJsEncodeCache::default(),
+            response_root_list_js_cache: GraphqlRootListJsCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1627,6 +1794,7 @@ impl GraphqlDeltaObservable {
             response: None,
             response_js: None,
             response_encode_cache: GraphqlJsEncodeCache::default(),
+            response_root_list_js_cache: GraphqlRootListJsCache::default(),
             response_dirty: true,
             subscribers: GraphqlSubscribers::default(),
         }
@@ -1642,10 +1810,18 @@ impl GraphqlDeltaObservable {
                 return payload.clone();
             }
 
-            let payload = graphql_response_to_js_value(
-                self.response.as_ref().unwrap(),
-                &mut self.response_encode_cache,
-            );
+            let payload = match self.batch_plan.as_ref() {
+                Some(_) => graphql_response_to_js_value_batched(
+                    self.response.as_ref().unwrap(),
+                    &mut self.response_encode_cache,
+                    &mut self.response_root_list_js_cache,
+                    self.batch_state.last_root_patch(),
+                ),
+                None => graphql_response_to_js_value(
+                    self.response.as_ref().unwrap(),
+                    &mut self.response_encode_cache,
+                ),
+            };
             self.response_js = Some(payload.clone());
             return payload;
         }
@@ -1661,10 +1837,18 @@ impl GraphqlDeltaObservable {
         if let Some(payload) = &self.response_js {
             payload.clone()
         } else {
-            let payload = graphql_response_to_js_value(
-                self.response.as_ref().unwrap(),
-                &mut self.response_encode_cache,
-            );
+            let payload = match self.batch_plan.as_ref() {
+                Some(_) => graphql_response_to_js_value_batched(
+                    self.response.as_ref().unwrap(),
+                    &mut self.response_encode_cache,
+                    &mut self.response_root_list_js_cache,
+                    self.batch_state.last_root_patch(),
+                ),
+                None => graphql_response_to_js_value(
+                    self.response.as_ref().unwrap(),
+                    &mut self.response_encode_cache,
+                ),
+            };
             self.response_js = Some(payload.clone());
             payload
         }
@@ -1691,6 +1875,31 @@ impl GraphqlDeltaObservable {
     }
 
     pub fn on_table_change(&mut self, table_id: TableId, deltas: Vec<Delta<Row>>) {
+        self.on_table_change_inner(
+            table_id,
+            deltas,
+            #[cfg(feature = "benchmark")]
+            None,
+        );
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub(crate) fn on_table_change_profiled(
+        &mut self,
+        table_id: TableId,
+        deltas: Vec<Delta<Row>>,
+    ) -> GraphqlDeltaProfile {
+        let mut profile = GraphqlDeltaProfile::default();
+        self.on_table_change_inner(table_id, deltas, Some(&mut profile));
+        profile
+    }
+
+    fn on_table_change_inner(
+        &mut self,
+        table_id: TableId,
+        deltas: Vec<Delta<Row>>,
+        #[cfg(feature = "benchmark")] mut profile: Option<&mut GraphqlDeltaProfile>,
+    ) {
         if self.subscribers.total_count() == 0 {
             return;
         }
@@ -1704,15 +1913,31 @@ impl GraphqlDeltaObservable {
                 false,
             )
         });
+        #[cfg(feature = "benchmark")]
+        let view_started_at = now_ms();
         let output_deltas = self.view.on_table_change(table_id, deltas);
+        #[cfg(feature = "benchmark")]
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.view_update_ms += now_ms() - view_started_at;
+        }
         if output_deltas.is_empty() && !self.has_nested_relations {
             return;
         }
 
         if let Some(plan) = self.batch_plan.as_ref() {
+            #[cfg(feature = "benchmark")]
+            let invalidation_started_at = now_ms();
             match batch_invalidation {
                 Some(Ok(mut invalidation)) => {
                     invalidation.root_changed = !output_deltas.is_empty();
+                    if invalidation.root_changed {
+                        invalidation.dirty_root_rows = output_deltas
+                            .iter()
+                            .map(|delta| delta.data.id())
+                            .collect();
+                        invalidation.stable_root_positions =
+                            output_deltas_preserve_root_positions(&output_deltas);
+                    }
                     self.batch_state.apply_invalidation(plan, &invalidation);
                 }
                 Some(Err(())) => {
@@ -1720,18 +1945,45 @@ impl GraphqlDeltaObservable {
                 }
                 None => {}
             }
+            #[cfg(feature = "benchmark")]
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.invalidation_ms += now_ms() - invalidation_started_at;
+            }
         }
         self.response_dirty = true;
         if self.subscribers.callback_count() == 0 {
             return;
         }
 
+        #[cfg(feature = "benchmark")]
+        let render_started_at = now_ms();
         if let Some(changed) = self.materialize_response_if_dirty() {
+            #[cfg(feature = "benchmark")]
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.render_ms += now_ms() - render_started_at;
+            }
             if changed {
                 if self.response.is_some() {
+                    #[cfg(feature = "benchmark")]
+                    let encode_started_at = now_ms();
                     let payload = self.response_js_value();
+                    #[cfg(feature = "benchmark")]
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.encode_ms += now_ms() - encode_started_at;
+                    }
+                    #[cfg(feature = "benchmark")]
+                    let emit_started_at = now_ms();
                     self.subscribers.emit(&payload);
+                    #[cfg(feature = "benchmark")]
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.emit_ms += now_ms() - emit_started_at;
+                    }
                 }
+            }
+        } else {
+            #[cfg(feature = "benchmark")]
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.render_ms += now_ms() - render_started_at;
             }
         }
     }
@@ -1741,24 +1993,36 @@ impl GraphqlDeltaObservable {
             return Some(false);
         }
 
-        let rows = self.view.result_rc();
         let cache = self.cache.borrow();
         let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_batched(
-                &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &rows,
-            )
-            .ok()?,
-            None => build_graphql_response(&cache, &self.catalog, &self.field, &rows).ok()?,
+            Some(plan) => {
+                let rows = self.view.result_row_refs().collect::<Vec<_>>();
+                build_graphql_response_batched_refs(
+                    &cache,
+                    &self.catalog,
+                    &self.field,
+                    plan,
+                    &mut self.batch_state,
+                    &rows,
+                )
+                .ok()?
+            }
+            None => {
+                let rows = self.view.result_rc();
+                build_graphql_response(&cache, &self.catalog, &self.field, &rows).ok()?
+            }
         };
-        let changed = self
-            .response
-            .as_ref()
-            .map_or(true, |current| *current != response);
+        let changed = match self.batch_plan.as_ref() {
+            Some(_) => batch_response_changed(&self.batch_state).unwrap_or_else(|| {
+                self.response
+                    .as_ref()
+                    .map_or(true, |current| *current != response)
+            }),
+            None => self
+                .response
+                .as_ref()
+                .map_or(true, |current| *current != response),
+        };
         if changed {
             self.response = Some(response);
             self.response_js = None;
@@ -1773,21 +2037,34 @@ impl GraphqlDeltaObservable {
     }
 
     fn render_response_js_value(&mut self) -> JsValue {
-        let rows = self.view.result_rc();
         let cache = self.cache.borrow();
         let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_batched(
-                &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &rows,
-            ),
-            None => build_graphql_response(&cache, &self.catalog, &self.field, &rows),
+            Some(plan) => {
+                let rows = self.view.result_row_refs().collect::<Vec<_>>();
+                build_graphql_response_batched_refs(
+                    &cache,
+                    &self.catalog,
+                    &self.field,
+                    plan,
+                    &mut self.batch_state,
+                    &rows,
+                )
+            }
+            None => {
+                let rows = self.view.result_rc();
+                build_graphql_response(&cache, &self.catalog, &self.field, &rows)
+            }
         };
         match response {
-            Ok(response) => graphql_response_to_js_value(&response, &mut self.response_encode_cache),
+            Ok(response) => match self.batch_plan.as_ref() {
+                Some(_) => graphql_response_to_js_value_batched(
+                    &response,
+                    &mut self.response_encode_cache,
+                    &mut self.response_root_list_js_cache,
+                    self.batch_state.last_root_patch(),
+                ),
+                None => graphql_response_to_js_value(&response, &mut self.response_encode_cache),
+            },
             Err(_) => JsValue::NULL,
         }
     }

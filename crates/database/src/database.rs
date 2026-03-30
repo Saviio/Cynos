@@ -791,6 +791,36 @@ fn delta_flush_profile_to_js_value(profile: DeltaFlushProfile) -> JsValue {
     .ok();
     js_sys::Reflect::set(
         &object,
+        &JsValue::from_str("graphqlViewUpdateMs"),
+        &JsValue::from_f64(profile.graphql_view_update_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlInvalidationMs"),
+        &JsValue::from_f64(profile.graphql_invalidation_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlRenderMs"),
+        &JsValue::from_f64(profile.graphql_render_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlEncodeMs"),
+        &JsValue::from_f64(profile.graphql_encode_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlEmitMs"),
+        &JsValue::from_f64(profile.graphql_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
         &JsValue::from_str("totalMs"),
         &JsValue::from_f64(profile.total_ms),
     )
@@ -1055,6 +1085,36 @@ fn snapshot_flush_profile_to_js_value(profile: SnapshotFlushProfile) -> JsValue 
         &object,
         &JsValue::from_str("graphqlQueryOnChangeMs"),
         &JsValue::from_f64(profile.graphql_query_on_change_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlRootRefreshMs"),
+        &JsValue::from_f64(profile.graphql_root_refresh_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlBatchInvalidationMs"),
+        &JsValue::from_f64(profile.graphql_batch_invalidation_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlRenderMs"),
+        &JsValue::from_f64(profile.graphql_render_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlEncodeMs"),
+        &JsValue::from_f64(profile.graphql_encode_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlEmitMs"),
+        &JsValue::from_f64(profile.graphql_emit_ms),
     )
     .ok();
     js_sys::Reflect::set(

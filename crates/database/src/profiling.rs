@@ -15,7 +15,22 @@ pub(crate) struct DeltaFlushProfile {
     pub join_execute_ms: f64,
     pub aggregate_execute_ms: f64,
     pub result_apply_ms: f64,
+    pub graphql_view_update_ms: f64,
+    pub graphql_invalidation_ms: f64,
+    pub graphql_render_ms: f64,
+    pub graphql_encode_ms: f64,
+    pub graphql_emit_ms: f64,
     pub total_ms: f64,
+}
+
+#[cfg(feature = "benchmark")]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GraphqlDeltaProfile {
+    pub view_update_ms: f64,
+    pub invalidation_ms: f64,
+    pub render_ms: f64,
+    pub encode_ms: f64,
+    pub emit_ms: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -107,6 +122,11 @@ pub(crate) struct SnapshotFlushProfile {
     pub invalidation_merge_ms: f64,
     pub rows_query_on_change_ms: f64,
     pub graphql_query_on_change_ms: f64,
+    pub graphql_root_refresh_ms: f64,
+    pub graphql_batch_invalidation_ms: f64,
+    pub graphql_render_ms: f64,
+    pub graphql_encode_ms: f64,
+    pub graphql_emit_ms: f64,
     pub reactive_patch_attempt_count: usize,
     pub reactive_patch_hit_count: usize,
     pub reactive_patch_ms: f64,
@@ -127,6 +147,16 @@ pub(crate) struct SnapshotFlushProfile {
     pub full_requery_compare_ms: f64,
     pub callback_ms: f64,
     pub total_ms: f64,
+}
+
+#[cfg(feature = "benchmark")]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GraphqlSnapshotQueryProfile {
+    pub root_refresh_ms: f64,
+    pub batch_invalidation_ms: f64,
+    pub render_ms: f64,
+    pub encode_ms: f64,
+    pub emit_ms: f64,
 }
 
 impl SnapshotFlushProfile {

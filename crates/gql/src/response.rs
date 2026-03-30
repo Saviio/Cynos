@@ -36,6 +36,10 @@ impl ResponseValue {
     pub fn list(items: Vec<ResponseValue>) -> Self {
         Self::List(items.into())
     }
+
+    pub fn list_shared(items: Rc<[ResponseValue]>) -> Self {
+        Self::List(items)
+    }
 }
 
 impl PartialEq for ResponseValue {

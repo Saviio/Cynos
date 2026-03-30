@@ -1,6 +1,6 @@
 use crate::binary_protocol::SchemaLayout;
 #[cfg(feature = "benchmark")]
-use crate::profiling::SnapshotInitProfile;
+use crate::profiling::{GraphqlDeltaProfile, SnapshotInitProfile};
 use crate::profiling::{
     now_ms, DeltaFlushProfile, IvmBridgeProfile, IvmBridgeProfiler, SnapshotFlushProfile,
     TraceInitProfile,
@@ -1145,17 +1145,56 @@ impl DeltaSubscription {
         &self,
         table_id: TableId,
         deltas: Vec<Delta<Row>>,
-    ) -> TraceUpdateProfile {
+    ) -> DeltaQueryUpdateProfile {
         match self {
-            Self::Rows(query) => {
+            Self::Rows(query) => DeltaQueryUpdateProfile::from_trace(
                 query
                     .borrow_mut()
-                    .on_table_change_profiled(table_id, deltas, Some(now_ms))
-            }
-            Self::Graphql(query) => {
-                query.borrow_mut().on_table_change(table_id, deltas);
-                TraceUpdateProfile::default()
-            }
+                    .on_table_change_profiled(table_id, deltas, Some(now_ms)),
+            ),
+            Self::Graphql(query) => DeltaQueryUpdateProfile::from_graphql(
+                query.borrow_mut().on_table_change_profiled(table_id, deltas),
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "benchmark")]
+#[derive(Clone, Debug, Default)]
+struct DeltaQueryUpdateProfile {
+    source_dispatch_ms: f64,
+    unary_execute_ms: f64,
+    join_execute_ms: f64,
+    aggregate_execute_ms: f64,
+    result_apply_ms: f64,
+    graphql_view_update_ms: f64,
+    graphql_invalidation_ms: f64,
+    graphql_render_ms: f64,
+    graphql_encode_ms: f64,
+    graphql_emit_ms: f64,
+}
+
+#[cfg(feature = "benchmark")]
+impl DeltaQueryUpdateProfile {
+    fn from_trace(profile: TraceUpdateProfile) -> Self {
+        Self {
+            source_dispatch_ms: profile.source_dispatch_ms,
+            unary_execute_ms: profile.unary_execute_ms,
+            join_execute_ms: profile.join_execute_ms,
+            aggregate_execute_ms: profile.aggregate_execute_ms,
+            result_apply_ms: profile.result_apply_ms,
+            ..Self::default()
+        }
+    }
+
+    fn from_graphql(profile: GraphqlDeltaProfile) -> Self {
+        Self {
+            graphql_view_update_ms: profile.view_update_ms,
+            graphql_invalidation_ms: profile.invalidation_ms,
+            graphql_render_ms: profile.render_ms,
+            graphql_encode_ms: profile.encode_ms,
+            graphql_emit_ms: profile.emit_ms,
+            ..Self::default()
         }
     }
 }
@@ -1280,9 +1319,20 @@ impl LiveRegistry {
 
         for (_, (query, changes)) in merged_graphql {
             let query_started_at = now_ms();
+            #[cfg(feature = "benchmark")]
+            let sample = query.borrow_mut().on_change_profiled(&changes);
+            #[cfg(not(feature = "benchmark"))]
             query.borrow_mut().on_change(&changes);
             profile.graphql_query_count += 1;
             profile.graphql_query_on_change_ms += now_ms() - query_started_at;
+            #[cfg(feature = "benchmark")]
+            {
+                profile.graphql_root_refresh_ms += sample.root_refresh_ms;
+                profile.graphql_batch_invalidation_ms += sample.batch_invalidation_ms;
+                profile.graphql_render_ms += sample.render_ms;
+                profile.graphql_encode_ms += sample.encode_ms;
+                profile.graphql_emit_ms += sample.emit_ms;
+            }
         }
 
         profile.total_ms = now_ms() - started_at;
@@ -1369,6 +1419,11 @@ impl LiveRegistry {
                         profile.join_execute_ms += update_profile.join_execute_ms;
                         profile.aggregate_execute_ms += update_profile.aggregate_execute_ms;
                         profile.result_apply_ms += update_profile.result_apply_ms;
+                        profile.graphql_view_update_ms += update_profile.graphql_view_update_ms;
+                        profile.graphql_invalidation_ms += update_profile.graphql_invalidation_ms;
+                        profile.graphql_render_ms += update_profile.graphql_render_ms;
+                        profile.graphql_encode_ms += update_profile.graphql_encode_ms;
+                        profile.graphql_emit_ms += update_profile.graphql_emit_ms;
                     }
                 }
             }

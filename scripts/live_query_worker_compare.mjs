@@ -49,6 +49,7 @@ const ENGINE_DEFS = {
     id: 'cynos',
     label: 'Cynos (GraphQL)',
     workerUrl: new URL('./cynos_graphql_worker_runtime.mjs', import.meta.url),
+    expectsMutationProfiles: true,
     notes: [
       'Worker initializes local Cynos WASM tables directly from the same synthetic server dataset and subscribes through generated GraphQL documents.',
       'GraphQL subscriptions can route through the engine’s delta-backed live planner when the query shape allows it, while still presenting full payload snapshots to the benchmark host.',

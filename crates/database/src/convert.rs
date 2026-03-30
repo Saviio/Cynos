@@ -11,6 +11,7 @@ use cynos_core::schema::Table;
 use cynos_core::{DataType, Row, Value};
 use hashbrown::HashMap;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
 type JsonbJsCache = HashMap<Vec<u8>, JsValue>;
 type GraphqlFieldKeyCache = HashMap<Rc<str>, JsValue>;
@@ -30,6 +31,12 @@ pub(crate) struct GraphqlJsEncodeCache {
     field_key_cache: GraphqlFieldKeyCache,
     object_cache: GraphqlObjectJsCache,
     list_cache: GraphqlListJsCache,
+}
+
+#[derive(Default)]
+pub(crate) struct GraphqlRootListJsCache {
+    list_len: Option<usize>,
+    array: Option<js_sys::Array>,
 }
 
 impl GraphqlJsEncodeCache {
@@ -408,6 +415,159 @@ pub(crate) fn gql_response_to_js_with_cache(
     let data = gql_value_to_js_with_cache(&response.data, cache);
     js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &data)?;
     Ok(obj.into())
+}
+
+pub(crate) fn gql_response_to_js_with_root_list_patch(
+    response: &cynos_gql::GraphqlResponse,
+    cache: &mut GraphqlJsEncodeCache,
+    root_list_cache: &mut GraphqlRootListJsCache,
+    patch: Option<&cynos_gql::GraphqlRootListPatch>,
+) -> Result<JsValue, JsValue> {
+    let cynos_gql::ResponseValue::Object(data_fields) = &response.data else {
+        return gql_response_to_js_with_cache(response, cache);
+    };
+    if data_fields.len() != 1 {
+        return gql_response_to_js_with_cache(response, cache);
+    }
+
+    let root_field = &data_fields[0];
+    let cynos_gql::ResponseValue::List(root_items) = &root_field.value else {
+        return gql_response_to_js_with_cache(response, cache);
+    };
+
+    let array = match (root_list_cache.list_len, root_list_cache.array.as_ref(), patch) {
+        (
+            Some(previous_len),
+            Some(previous_array),
+            Some(cynos_gql::GraphqlRootListPatch::StablePositions(positions)),
+        ) if previous_len == root_items.len() => {
+            let next = previous_array.slice(0, previous_len as u32);
+            for &position in positions {
+                if let Some(value) = root_items.get(position) {
+                    next.set(position as u32, gql_value_to_js_with_cache(value, cache));
+                }
+            }
+            next
+        }
+        (
+            Some(previous_len),
+            Some(previous_array),
+            Some(cynos_gql::GraphqlRootListPatch::Splice {
+                removed_positions,
+                inserted_positions,
+                updated_positions,
+            }),
+        ) => {
+            let next = previous_array.slice(0, previous_len as u32);
+            for (start, delete_count) in contiguous_remove_groups(removed_positions) {
+                array_splice(&next, start as u32, delete_count as u32, &[])?;
+            }
+            for (start, end) in contiguous_insert_groups(inserted_positions) {
+                let items = (start..end)
+                    .filter_map(|position| root_items.get(position))
+                    .map(|value| gql_value_to_js_with_cache(value, cache))
+                    .collect::<Vec<_>>();
+                array_splice(&next, start as u32, 0, &items)?;
+            }
+            for &position in updated_positions {
+                if let Some(value) = root_items.get(position) {
+                    next.set(position as u32, gql_value_to_js_with_cache(value, cache));
+                }
+            }
+            next
+        }
+        _ => encode_graphql_root_list(root_items, cache),
+    };
+
+    root_list_cache.list_len = Some(root_items.len());
+    root_list_cache.array = Some(array.clone());
+
+    let data = js_sys::Object::new();
+    let root_key = cache
+        .field_key_cache
+        .entry(root_field.name.clone())
+        .or_insert_with(|| JsValue::from_str(root_field.name.as_ref()))
+        .clone();
+    js_sys::Reflect::set(&data, &root_key, &array.clone().into())?;
+
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &data.into())?;
+    Ok(obj.into())
+}
+
+fn encode_graphql_root_list(
+    root_items: &[cynos_gql::ResponseValue],
+    cache: &mut GraphqlJsEncodeCache,
+) -> js_sys::Array {
+    let array = js_sys::Array::new_with_length(root_items.len() as u32);
+    for (index, value) in root_items.iter().enumerate() {
+        array.set(index as u32, gql_value_to_js_with_cache(value, cache));
+    }
+    array
+}
+
+fn array_splice(
+    array: &js_sys::Array,
+    start: u32,
+    delete_count: u32,
+    items: &[JsValue],
+) -> Result<(), JsValue> {
+    let splice = js_sys::Reflect::get(array.as_ref(), &JsValue::from_str("splice"))?
+        .dyn_into::<js_sys::Function>()?;
+    let args = js_sys::Array::new_with_length((2 + items.len()) as u32);
+    args.set(0, JsValue::from_f64(start as f64));
+    args.set(1, JsValue::from_f64(delete_count as f64));
+    for (index, item) in items.iter().enumerate() {
+        args.set((index + 2) as u32, item.clone());
+    }
+    splice.apply(array.as_ref(), &args)?;
+    Ok(())
+}
+
+fn contiguous_remove_groups(removed_positions: &[usize]) -> Vec<(usize, usize)> {
+    if removed_positions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut positions = removed_positions.to_vec();
+    positions.sort_unstable();
+
+    let mut groups = Vec::new();
+    let mut start = positions[0];
+    let mut len = 1usize;
+    for &position in positions.iter().skip(1) {
+        if position == start + len {
+            len += 1;
+        } else {
+            groups.push((start, len));
+            start = position;
+            len = 1;
+        }
+    }
+    groups.push((start, len));
+    groups.reverse();
+    groups
+}
+
+fn contiguous_insert_groups(inserted_positions: &[usize]) -> Vec<(usize, usize)> {
+    if inserted_positions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut groups = Vec::new();
+    let mut start = inserted_positions[0];
+    let mut end = start + 1;
+    for &position in inserted_positions.iter().skip(1) {
+        if position == end {
+            end += 1;
+        } else {
+            groups.push((start, end));
+            start = position;
+            end = position + 1;
+        }
+    }
+    groups.push((start, end));
+    groups
 }
 
 fn js_to_gql_input_value(js: &JsValue) -> Result<cynos_gql::InputValue, JsValue> {

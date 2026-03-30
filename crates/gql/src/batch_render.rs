@@ -21,9 +21,27 @@ use crate::render_plan::{
 };
 use crate::response::{GraphqlResponse, ResponseField, ResponseValue};
 
+trait RowRenderRef {
+    fn row_rc(&self) -> &Rc<Row>;
+}
+
+impl RowRenderRef for Rc<Row> {
+    fn row_rc(&self) -> &Rc<Row> {
+        self
+    }
+}
+
+impl RowRenderRef for &Rc<Row> {
+    fn row_rc(&self) -> &Rc<Row> {
+        self
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GraphqlInvalidation {
     pub root_changed: bool,
+    pub dirty_root_rows: HashSet<u64>,
+    pub stable_root_positions: bool,
     pub changed_tables: Vec<String>,
     pub dirty_edge_keys: HashMap<EdgeId, HashSet<Value>>,
     pub dirty_table_rows: HashMap<String, HashSet<u64>>,
@@ -54,6 +72,28 @@ pub struct GraphqlBatchState {
     node_row_index: HashMap<NodeId, HashMap<u64, HashSet<RowCacheKey>>>,
     edge_bucket_cache: HashMap<EdgeId, HashMap<Value, Vec<Rc<Row>>>>,
     edge_parent_membership: HashMap<EdgeId, HashMap<Value, HashSet<RowCacheKey>>>,
+    root_list_cache: Option<RootListCacheEntry>,
+    dirty_root_rows: HashSet<u64>,
+    root_list_requires_full_rebuild: bool,
+    last_root_patch: Option<GraphqlRootListPatch>,
+}
+
+#[derive(Clone, Debug)]
+struct RootListCacheEntry {
+    row_keys: Vec<RowCacheKey>,
+    row_positions: HashMap<u64, usize>,
+    items: Rc<[ResponseValue]>,
+    list_value: ResponseValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphqlRootListPatch {
+    StablePositions(Vec<usize>),
+    Splice {
+        removed_positions: Vec<usize>,
+        inserted_positions: Vec<usize>,
+        updated_positions: Vec<usize>,
+    },
 }
 
 impl GraphqlBatchState {
@@ -67,7 +107,18 @@ impl GraphqlBatchState {
         let mut seen = HashSet::new();
 
         if invalidation.root_changed {
-            self.collect_node_rows(plan.root_node(), &mut pending);
+            self.dirty_root_rows
+                .extend(invalidation.dirty_root_rows.iter().copied());
+            if !invalidation.stable_root_positions {
+                self.root_list_requires_full_rebuild = true;
+            }
+            if invalidation.dirty_root_rows.is_empty() {
+                self.collect_node_rows(plan.root_node(), &mut pending);
+            } else {
+                for row_id in &invalidation.dirty_root_rows {
+                    self.collect_row_id_entries(plan.root_node(), *row_id, &mut pending);
+                }
+            }
         }
 
         for (table_name, row_ids) in &invalidation.dirty_table_rows {
@@ -114,6 +165,9 @@ impl GraphqlBatchState {
         while let Some(row_key) = pending.pop() {
             if !seen.insert(row_key) {
                 continue;
+            }
+            if row_key.node_id == plan.root_node() {
+                self.dirty_root_rows.insert(row_key.row_id);
             }
             let parents = self.parent_rows_for_row(plan, row_key);
             self.remove_row_entry(row_key);
@@ -255,6 +309,49 @@ impl GraphqlBatchState {
                 self.node_row_index.remove(&row_key.node_id);
             }
         }
+
+        if self
+            .root_list_cache
+            .as_ref()
+            .is_some_and(|cache| cache.row_positions.contains_key(&row_key.row_id))
+        {
+            self.dirty_root_rows.insert(row_key.row_id);
+        }
+    }
+
+    fn clear_root_list_cache(&mut self) {
+        self.root_list_cache = None;
+        self.dirty_root_rows.clear();
+        self.root_list_requires_full_rebuild = false;
+        self.last_root_patch = None;
+    }
+
+    fn update_root_list_cache(
+        &mut self,
+        row_keys: Vec<RowCacheKey>,
+        items: Vec<ResponseValue>,
+    ) -> ResponseValue {
+        let row_positions = row_keys
+            .iter()
+            .enumerate()
+            .map(|(index, row_key)| (row_key.row_id, index))
+            .collect();
+        let items: Rc<[ResponseValue]> = items.into();
+        let list_value = ResponseValue::list_shared(items.clone());
+        self.root_list_cache = Some(RootListCacheEntry {
+            row_keys,
+            row_positions,
+            items,
+            list_value: list_value.clone(),
+        });
+        self.dirty_root_rows.clear();
+        self.root_list_requires_full_rebuild = false;
+        self.last_root_patch = None;
+        list_value
+    }
+
+    pub fn last_root_patch(&self) -> Option<&GraphqlRootListPatch> {
+        self.last_root_patch.as_ref()
     }
 }
 
@@ -266,42 +363,63 @@ pub fn render_graphql_response(
     state: &mut GraphqlBatchState,
     rows: &[Rc<Row>],
 ) -> GqlResult<GraphqlResponse> {
+    render_graphql_response_impl(cache, catalog, field, plan, state, rows)
+}
+
+pub fn render_graphql_response_refs(
+    cache: &TableCache,
+    catalog: &GraphqlCatalog,
+    field: &BoundRootField,
+    plan: &GraphqlBatchPlan,
+    state: &mut GraphqlBatchState,
+    rows: &[&Rc<Row>],
+) -> GqlResult<GraphqlResponse> {
+    render_graphql_response_impl(cache, catalog, field, plan, state, rows)
+}
+
+fn render_graphql_response_impl<R: RowRenderRef>(
+    cache: &TableCache,
+    catalog: &GraphqlCatalog,
+    field: &BoundRootField,
+    plan: &GraphqlBatchPlan,
+    state: &mut GraphqlBatchState,
+    rows: &[R],
+) -> GqlResult<GraphqlResponse> {
     let field = render_root_field(cache, catalog, field, plan, state, rows)?;
     Ok(GraphqlResponse::new(ResponseValue::object(alloc::vec![
         field
     ])))
 }
 
-fn render_root_field(
+fn render_root_field<R: RowRenderRef>(
     cache: &TableCache,
     catalog: &GraphqlCatalog,
     field: &BoundRootField,
     plan: &GraphqlBatchPlan,
     state: &mut GraphqlBatchState,
-    rows: &[Rc<Row>],
+    rows: &[R],
 ) -> GqlResult<ResponseField> {
     let value = match &field.kind {
         BoundRootFieldKind::Collection { .. }
         | BoundRootFieldKind::Insert { .. }
         | BoundRootFieldKind::Update { .. }
-        | BoundRootFieldKind::Delete { .. } => ResponseValue::list(render_node_list(
-            cache,
-            catalog,
-            plan,
-            state,
-            plan.root_node(),
-            rows,
-        )?),
+        | BoundRootFieldKind::Delete { .. } => {
+            render_root_node_list(cache, catalog, plan, state, plan.root_node(), rows)?
+        }
         BoundRootFieldKind::ByPk { .. } => match rows.first() {
             Some(row) => {
-                prefetch_node_edges(
-                    cache,
-                    catalog,
-                    plan,
-                    state,
-                    plan.root_node(),
-                    core::slice::from_ref(row),
-                )?;
+                let row = row.row_rc();
+                if !row_is_cached(state, plan.root_node(), row) {
+                    let singleton = [row];
+                    prefetch_node_edges(
+                        cache,
+                        catalog,
+                        plan,
+                        state,
+                        plan.root_node(),
+                        &singleton,
+                    )?;
+                }
                 render_node_object(cache, catalog, plan, state, plan.root_node(), row)?
             }
             None => ResponseValue::Null,
@@ -317,24 +435,286 @@ fn render_root_field(
     Ok(ResponseField::new(field.response_key.clone(), value))
 }
 
-fn render_node_list(
+fn render_root_node_list<R: RowRenderRef>(
     cache: &TableCache,
     catalog: &GraphqlCatalog,
     plan: &GraphqlBatchPlan,
     state: &mut GraphqlBatchState,
     node_id: NodeId,
-    rows: &[Rc<Row>],
+    rows: &[R],
+) -> GqlResult<ResponseValue> {
+    if rows.is_empty() {
+        state.clear_root_list_cache();
+        return Ok(ResponseValue::list(Vec::new()));
+    }
+
+    if let Some(list_value) = try_render_root_node_list_cached(
+        cache, catalog, plan, state, node_id, rows,
+    )? {
+        return Ok(list_value);
+    }
+
+    let items = render_node_list(cache, catalog, plan, state, node_id, rows)?;
+    let row_keys = rows
+        .iter()
+        .map(|row| RowCacheKey::new(node_id, row.row_rc()))
+        .collect();
+    Ok(state.update_root_list_cache(row_keys, items))
+}
+
+fn try_render_root_node_list_cached<R: RowRenderRef>(
+    cache: &TableCache,
+    catalog: &GraphqlCatalog,
+    plan: &GraphqlBatchPlan,
+    state: &mut GraphqlBatchState,
+    node_id: NodeId,
+    rows: &[R],
+) -> GqlResult<Option<ResponseValue>> {
+    let Some(mut cached) = state.root_list_cache.take() else {
+        return Ok(None);
+    };
+
+    if !state.root_list_requires_full_rebuild {
+        if cached.row_keys.len() == rows.len() {
+            if state.dirty_root_rows.is_empty() {
+                let list_value = cached.list_value.clone();
+                state.root_list_cache = Some(cached);
+                return Ok(Some(list_value));
+            }
+
+            let dirty_positions = state
+                .dirty_root_rows
+                .iter()
+                .map(|row_id| {
+                    cached
+                        .row_positions
+                        .get(row_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            GqlError::new(GqlErrorKind::Execution, "missing root row position")
+                        })
+                })
+                .collect::<GqlResult<Vec<_>>>();
+
+            match dirty_positions {
+                Ok(dirty_positions) => {
+                    let mut row_keys = cached.row_keys.clone();
+                    let mut items = cached.items.as_ref().to_vec();
+                    let mut changed = false;
+                    let mut applied_positions = Vec::with_capacity(dirty_positions.len());
+
+                    for position in dirty_positions {
+                        let row = rows
+                            .get(position)
+                            .map(RowRenderRef::row_rc)
+                            .ok_or_else(|| {
+                                GqlError::new(
+                                    GqlErrorKind::Execution,
+                                    "root row position out of bounds",
+                                )
+                            })?;
+                        if row.id() != row_keys[position].row_id {
+                            state.root_list_requires_full_rebuild = true;
+                            break;
+                        }
+                        if !row_is_cached(state, node_id, row) {
+                            let singleton = [row];
+                            prefetch_node_edges(cache, catalog, plan, state, node_id, &singleton)?;
+                        }
+                        let rendered =
+                            render_node_object(cache, catalog, plan, state, node_id, row)?;
+                        if items[position] != rendered {
+                            items[position] = rendered;
+                            changed = true;
+                        }
+                        row_keys[position] = RowCacheKey::new(node_id, row);
+                        applied_positions.push(position);
+                    }
+
+                    if !state.root_list_requires_full_rebuild {
+                        if changed {
+                            let list_value = state.update_root_list_cache(row_keys, items);
+                            state.last_root_patch =
+                                Some(GraphqlRootListPatch::StablePositions(applied_positions));
+                            return Ok(Some(list_value));
+                        }
+                        cached.row_keys = row_keys;
+                        cached.row_positions = cached
+                            .row_keys
+                            .iter()
+                            .enumerate()
+                            .map(|(index, row_key)| (row_key.row_id, index))
+                            .collect();
+                        state.dirty_root_rows.clear();
+                        state.last_root_patch =
+                            Some(GraphqlRootListPatch::StablePositions(Vec::new()));
+                        let list_value = cached.list_value.clone();
+                        state.root_list_cache = Some(cached);
+                        return Ok(Some(list_value));
+                    }
+                }
+                Err(_) => {
+                    state.root_list_requires_full_rebuild = true;
+                }
+            }
+        } else {
+            state.root_list_requires_full_rebuild = true;
+        }
+    }
+
+    if let Some((row_keys, items, patch)) =
+        try_render_root_node_list_splice(cache, catalog, plan, state, node_id, rows, &cached)?
+    {
+        let list_value = state.update_root_list_cache(row_keys, items);
+        state.last_root_patch = Some(patch);
+        return Ok(Some(list_value));
+    }
+
+    Ok(None)
+}
+
+fn try_render_root_node_list_splice<R: RowRenderRef>(
+    cache: &TableCache,
+    catalog: &GraphqlCatalog,
+    plan: &GraphqlBatchPlan,
+    state: &mut GraphqlBatchState,
+    node_id: NodeId,
+    rows: &[R],
+    cached: &RootListCacheEntry,
+) -> GqlResult<Option<(Vec<RowCacheKey>, Vec<ResponseValue>, GraphqlRootListPatch)>> {
+    let row_keys = rows
+        .iter()
+        .map(|row| RowCacheKey::new(node_id, row.row_rc()))
+        .collect::<Vec<_>>();
+    let new_row_positions = row_keys
+        .iter()
+        .enumerate()
+        .map(|(index, row_key)| (row_key.row_id, index))
+        .collect::<HashMap<_, _>>();
+
+    let mut removed_positions = cached
+        .row_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row_key)| {
+            (!new_row_positions.contains_key(&row_key.row_id)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    removed_positions.sort_unstable_by(|left, right| right.cmp(left));
+
+    let inserted_positions = row_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row_key)| {
+            (!cached.row_positions.contains_key(&row_key.row_id)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    let mut last_old_position = None;
+    for row_key in &row_keys {
+        let Some(old_position) = cached.row_positions.get(&row_key.row_id).copied() else {
+            continue;
+        };
+        if last_old_position.is_some_and(|previous| old_position < previous) {
+            return Ok(None);
+        }
+        last_old_position = Some(old_position);
+    }
+
+    let mut positions_needing_render = inserted_positions.clone();
+    let mut updated_positions = Vec::new();
+    for (position, row_key) in row_keys.iter().enumerate() {
+        let Some(old_position) = cached.row_positions.get(&row_key.row_id).copied() else {
+            continue;
+        };
+        if cached.row_keys[old_position] != *row_key || state.dirty_root_rows.contains(&row_key.row_id)
+        {
+            positions_needing_render.push(position);
+        }
+    }
+    positions_needing_render.sort_unstable();
+    positions_needing_render.dedup();
+
+    let uncached_rows = positions_needing_render
+        .iter()
+        .filter_map(|position| rows.get(*position).map(RowRenderRef::row_rc))
+        .filter(|row| !row_is_cached(state, node_id, row))
+        .collect::<Vec<_>>();
+    if !uncached_rows.is_empty() {
+        prefetch_node_edges(cache, catalog, plan, state, node_id, &uncached_rows)?;
+    }
+
+    let positions_needing_render = positions_needing_render
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut items = Vec::with_capacity(rows.len());
+    for (position, row_key) in row_keys.iter().enumerate() {
+        let old_position = cached.row_positions.get(&row_key.row_id).copied();
+        if !positions_needing_render.contains(&position) {
+            if let Some(old_position) = old_position {
+                items.push(cached.items[old_position].clone());
+                continue;
+            }
+        }
+
+        let row = rows
+            .get(position)
+            .map(RowRenderRef::row_rc)
+            .ok_or_else(|| GqlError::new(GqlErrorKind::Execution, "root row position out of bounds"))?;
+        let rendered = render_node_object(cache, catalog, plan, state, node_id, row)?;
+        if let Some(old_position) = old_position {
+            if cached.items[old_position] == rendered {
+                items.push(cached.items[old_position].clone());
+            } else {
+                updated_positions.push(position);
+                items.push(rendered);
+            }
+        } else {
+            items.push(rendered);
+        }
+    }
+
+    Ok(Some((
+        row_keys,
+        items,
+        GraphqlRootListPatch::Splice {
+            removed_positions,
+            inserted_positions,
+            updated_positions,
+        },
+    )))
+}
+
+fn render_node_list<R: RowRenderRef>(
+    cache: &TableCache,
+    catalog: &GraphqlCatalog,
+    plan: &GraphqlBatchPlan,
+    state: &mut GraphqlBatchState,
+    node_id: NodeId,
+    rows: &[R],
 ) -> GqlResult<Vec<ResponseValue>> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
 
-    prefetch_node_edges(cache, catalog, plan, state, node_id, rows)?;
+    let uncached_rows = rows
+        .iter()
+        .map(RowRenderRef::row_rc)
+        .filter(|row| !row_is_cached(state, node_id, row))
+        .collect::<Vec<_>>();
+    if !uncached_rows.is_empty() {
+        prefetch_node_edges(cache, catalog, plan, state, node_id, &uncached_rows)?;
+    }
 
     let mut values = Vec::with_capacity(rows.len());
     for row in rows {
         values.push(render_node_object(
-            cache, catalog, plan, state, node_id, row,
+            cache,
+            catalog,
+            plan,
+            state,
+            node_id,
+            row.row_rc(),
         )?);
     }
     Ok(values)
@@ -410,18 +790,25 @@ fn render_forward_relation(
 
     match child_row {
         Some(child_row) => {
-            prefetch_node_edges(
-                cache,
-                catalog,
-                plan,
-                state,
-                edge.child_node,
-                core::slice::from_ref(&child_row),
-            )?;
+            if !row_is_cached(state, edge.child_node, &child_row) {
+                let singleton = [&child_row];
+                prefetch_node_edges(
+                    cache,
+                    catalog,
+                    plan,
+                    state,
+                    edge.child_node,
+                    &singleton,
+                )?;
+            }
             render_node_object(cache, catalog, plan, state, edge.child_node, &child_row)
         }
         None => Ok(ResponseValue::Null),
     }
+}
+
+fn row_is_cached(state: &GraphqlBatchState, node_id: NodeId, row: &Rc<Row>) -> bool {
+    state.row_cache.contains_key(&RowCacheKey::new(node_id, row))
 }
 
 fn render_reverse_relation(
@@ -459,7 +846,7 @@ fn prefetch_node_edges(
     plan: &GraphqlBatchPlan,
     state: &mut GraphqlBatchState,
     node_id: NodeId,
-    rows: &[Rc<Row>],
+    rows: &[&Rc<Row>],
 ) -> GqlResult<()> {
     if rows.is_empty() {
         return Ok(());
@@ -506,7 +893,7 @@ fn prefetch_node_edges(
     Ok(())
 }
 
-fn collect_edge_keys(edge: &RelationEdgePlan, rows: &[Rc<Row>]) -> HashSet<Value> {
+fn collect_edge_keys(edge: &RelationEdgePlan, rows: &[&Rc<Row>]) -> HashSet<Value> {
     let mut keys = HashSet::new();
     for row in rows {
         let value = match edge.kind {
@@ -1050,6 +1437,20 @@ mod tests {
         (field, plan, rows, state)
     }
 
+    fn root_list_ptr(value: &ResponseValue) -> *const [ResponseValue] {
+        match value {
+            ResponseValue::List(items) => Rc::as_ptr(items),
+            other => panic!("expected list value, found {other:?}"),
+        }
+    }
+
+    fn object_ptr(value: &ResponseValue) -> *const [ResponseField] {
+        match value {
+            ResponseValue::Object(fields) => Rc::as_ptr(fields),
+            other => panic!("expected object value, found {other:?}"),
+        }
+    }
+
     #[test]
     fn batch_renderer_matches_recursive_execution_for_reverse_relation_order_limit() {
         let cache = build_cache();
@@ -1092,6 +1493,8 @@ mod tests {
             &plan,
             &GraphqlInvalidation {
                 root_changed: false,
+                dirty_root_rows: HashSet::new(),
+                stable_root_positions: false,
                 changed_tables: alloc::vec!["comments".into()],
                 dirty_edge_keys: HashMap::from([(
                     comments_edge_id,
@@ -1138,6 +1541,8 @@ mod tests {
             &plan,
             &GraphqlInvalidation {
                 root_changed: false,
+                dirty_root_rows: HashSet::new(),
+                stable_root_positions: false,
                 changed_tables: alloc::vec!["users".into()],
                 dirty_edge_keys: HashMap::from([(
                     author_edge_id,
@@ -1165,5 +1570,145 @@ mod tests {
             .any(|key| key.node_id == user_node_id && key.row_id == 2);
         assert!(cached_user_1);
         assert!(!cached_user_2);
+    }
+
+    #[test]
+    fn batch_invalidation_targets_changed_root_rows_without_flushing_unrelated_roots() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query = "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
+
+        let (_field, plan, rows, mut state) = prepare_batch_execution(&cache, &catalog, query);
+        let root_node = plan.root_node();
+        let root_post_10 = RowCacheKey::new(root_node, &rows[0]);
+        let root_post_11 = RowCacheKey::new(root_node, &rows[1]);
+        let root_post_12 = RowCacheKey::new(root_node, &rows[2]);
+
+        state.apply_invalidation(
+            &plan,
+            &GraphqlInvalidation {
+                root_changed: true,
+                dirty_root_rows: HashSet::from([11_u64]),
+                stable_root_positions: false,
+                changed_tables: Vec::new(),
+                dirty_edge_keys: HashMap::new(),
+                dirty_table_rows: HashMap::new(),
+            },
+        );
+
+        assert!(state.row_cache.contains_key(&root_post_10));
+        assert!(!state.row_cache.contains_key(&root_post_11));
+        assert!(state.row_cache.contains_key(&root_post_12));
+    }
+
+    #[test]
+    fn batch_renderer_reuses_root_list_when_stable_root_update_keeps_response_equal() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query = "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
+
+        let (field, plan, rows, mut state) = prepare_batch_execution(&cache, &catalog, query);
+        let initial_list_ptr = root_list_ptr(&state.root_list_cache.as_ref().unwrap().list_value);
+
+        let mut updated_rows = rows.clone();
+        updated_rows[1] = Rc::new(Row::new_with_version(
+            rows[1].id(),
+            rows[1].version() + 1,
+            rows[1].values().to_vec(),
+        ));
+
+        state.apply_invalidation(
+            &plan,
+            &GraphqlInvalidation {
+                root_changed: true,
+                dirty_root_rows: HashSet::from([rows[1].id()]),
+                stable_root_positions: true,
+                changed_tables: Vec::new(),
+                dirty_edge_keys: HashMap::new(),
+                dirty_table_rows: HashMap::new(),
+            },
+        );
+
+        let response =
+            render_graphql_response(&cache, &catalog, &field, &plan, &mut state, &updated_rows)
+                .unwrap();
+        let rerendered_list_ptr = root_list_ptr(&state.root_list_cache.as_ref().unwrap().list_value);
+
+        assert_eq!(response, execute_with_batch(&cache, &catalog, query));
+        assert_eq!(rerendered_list_ptr, initial_list_ptr);
+    }
+
+    #[test]
+    fn batch_renderer_only_rebuilds_changed_root_object_when_positions_stay_stable() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query = "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
+
+        let (field, plan, rows, mut state) = prepare_batch_execution(&cache, &catalog, query);
+        let initial_items = state.root_list_cache.as_ref().unwrap().items.clone();
+        let initial_first_ptr = object_ptr(&initial_items[0]);
+        let initial_second_ptr = object_ptr(&initial_items[1]);
+        let initial_third_ptr = object_ptr(&initial_items[2]);
+
+        let mut updated_values = rows[1].values().to_vec();
+        updated_values[2] = Value::String("second+".into());
+        let mut updated_rows = rows.clone();
+        updated_rows[1] = Rc::new(Row::new_with_version(
+            rows[1].id(),
+            rows[1].version() + 1,
+            updated_values,
+        ));
+
+        state.apply_invalidation(
+            &plan,
+            &GraphqlInvalidation {
+                root_changed: true,
+                dirty_root_rows: HashSet::from([rows[1].id()]),
+                stable_root_positions: true,
+                changed_tables: Vec::new(),
+                dirty_edge_keys: HashMap::new(),
+                dirty_table_rows: HashMap::new(),
+            },
+        );
+
+        render_graphql_response(&cache, &catalog, &field, &plan, &mut state, &updated_rows).unwrap();
+        let rerendered_items = &state.root_list_cache.as_ref().unwrap().items;
+
+        assert_eq!(object_ptr(&rerendered_items[0]), initial_first_ptr);
+        assert_ne!(object_ptr(&rerendered_items[1]), initial_second_ptr);
+        assert_eq!(object_ptr(&rerendered_items[2]), initial_third_ptr);
+    }
+
+    #[test]
+    fn batch_renderer_reports_splice_patch_for_root_membership_change() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query = "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
+
+        let (field, plan, rows, mut state) = prepare_batch_execution(&cache, &catalog, query);
+        let updated_rows = alloc::vec![rows[0].clone(), rows[2].clone()];
+
+        state.apply_invalidation(
+            &plan,
+            &GraphqlInvalidation {
+                root_changed: true,
+                dirty_root_rows: HashSet::from([rows[1].id()]),
+                stable_root_positions: false,
+                changed_tables: Vec::new(),
+                dirty_edge_keys: HashMap::new(),
+                dirty_table_rows: HashMap::new(),
+            },
+        );
+
+        render_graphql_response(&cache, &catalog, &field, &plan, &mut state, &updated_rows).unwrap();
+
+        assert_eq!(
+            state.last_root_patch(),
+            Some(&GraphqlRootListPatch::Splice {
+                removed_positions: alloc::vec![1],
+                inserted_positions: Vec::new(),
+                updated_positions: Vec::new(),
+            })
+        );
     }
 }

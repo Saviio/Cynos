@@ -722,6 +722,38 @@ function flushPendingSnapshot(active, rows) {
   active.pending = null
 }
 
+function postMutationProfile(active, phase, mutationProfile) {
+  post({
+    type: 'mutation-profile',
+    scenarioId: active.scenarioId,
+    phase,
+    mutationProfile,
+  })
+}
+
+function takeCommitProfile() {
+  const profile = runtime.db?.takeLastCommitProfile?.()
+  return profile && typeof profile === 'object' ? profile : null
+}
+
+function takeDeltaFlushProfile() {
+  const profile = runtime.db?.takeLastDeltaFlushProfile?.()
+  return profile && typeof profile === 'object' ? profile : null
+}
+
+function takeSnapshotFlushProfile() {
+  const profile = runtime.db?.takeLastSnapshotFlushProfile?.()
+  return profile && typeof profile === 'object' ? profile : null
+}
+
+function buildCommitProfiles() {
+  return {
+    commitProfile: takeCommitProfile(),
+    deltaFlushProfile: takeDeltaFlushProfile(),
+    snapshotFlushProfile: takeSnapshotFlushProfile(),
+  }
+}
+
 function cancelScheduledReattach(active) {
   if (active.reattachHandle == null) return
   clearTimeout(active.reattachHandle)
@@ -902,13 +934,16 @@ function runSocketPatchBurst(message) {
     throw new Error('Subscribe before running socket patches.')
   }
 
-  const projectIds = collectActiveProjectIds(message.patchCount)
-  runtime.active.pending = {
+  const pending = {
     phase: 'socket',
     startedAt: performance.now(),
   }
+  runtime.active.pending = pending
+  const projectIds = collectActiveProjectIds(message.patchCount)
+  const projectIdsCollectedAt = performance.now()
 
   const tx = runtime.db.transaction()
+  const patchLoopStartedAt = performance.now()
   for (const projectId of projectIds) {
     const next = applyProjectPatch(projectId, (current) => {
       const healthScore = current.healthScore >= 45 ? 24 : 82
@@ -930,7 +965,18 @@ function runSocketPatchBurst(message) {
       col('id').eq(next.id),
     )
   }
+  const patchLoopCompletedAt = performance.now()
+  const commitStartedAt = performance.now()
   tx.commit()
+  const commitCompletedAt = performance.now()
+
+  postMutationProfile(runtime.active, 'socket', {
+    projectIdsCount: projectIds.length,
+    collectProjectIdsMs: projectIdsCollectedAt - pending.startedAt,
+    patchLoopMs: patchLoopCompletedAt - patchLoopStartedAt,
+    commitCallMs: commitCompletedAt - commitStartedAt,
+    ...buildCommitProfiles(),
+  })
 }
 
 function runApiRefresh(message) {
@@ -939,13 +985,16 @@ function runApiRefresh(message) {
     throw new Error('Subscribe before running API refresh.')
   }
 
-  const projectIds = collectActiveProjectIds(message.patchCount)
-  runtime.active.pending = {
+  const pending = {
     phase: 'api',
     startedAt: performance.now(),
   }
+  runtime.active.pending = pending
+  const projectIds = collectActiveProjectIds(message.patchCount)
+  const projectIdsCollectedAt = performance.now()
 
   const tx = runtime.db.transaction()
+  const patchLoopStartedAt = performance.now()
   for (const projectId of projectIds) {
     const next = applyProjectPatch(projectId, (current) => {
       const nextRisk = current.healthScore >= 45 ? 18 : 76
@@ -979,7 +1028,18 @@ function runApiRefresh(message) {
       col('id').eq(next.id),
     )
   }
+  const patchLoopCompletedAt = performance.now()
+  const commitStartedAt = performance.now()
   tx.commit()
+  const commitCompletedAt = performance.now()
+
+  postMutationProfile(runtime.active, 'api', {
+    projectIdsCount: projectIds.length,
+    collectProjectIdsMs: projectIdsCollectedAt - pending.startedAt,
+    patchLoopMs: patchLoopCompletedAt - patchLoopStartedAt,
+    commitCallMs: commitCompletedAt - commitStartedAt,
+    ...buildCommitProfiles(),
+  })
 }
 
 function handleError(error, context) {
