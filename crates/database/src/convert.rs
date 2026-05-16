@@ -20,6 +20,54 @@ type GraphqlObjectJsCache =
 type GraphqlListJsCache =
     HashMap<*const [cynos_gql::ResponseValue], GraphqlSharedJsCacheEntry<cynos_gql::ResponseValue>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JsonbJsCachePolicy {
+    max_entries: usize,
+    target_entries: usize,
+    max_bytes: usize,
+    target_bytes: usize,
+}
+
+impl JsonbJsCachePolicy {
+    pub(crate) const DEFAULT: Self = Self {
+        max_entries: 8_192,
+        target_entries: 6_144,
+        max_bytes: 4 * 1024 * 1024,
+        target_bytes: 3 * 1024 * 1024,
+    };
+
+    pub(crate) fn should_prune(self, entries: usize, bytes: usize) -> bool {
+        entries > self.max_entries || bytes > self.max_bytes
+    }
+
+    pub(crate) fn target_entries(self) -> usize {
+        self.target_entries.min(self.max_entries)
+    }
+
+    pub(crate) fn target_bytes(self) -> usize {
+        self.target_bytes.min(self.max_bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphqlJsEncodeCachePolicy {
+    shared_max_entries: usize,
+    shared_target_entries: usize,
+    field_key_max_entries: usize,
+    field_key_target_entries: usize,
+    jsonb: JsonbJsCachePolicy,
+}
+
+impl GraphqlJsEncodeCachePolicy {
+    const DEFAULT: Self = Self {
+        shared_max_entries: 65_536,
+        shared_target_entries: 49_152,
+        field_key_max_entries: 4_096,
+        field_key_target_entries: 3_072,
+        jsonb: JsonbJsCachePolicy::DEFAULT,
+    };
+}
+
 struct GraphqlSharedJsCacheEntry<T> {
     weak: Weak<[T]>,
     value: JsValue,
@@ -42,9 +90,19 @@ pub(crate) struct GraphqlRootListJsCache {
 
 impl GraphqlJsEncodeCache {
     fn maybe_prune(&mut self) {
-        self.maybe_prune_shared_with_limits(65_536, 49_152);
-        self.maybe_prune_field_keys_with_limits(4_096, 3_072);
-        self.maybe_prune_jsonb_with_limits(8_192, 6_144, 4 * 1024 * 1024, 3 * 1024 * 1024);
+        self.maybe_prune_with_policy(GraphqlJsEncodeCachePolicy::DEFAULT);
+    }
+
+    fn maybe_prune_with_policy(&mut self, policy: GraphqlJsEncodeCachePolicy) {
+        self.maybe_prune_shared_with_limits(
+            policy.shared_max_entries,
+            policy.shared_target_entries,
+        );
+        self.maybe_prune_field_keys_with_limits(
+            policy.field_key_max_entries,
+            policy.field_key_target_entries,
+        );
+        self.maybe_prune_jsonb_with_policy(policy.jsonb);
     }
 
     fn maybe_prune_shared_with_limits(&mut self, max_entries: usize, target_entries: usize) {
@@ -91,19 +149,13 @@ impl GraphqlJsEncodeCache {
         }
     }
 
-    fn maybe_prune_jsonb_with_limits(
-        &mut self,
-        max_entries: usize,
-        target_entries: usize,
-        max_bytes: usize,
-        target_bytes: usize,
-    ) {
-        if self.jsonb_cache.len() <= max_entries && self.jsonb_cache_bytes <= max_bytes {
+    fn maybe_prune_jsonb_with_policy(&mut self, policy: JsonbJsCachePolicy) {
+        if !policy.should_prune(self.jsonb_cache.len(), self.jsonb_cache_bytes) {
             return;
         }
 
-        let target_entries = target_entries.min(max_entries);
-        let target_bytes = target_bytes.min(max_bytes);
+        let target_entries = policy.target_entries();
+        let target_bytes = policy.target_bytes();
         let mut projected_len = self.jsonb_cache.len();
         let mut projected_bytes = self.jsonb_cache_bytes;
         let mut keys_to_remove = Vec::new();
@@ -148,12 +200,7 @@ impl GraphqlJsEncodeCache {
                 let parsed = value_to_js(value);
                 self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_add(jsonb.0.len());
                 self.jsonb_cache.insert(jsonb.0.clone(), parsed.clone());
-                self.maybe_prune_jsonb_with_limits(
-                    8_192,
-                    6_144,
-                    4 * 1024 * 1024,
-                    3 * 1024 * 1024,
-                );
+                self.maybe_prune_jsonb_with_policy(JsonbJsCachePolicy::DEFAULT);
                 parsed
             }
             _ => value_to_js(value),
@@ -883,7 +930,12 @@ mod tests {
             cache.jsonb_cache.insert(key, JsValue::NULL);
         }
 
-        cache.maybe_prune_jsonb_with_limits(4, 3, 12, 9);
+        cache.maybe_prune_jsonb_with_policy(JsonbJsCachePolicy {
+            max_entries: 4,
+            target_entries: 3,
+            max_bytes: 12,
+            target_bytes: 9,
+        });
 
         assert!(cache.jsonb_cache.len() <= 3);
         assert!(cache.jsonb_cache_bytes <= 9);

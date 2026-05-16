@@ -14,7 +14,7 @@
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
 use crate::convert::{
     gql_response_to_js_with_cache, gql_response_to_js_with_root_list_patch, value_to_js,
-    GraphqlJsEncodeCache, GraphqlRootListJsCache,
+    GraphqlJsEncodeCache, GraphqlRootListJsCache, JsonbJsCachePolicy,
 };
 use crate::live_runtime::{
     RowsSnapshotDependencyGraph, RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey,
@@ -2891,11 +2891,6 @@ struct CachedSnapshotRowJs {
     value: JsValue,
 }
 
-const SNAPSHOT_JSONB_CACHE_MAX_ENTRIES: usize = 8_192;
-const SNAPSHOT_JSONB_CACHE_TARGET_ENTRIES: usize = 6_144;
-const SNAPSHOT_JSONB_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
-const SNAPSHOT_JSONB_CACHE_TARGET_BYTES: usize = 3 * 1024 * 1024;
-
 #[derive(Default)]
 struct JsSnapshotRowsCache {
     rows: HashMap<u64, CachedSnapshotRowJs>,
@@ -3054,20 +3049,19 @@ impl JsSnapshotRowsCache {
     }
 
     fn prune_jsonb_cache_if_needed(&mut self) {
-        if self.jsonb_cache.len() <= SNAPSHOT_JSONB_CACHE_MAX_ENTRIES
-            && self.jsonb_cache_bytes <= SNAPSHOT_JSONB_CACHE_MAX_BYTES
-        {
+        let policy = JsonbJsCachePolicy::DEFAULT;
+        if !policy.should_prune(self.jsonb_cache.len(), self.jsonb_cache_bytes) {
             return;
         }
 
+        let target_entries = policy.target_entries();
+        let target_bytes = policy.target_bytes();
         let mut projected_len = self.jsonb_cache.len();
         let mut projected_bytes = self.jsonb_cache_bytes;
         let mut keys_to_remove = Vec::new();
 
         for key in self.jsonb_cache.keys() {
-            if projected_len <= SNAPSHOT_JSONB_CACHE_TARGET_ENTRIES
-                && projected_bytes <= SNAPSHOT_JSONB_CACHE_TARGET_BYTES
-            {
+            if projected_len <= target_entries && projected_bytes <= target_bytes {
                 break;
             }
 
@@ -3683,7 +3677,8 @@ mod tests {
     #[test]
     fn test_snapshot_rows_cache_prunes_jsonb_entries_incrementally() {
         let mut cache = JsSnapshotRowsCache::default();
-        for index in 0..SNAPSHOT_JSONB_CACHE_MAX_ENTRIES + 64 {
+        let policy = JsonbJsCachePolicy::DEFAULT;
+        for index in 0..policy.target_entries() + 2_112 {
             let mut key = alloc::vec![(index % 251) as u8; 1024];
             key.extend_from_slice(&(index as u64).to_le_bytes());
             cache.jsonb_cache_bytes += key.len();
@@ -3692,8 +3687,8 @@ mod tests {
 
         cache.prune_jsonb_cache_if_needed();
 
-        assert!(cache.jsonb_cache.len() <= SNAPSHOT_JSONB_CACHE_TARGET_ENTRIES);
-        assert!(cache.jsonb_cache_bytes <= SNAPSHOT_JSONB_CACHE_TARGET_BYTES);
+        assert!(cache.jsonb_cache.len() <= policy.target_entries());
+        assert!(cache.jsonb_cache_bytes <= policy.target_bytes());
     }
 
     #[test]
