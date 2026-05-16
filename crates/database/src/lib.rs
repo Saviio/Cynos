@@ -47,6 +47,7 @@ mod profiling;
 pub mod query_builder;
 pub mod query_engine;
 pub mod reactive_bridge;
+pub(crate) mod snapshot_refresh_policy;
 pub mod table;
 pub mod transaction;
 

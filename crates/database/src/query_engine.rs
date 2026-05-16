@@ -14,13 +14,17 @@ use cynos_jsonb::JsonPath;
 use cynos_query::ast::{BinaryOp, Expr as AstExpr};
 use cynos_query::context::{
     ExecutionContext, IndexInfo, PlannerFeatureFlags, PlanningIntent, PlanningMode, QueryIndexType,
-    RestrictedAccessMode, TableStats,
+    TableStats,
 };
 use cynos_query::executor::{DataSource, ExecutionError, ExecutionResult, PhysicalPlanRunner};
 pub use cynos_query::plan_cache::CompiledPhysicalPlan;
 use cynos_query::planner::{LogicalPlan, PhysicalPlan, PlannerProfile, QueryPlanner};
 use cynos_storage::TableCache;
 use hashbrown::HashSet;
+
+pub(crate) use crate::snapshot_refresh_policy::{
+    RootSubsetPlanVariant, RootSubsetRefreshDecision, SnapshotRefreshCostModel,
+};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -43,7 +47,7 @@ struct TableSubsetDataSource<'a> {
     cache: &'a TableCache,
     subset_table: &'a str,
     sorted_allowed_row_ids: Vec<u64>,
-    subset_execution_mode: SubsetExecutionMode,
+    subset_decision: RootSubsetRefreshDecision,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,100 +59,6 @@ pub(crate) enum CompilePlanProfile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RootSubsetPlanningProfile {
     pub variant: RootSubsetPlanVariant,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RootSubsetPlanVariant {
-    Small,
-    Large,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RootSubsetCostPolicy {
-    /// Subset-driven execution remains cheap below this absolute row-count ceiling even when the
-    /// subset is not tiny relative to the table.
-    max_subset_driven_rows: usize,
-    /// Above the absolute ceiling, subset-driven execution is selected only while the affected
-    /// subset is at most `1 / subset_to_table_ratio_denominator` of the root table.
-    subset_to_table_ratio_denominator: usize,
-    /// Synthetic row count exposed to the planner for the small/subset-driven profile.
-    small_profile_effective_rows: usize,
-}
-
-impl RootSubsetCostPolicy {
-    pub(crate) const DEFAULT: Self = Self {
-        max_subset_driven_rows: 8_192,
-        subset_to_table_ratio_denominator: 4,
-        small_profile_effective_rows: 1_024,
-    };
-
-    fn choose_variant(
-        self,
-        allowed_row_count: usize,
-        table_row_count: usize,
-    ) -> RootSubsetPlanVariant {
-        if allowed_row_count <= self.max_subset_driven_rows
-            || allowed_row_count.saturating_mul(self.subset_to_table_ratio_denominator)
-                <= table_row_count
-        {
-            RootSubsetPlanVariant::Small
-        } else {
-            RootSubsetPlanVariant::Large
-        }
-    }
-
-    fn effective_subset_rows(
-        self,
-        variant: RootSubsetPlanVariant,
-        table_row_count: usize,
-    ) -> Option<usize> {
-        match variant {
-            RootSubsetPlanVariant::Small => {
-                Some(table_row_count.min(self.small_profile_effective_rows))
-            }
-            RootSubsetPlanVariant::Large => {
-                if table_row_count == 0 {
-                    return None;
-                }
-                let lower_bound = self
-                    .max_subset_driven_rows
-                    .saturating_add(1)
-                    .min(table_row_count.max(1));
-                let ratio_bound =
-                    core::cmp::max(table_row_count / self.subset_to_table_ratio_denominator, 1);
-                Some(core::cmp::max(lower_bound, ratio_bound))
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PartialRefreshWindowPolicy {
-    min_overscan: usize,
-    max_overscan: usize,
-    overscan_divisor: usize,
-}
-
-impl PartialRefreshWindowPolicy {
-    pub(crate) const DEFAULT: Self = Self {
-        min_overscan: 256,
-        max_overscan: 1_024,
-        overscan_divisor: 4,
-    };
-
-    pub(crate) fn overscan_for_limit(self, limit: usize) -> usize {
-        let divisor = self.overscan_divisor.max(1);
-        core::cmp::max(
-            self.min_overscan,
-            core::cmp::min(limit / divisor, self.max_overscan),
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SubsetExecutionMode {
-    SubsetDriven,
-    IndexDrivenIntersect,
 }
 
 impl RootSubsetPlanningProfile {
@@ -163,33 +73,12 @@ impl RootSubsetPlanningProfile {
             variant: RootSubsetPlanVariant::Large,
         }
     }
-
-    fn preferred_access_mode(self) -> RestrictedAccessMode {
-        match self.variant {
-            RootSubsetPlanVariant::Small => RestrictedAccessMode::SubsetDriven,
-            RootSubsetPlanVariant::Large => RestrictedAccessMode::IndexDrivenIntersect,
-        }
-    }
-}
-
-impl SubsetExecutionMode {
-    fn choose(allowed_row_count: usize, table_row_count: usize) -> Self {
-        match choose_root_subset_plan_variant(allowed_row_count, table_row_count) {
-            RootSubsetPlanVariant::Small => Self::SubsetDriven,
-            RootSubsetPlanVariant::Large => Self::IndexDrivenIntersect,
-        }
-    }
-}
-
-pub(crate) fn choose_root_subset_plan_variant(
-    allowed_row_count: usize,
-    table_row_count: usize,
-) -> RootSubsetPlanVariant {
-    RootSubsetCostPolicy::DEFAULT.choose_variant(allowed_row_count, table_row_count)
 }
 
 pub(crate) fn partial_refresh_overscan_for_limit(limit: usize) -> usize {
-    PartialRefreshWindowPolicy::DEFAULT.overscan_for_limit(limit)
+    SnapshotRefreshCostModel::DEFAULT
+        .decide_partial_refresh_window(limit)
+        .overscan
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,13 +201,14 @@ impl<'a> TableSubsetDataSource<'a> {
             .ok_or_else(|| ExecutionError::TableNotFound(subset_table.into()))?;
         let mut sorted_allowed_row_ids: Vec<u64> = allowed_row_ids.iter().copied().collect();
         sorted_allowed_row_ids.sort_unstable();
-        let subset_execution_mode = SubsetExecutionMode::choose(allowed_row_ids.len(), store.len());
+        let subset_decision = SnapshotRefreshCostModel::DEFAULT
+            .decide_root_subset_refresh(allowed_row_ids.len(), store.len());
 
         Ok(Self {
             cache,
             subset_table,
             sorted_allowed_row_ids,
-            subset_execution_mode,
+            subset_decision,
         })
     }
 
@@ -334,7 +224,7 @@ impl<'a> TableSubsetDataSource<'a> {
 
     #[inline]
     fn subset_driven(&self) -> bool {
-        self.subset_execution_mode == SubsetExecutionMode::SubsetDriven
+        self.subset_decision.variant == RootSubsetPlanVariant::Small
     }
 
     fn scalar_range(
@@ -1280,15 +1170,10 @@ fn register_restricted_relation_intent(
         .get_table(restricted_table)
         .map(|store| store.len())
         .unwrap_or(0);
-    let Some(effective_subset_rows) =
-        RootSubsetCostPolicy::DEFAULT.effective_subset_rows(profile.variant, table_rows)
+    let Some(decision) = SnapshotRefreshCostModel::DEFAULT
+        .root_subset_planning_decision(profile.variant, table_rows)
     else {
         return;
-    };
-    let subset_fraction = if table_rows > 0 {
-        Some(effective_subset_rows as f64 / table_rows as f64)
-    } else {
-        None
     };
 
     ctx.set_planner_feature_flags(PlannerFeatureFlags {
@@ -1297,13 +1182,13 @@ fn register_restricted_relation_intent(
     ctx.set_planning_intent(PlanningIntent {
         mode: PlanningMode::RestrictedRelation,
         restricted_table: Some(restricted_table.to_string()),
-        exact_subset_rows: Some(effective_subset_rows),
-        subset_fraction,
-        preferred_access_mode: profile.preferred_access_mode(),
+        exact_subset_rows: Some(decision.effective_subset_rows),
+        subset_fraction: decision.subset_fraction,
+        preferred_access_mode: decision.preferred_access_mode,
         anchor_table: Some(restricted_table.to_string()),
         allow_global_fallback: true,
     });
-    ctx.register_effective_row_count(restricted_table, effective_subset_rows);
+    ctx.register_effective_row_count(restricted_table, decision.effective_subset_rows);
 }
 
 fn register_plan_costs(cache: &TableCache, ctx: &mut ExecutionContext, plan: &LogicalPlan) {
@@ -1815,6 +1700,7 @@ pub fn execute_compiled_physical_plan_with_summary_on_table_subset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot_refresh_policy::RootSubsetDecisionReason;
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Row, Value};
     use cynos_query::ast::Expr as AstExpr;
@@ -2080,48 +1966,62 @@ mod tests {
 
     #[test]
     fn test_choose_root_subset_plan_variant_uses_shared_thresholds() {
+        let cost_model = SnapshotRefreshCostModel::DEFAULT;
         assert_eq!(
-            choose_root_subset_plan_variant(64, 10_000),
+            cost_model.decide_root_subset_refresh(64, 10_000).variant,
             RootSubsetPlanVariant::Small
         );
         assert_eq!(
-            choose_root_subset_plan_variant(2_500, 10_000),
+            cost_model.decide_root_subset_refresh(2_500, 10_000).variant,
             RootSubsetPlanVariant::Small
         );
         assert_eq!(
-            choose_root_subset_plan_variant(8_193, 10_000),
+            cost_model.decide_root_subset_refresh(8_193, 10_000).variant,
             RootSubsetPlanVariant::Large
         );
         assert_eq!(
-            choose_root_subset_plan_variant(10_000, 30_000),
+            cost_model
+                .decide_root_subset_refresh(10_000, 30_000)
+                .variant,
             RootSubsetPlanVariant::Large
         );
     }
 
     #[test]
     fn test_snapshot_refresh_cost_policies_preserve_cutoffs() {
-        let root_subset_policy = RootSubsetCostPolicy::DEFAULT;
+        let cost_model = SnapshotRefreshCostModel::DEFAULT;
         assert_eq!(
-            root_subset_policy.choose_variant(8_192, 10_000),
+            cost_model.decide_root_subset_refresh(8_192, 10_000).variant,
             RootSubsetPlanVariant::Small
         );
         assert_eq!(
-            root_subset_policy.choose_variant(8_193, 10_000),
+            cost_model.decide_root_subset_refresh(8_193, 10_000).variant,
             RootSubsetPlanVariant::Large
         );
         assert_eq!(
-            root_subset_policy.effective_subset_rows(RootSubsetPlanVariant::Small, 4_096),
+            cost_model.decide_root_subset_refresh(9_000, 40_000).reason,
+            RootSubsetDecisionReason::WithinSubsetFractionCeiling
+        );
+        assert_eq!(
+            cost_model
+                .root_subset_planning_decision(RootSubsetPlanVariant::Small, 4_096)
+                .map(|decision| decision.effective_subset_rows),
             Some(1_024)
         );
         assert_eq!(
-            root_subset_policy.effective_subset_rows(RootSubsetPlanVariant::Large, 0),
+            cost_model.root_subset_planning_decision(RootSubsetPlanVariant::Large, 0),
             None
         );
 
-        let partial_policy = PartialRefreshWindowPolicy::DEFAULT;
-        assert_eq!(partial_policy.overscan_for_limit(100), 256);
-        assert_eq!(partial_policy.overscan_for_limit(4_096), 1_024);
-        assert_eq!(partial_policy.overscan_for_limit(20_000), 1_024);
+        assert_eq!(cost_model.decide_partial_refresh_window(100).overscan, 256);
+        assert_eq!(
+            cost_model.decide_partial_refresh_window(4_096).overscan,
+            1_024
+        );
+        assert_eq!(
+            cost_model.decide_partial_refresh_window(20_000).overscan,
+            1_024
+        );
     }
 
     #[test]

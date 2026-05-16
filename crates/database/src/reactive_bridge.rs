@@ -27,9 +27,9 @@ use crate::profiling::{
 #[cfg(feature = "benchmark")]
 use crate::profiling::{GraphqlDeltaProfile, GraphqlSnapshotQueryProfile};
 use crate::query_engine::{
-    choose_root_subset_plan_variant, execute_compiled_physical_plan_on_table_subset,
-    execute_compiled_physical_plan_with_summary, CompiledPhysicalPlan, QueryResultSummary,
-    RootSubsetPlanVariant,
+    execute_compiled_physical_plan_on_table_subset, execute_compiled_physical_plan_with_summary,
+    CompiledPhysicalPlan, QueryResultSummary, RootSubsetPlanVariant, RootSubsetRefreshDecision,
+    SnapshotRefreshCostModel,
 };
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -236,16 +236,25 @@ impl RootSubsetRefreshRuntime {
         })
     }
 
+    fn select_decision(
+        &self,
+        cache: &TableCache,
+        affected_root_ids: &HashSet<u64>,
+    ) -> RootSubsetRefreshDecision {
+        let table_row_count = cache
+            .get_table(&self.metadata.root_table)
+            .map(|store| store.len())
+            .unwrap_or(0);
+        SnapshotRefreshCostModel::DEFAULT
+            .decide_root_subset_refresh(affected_root_ids.len(), table_row_count)
+    }
+
     fn select_variant(
         &self,
         cache: &TableCache,
         affected_root_ids: &HashSet<u64>,
     ) -> RootSubsetPlanVariant {
-        let table_row_count = cache
-            .get_table(&self.metadata.root_table)
-            .map(|store| store.len())
-            .unwrap_or(0);
-        choose_root_subset_plan_variant(affected_root_ids.len(), table_row_count)
+        self.select_decision(cache, affected_root_ids).variant
     }
 
     fn select_compiled_plan<'a>(
