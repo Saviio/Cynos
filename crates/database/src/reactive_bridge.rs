@@ -1901,6 +1901,35 @@ pub struct GraphqlDeltaObservable {
 }
 
 impl GraphqlDeltaObservable {
+    fn from_view(
+        view: MaterializedView,
+        cache: Rc<RefCell<TableCache>>,
+        catalog: cynos_gql::GraphqlCatalog,
+        field: cynos_gql::bind::BoundRootField,
+        dependency_table_bindings: Vec<(TableId, String)>,
+    ) -> Self {
+        let batch_plan = cynos_gql::compile_batch_plan(&catalog, &field)
+            .ok()
+            .filter(|plan| plan.has_relations());
+        let has_nested_relations = root_field_has_relations(&field);
+
+        Self {
+            view,
+            cache,
+            batch_plan,
+            batch_state: cynos_gql::GraphqlBatchState::default(),
+            dependency_table_names: dependency_table_bindings.into_iter().collect(),
+            catalog,
+            has_nested_relations,
+            field,
+            response_payload: GraphqlResponsePayloadCache {
+                dirty: true,
+                ..GraphqlResponsePayloadCache::default()
+            },
+            subscribers: GraphqlSubscribers::default(),
+        }
+    }
+
     pub fn new(
         dataflow: DataflowNode,
         cache: Rc<RefCell<TableCache>>,
@@ -1909,23 +1938,13 @@ impl GraphqlDeltaObservable {
         dependency_table_bindings: Vec<(TableId, String)>,
         initial_rows: Vec<Row>,
     ) -> Self {
-        Self {
-            view: MaterializedView::with_initial(dataflow, initial_rows),
+        Self::from_view(
+            MaterializedView::with_initial(dataflow, initial_rows),
             cache,
-            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
-                .ok()
-                .filter(|plan| plan.has_relations()),
-            batch_state: cynos_gql::GraphqlBatchState::default(),
-            dependency_table_names: dependency_table_bindings.into_iter().collect(),
             catalog,
-            has_nested_relations: root_field_has_relations(&field),
             field,
-            response_payload: GraphqlResponsePayloadCache {
-                dirty: true,
-                ..GraphqlResponsePayloadCache::default()
-            },
-            subscribers: GraphqlSubscribers::default(),
-        }
+            dependency_table_bindings,
+        )
     }
 
     pub fn new_with_sources(
@@ -1937,23 +1956,13 @@ impl GraphqlDeltaObservable {
         initial_rows: Vec<Row>,
         source_rows: &HashMap<TableId, Vec<Row>>,
     ) -> Self {
-        Self {
-            view: MaterializedView::with_sources(dataflow, initial_rows, source_rows),
+        Self::from_view(
+            MaterializedView::with_sources(dataflow, initial_rows, source_rows),
             cache,
-            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
-                .ok()
-                .filter(|plan| plan.has_relations()),
-            batch_state: cynos_gql::GraphqlBatchState::default(),
-            dependency_table_names: dependency_table_bindings.into_iter().collect(),
             catalog,
-            has_nested_relations: root_field_has_relations(&field),
             field,
-            response_payload: GraphqlResponsePayloadCache {
-                dirty: true,
-                ..GraphqlResponsePayloadCache::default()
-            },
-            subscribers: GraphqlSubscribers::default(),
-        }
+            dependency_table_bindings,
+        )
     }
 
     pub fn new_with_compiled_loader<F>(
@@ -1970,8 +1979,8 @@ impl GraphqlDeltaObservable {
     where
         F: FnMut(TableId) -> Vec<Rc<Row>>,
     {
-        Self {
-            view: MaterializedView::with_compiled_loader_and_bootstrap(
+        Self::from_view(
+            MaterializedView::with_compiled_loader_and_bootstrap(
                 dataflow,
                 compiled_ivm_plan,
                 compiled_bootstrap_plan,
@@ -1979,20 +1988,10 @@ impl GraphqlDeltaObservable {
                 load_source_rows,
             ),
             cache,
-            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
-                .ok()
-                .filter(|plan| plan.has_relations()),
-            batch_state: cynos_gql::GraphqlBatchState::default(),
-            dependency_table_names: dependency_table_bindings.into_iter().collect(),
             catalog,
-            has_nested_relations: root_field_has_relations(&field),
             field,
-            response_payload: GraphqlResponsePayloadCache {
-                dirty: true,
-                ..GraphqlResponsePayloadCache::default()
-            },
-            subscribers: GraphqlSubscribers::default(),
-        }
+            dependency_table_bindings,
+        )
     }
 
     pub fn new_with_compiled_source_visitor<F>(
@@ -2009,8 +2008,8 @@ impl GraphqlDeltaObservable {
     where
         F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
     {
-        Self {
-            view: MaterializedView::with_compiled_source_visitor_and_bootstrap(
+        Self::from_view(
+            MaterializedView::with_compiled_source_visitor_and_bootstrap(
                 dataflow,
                 compiled_ivm_plan,
                 compiled_bootstrap_plan,
@@ -2018,20 +2017,10 @@ impl GraphqlDeltaObservable {
                 visit_source_rows,
             ),
             cache,
-            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
-                .ok()
-                .filter(|plan| plan.has_relations()),
-            batch_state: cynos_gql::GraphqlBatchState::default(),
-            dependency_table_names: dependency_table_bindings.into_iter().collect(),
             catalog,
-            has_nested_relations: root_field_has_relations(&field),
             field,
-            response_payload: GraphqlResponsePayloadCache {
-                dirty: true,
-                ..GraphqlResponsePayloadCache::default()
-            },
-            subscribers: GraphqlSubscribers::default(),
-        }
+            dependency_table_bindings,
+        )
     }
 
     pub fn attach_keepalive(&mut self) -> usize {
