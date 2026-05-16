@@ -671,7 +671,7 @@ fn filter_uses_relations(filter: &BoundFilter) -> bool {
     }
 }
 
-fn matches_filter(row: &Row, filter: &BoundFilter) -> bool {
+pub(crate) fn matches_filter(row: &Row, filter: &BoundFilter) -> bool {
     match filter {
         BoundFilter::And(filters) => filters.iter().all(|filter| matches_filter(row, filter)),
         BoundFilter::Or(filters) => filters.iter().any(|filter| matches_filter(row, filter)),

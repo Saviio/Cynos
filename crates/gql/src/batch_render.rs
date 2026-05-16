@@ -2,7 +2,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use cynos_core::{Row, Value};
+use cynos_core::{schema::IndexType, Row, Value};
 use cynos_index::KeyRange;
 use cynos_storage::{RowStore, TableCache};
 use hashbrown::{HashMap, HashSet};
@@ -13,7 +13,7 @@ use crate::bind::{
 };
 use crate::catalog::{GraphqlCatalog, TableMeta};
 use crate::error::{GqlError, GqlErrorKind, GqlResult};
-use crate::execute::apply_collection_query;
+use crate::execute::{apply_collection_query, matches_filter};
 use crate::plan::{build_table_query_plan, execute_logical_plan};
 use crate::render_plan::{
     EdgeId, GraphqlBatchPlan, NodeId, RelationEdgeKind, RelationEdgePlan, RelationFetchStrategy,
@@ -450,9 +450,9 @@ fn render_root_node_list<R: RowRenderRef>(
         return Ok(ResponseValue::list(Vec::new()));
     }
 
-    if let Some(list_value) = try_render_root_node_list_cached(
-        cache, catalog, plan, state, node_id, rows,
-    )? {
+    if let Some(list_value) =
+        try_render_root_node_list_cached(cache, catalog, plan, state, node_id, rows)?
+    {
         return Ok(list_value);
     }
 
@@ -488,13 +488,9 @@ fn try_render_root_node_list_cached<R: RowRenderRef>(
                 .dirty_root_rows
                 .iter()
                 .map(|row_id| {
-                    cached
-                        .row_positions
-                        .get(row_id)
-                        .copied()
-                        .ok_or_else(|| {
-                            GqlError::new(GqlErrorKind::Execution, "missing root row position")
-                        })
+                    cached.row_positions.get(row_id).copied().ok_or_else(|| {
+                        GqlError::new(GqlErrorKind::Execution, "missing root row position")
+                    })
                 })
                 .collect::<GqlResult<Vec<_>>>();
 
@@ -506,15 +502,15 @@ fn try_render_root_node_list_cached<R: RowRenderRef>(
                     let mut applied_positions = Vec::with_capacity(dirty_positions.len());
 
                     for position in dirty_positions {
-                        let row = rows
-                            .get(position)
-                            .map(RowRenderRef::row_rc)
-                            .ok_or_else(|| {
-                                GqlError::new(
-                                    GqlErrorKind::Execution,
-                                    "root row position out of bounds",
-                                )
-                            })?;
+                        let row =
+                            rows.get(position)
+                                .map(RowRenderRef::row_rc)
+                                .ok_or_else(|| {
+                                    GqlError::new(
+                                        GqlErrorKind::Execution,
+                                        "root row position out of bounds",
+                                    )
+                                })?;
                         if row.id() != row_keys[position].row_id {
                             state.root_list_requires_full_rebuild = true;
                             break;
@@ -522,12 +518,7 @@ fn try_render_root_node_list_cached<R: RowRenderRef>(
                         if !row_is_cached(state, node_id, row) {
                             let singleton = [row];
                             prefetch_node_edges_with_children(
-                                cache,
-                                catalog,
-                                plan,
-                                state,
-                                node_id,
-                                &singleton,
+                                cache, catalog, plan, state, node_id, &singleton,
                             )?;
                         }
                         let rendered =
@@ -636,7 +627,8 @@ fn try_render_root_node_list_splice<R: RowRenderRef>(
         let Some(old_position) = cached.row_positions.get(&row_key.row_id).copied() else {
             continue;
         };
-        if cached.row_keys[old_position] != *row_key || state.dirty_root_rows.contains(&row_key.row_id)
+        if cached.row_keys[old_position] != *row_key
+            || state.dirty_root_rows.contains(&row_key.row_id)
         {
             positions_needing_render.push(position);
         }
@@ -653,9 +645,7 @@ fn try_render_root_node_list_splice<R: RowRenderRef>(
         prefetch_node_edges_with_children(cache, catalog, plan, state, node_id, &uncached_rows)?;
     }
 
-    let positions_needing_render = positions_needing_render
-        .into_iter()
-        .collect::<HashSet<_>>();
+    let positions_needing_render = positions_needing_render.into_iter().collect::<HashSet<_>>();
     let mut items = Vec::with_capacity(rows.len());
     for (position, row_key) in row_keys.iter().enumerate() {
         let old_position = cached.row_positions.get(&row_key.row_id).copied();
@@ -669,7 +659,9 @@ fn try_render_root_node_list_splice<R: RowRenderRef>(
         let row = rows
             .get(position)
             .map(RowRenderRef::row_rc)
-            .ok_or_else(|| GqlError::new(GqlErrorKind::Execution, "root row position out of bounds"))?;
+            .ok_or_else(|| {
+                GqlError::new(GqlErrorKind::Execution, "root row position out of bounds")
+            })?;
         let rendered = render_node_object(cache, catalog, plan, state, node_id, row)?;
         if let Some(old_position) = old_position {
             if cached.items[old_position] == rendered {
@@ -817,7 +809,9 @@ fn render_forward_relation(
 }
 
 fn row_is_cached(state: &GraphqlBatchState, node_id: NodeId, row: &Rc<Row>) -> bool {
-    state.row_cache.contains_key(&RowCacheKey::new(node_id, row))
+    state
+        .row_cache
+        .contains_key(&RowCacheKey::new(node_id, row))
 }
 
 fn render_reverse_relation(
@@ -986,12 +980,13 @@ fn fetch_edge_buckets(
     }
 
     let mut buckets = match edge.strategy {
-        RelationFetchStrategy::PlannerBatch => match planner_batch_fetch(cache, catalog, edge, keys)
-        {
-            Ok(buckets) => Ok(buckets),
-            Err(error) if edge_query_uses_relations(edge) => Err(error),
-            Err(_) => scan_and_bucket_fetch(cache, edge, keys),
-        },
+        RelationFetchStrategy::PlannerBatch => {
+            match planner_batch_fetch(cache, catalog, edge, keys) {
+                Ok(buckets) => Ok(buckets),
+                Err(error) if edge_query_uses_relations(edge) => Err(error),
+                Err(_) => scan_and_bucket_fetch(cache, edge, keys),
+            }
+        }
         RelationFetchStrategy::IndexedProbeBatch => match indexed_probe_fetch(cache, edge, keys) {
             Ok(buckets) => Ok(buckets),
             Err(error) if edge_query_uses_relations(edge) => Err(error),
@@ -1040,12 +1035,183 @@ fn planner_batch_fetch(
             alloc::format!("table `{}` is not available", table_name),
         )
     })?;
+    if let Some(buckets) = try_ordered_reverse_window_fetch(cache, edge, keys)? {
+        return Ok(buckets);
+    }
     let query = build_batch_query(table, edge, keys)?;
     let plan = build_table_query_plan(catalog, table_name, table, &query)?;
     let rows = execute_logical_plan(cache, table_name, plan)?;
 
     let buckets = bucket_rows_for_query(rows, edge_target_column_index(edge), edge.query.as_ref());
     Ok(buckets)
+}
+
+fn try_ordered_reverse_window_fetch(
+    cache: &TableCache,
+    edge: &RelationEdgePlan,
+    keys: &HashSet<Value>,
+) -> GqlResult<Option<HashMap<Value, Vec<Rc<Row>>>>> {
+    if edge.kind != RelationEdgeKind::Reverse {
+        return Ok(None);
+    }
+
+    let Some(query) = edge.query.as_ref() else {
+        return Ok(None);
+    };
+    if query.order_by.is_empty() || query.limit.is_none() {
+        return Ok(None);
+    }
+    if query.filter.as_ref().is_some_and(filter_uses_relations) {
+        return Ok(None);
+    }
+
+    let Some(reverse) = common_order_direction(query) else {
+        return Ok(None);
+    };
+
+    let table_name = edge_target_table(edge);
+    let store = cache.get_table(table_name).ok_or_else(|| {
+        GqlError::new(
+            GqlErrorKind::Execution,
+            alloc::format!("table `{}` was not found", table_name),
+        )
+    })?;
+    let Some(index_name) = find_reverse_order_prefix_index_name(store, edge, query) else {
+        return Ok(None);
+    };
+
+    let mut buckets = HashMap::with_capacity(keys.len());
+    for key in keys {
+        buckets.insert(
+            key.clone(),
+            fetch_ordered_reverse_window_rows(store, index_name, key, query, reverse),
+        );
+    }
+    Ok(Some(buckets))
+}
+
+fn fetch_ordered_reverse_window_rows(
+    store: &RowStore,
+    index_name: &str,
+    key: &Value,
+    query: &BoundCollectionQuery,
+    reverse: bool,
+) -> Vec<Rc<Row>> {
+    let prefix = alloc::vec![key.clone()];
+    let Some(limit) = query.limit else {
+        return Vec::new();
+    };
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let Some(filter) = query.filter.as_ref() else {
+        return store.index_scan_composite_prefix_with_options(
+            index_name,
+            &prefix,
+            query.limit,
+            query.offset,
+            reverse,
+        );
+    };
+
+    let mut rows = Vec::new();
+    let mut skipped = 0usize;
+    let mut emitted = 0usize;
+    store.visit_index_scan_composite_prefix_with_options(
+        index_name,
+        &prefix,
+        None,
+        0,
+        reverse,
+        |row| {
+            if !matches_filter(row.as_ref(), filter) {
+                return true;
+            }
+            if skipped < query.offset {
+                skipped += 1;
+                return true;
+            }
+            if emitted >= limit {
+                return false;
+            }
+
+            rows.push(row.clone());
+            emitted += 1;
+            emitted < limit
+        },
+    );
+    rows
+}
+
+fn common_order_direction(query: &BoundCollectionQuery) -> Option<bool> {
+    let first = query.order_by.first()?.descending;
+    query
+        .order_by
+        .iter()
+        .all(|spec| spec.descending == first)
+        .then_some(first)
+}
+
+fn find_reverse_order_prefix_index_name<'a>(
+    store: &'a RowStore,
+    edge: &RelationEdgePlan,
+    query: &BoundCollectionQuery,
+) -> Option<&'a str> {
+    if !order_by_columns_form_unique_key(store, &query.order_by) {
+        return None;
+    }
+
+    store
+        .schema()
+        .indices()
+        .iter()
+        .find(|index| {
+            index.get_index_type() == IndexType::BTree
+                && index.columns().len() == query.order_by.len().saturating_add(1)
+                && index.columns()[0].name == edge.relation.child_column
+                && query
+                    .order_by
+                    .iter()
+                    .enumerate()
+                    .all(|(order_index, spec)| {
+                        store
+                            .schema()
+                            .columns()
+                            .get(spec.column_index)
+                            .is_some_and(|column| {
+                                index.columns()[order_index + 1].name == column.name()
+                            })
+                    })
+        })
+        .map(|index| index.name())
+}
+
+fn order_by_columns_form_unique_key(store: &RowStore, order_by: &[crate::bind::OrderSpec]) -> bool {
+    if order_by.is_empty() {
+        return false;
+    }
+
+    let matches_order_columns = |columns: &[cynos_core::schema::IndexedColumn]| {
+        columns.len() == order_by.len()
+            && order_by.iter().enumerate().all(|(index, spec)| {
+                store
+                    .schema()
+                    .columns()
+                    .get(spec.column_index)
+                    .is_some_and(|column| columns[index].name == column.name())
+            })
+    };
+
+    store
+        .schema()
+        .primary_key()
+        .is_some_and(|primary_key| matches_order_columns(primary_key.columns()))
+        || store
+            .schema()
+            .indices()
+            .iter()
+            .any(|index| index.is_unique() && matches_order_columns(index.columns()))
 }
 
 fn indexed_probe_fetch(
@@ -1418,6 +1584,8 @@ mod tests {
             .unwrap()
             .add_index("idx_posts_author_id", &["author_id"], false)
             .unwrap()
+            .add_index("idx_posts_author_id_id", &["author_id", "id"], false)
+            .unwrap()
             .build()
             .unwrap();
         let comments = TableBuilder::new("comments")
@@ -1607,6 +1775,78 @@ mod tests {
     }
 
     #[test]
+    fn ordered_reverse_relation_window_uses_composite_prefix_probe() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let prepared = PreparedQuery::parse(
+            "{ users(orderBy: [{ field: ID, direction: ASC }]) { id posts(orderBy: [{ field: ID, direction: DESC }], limit: 1) { id title } } }",
+        )
+        .unwrap();
+        let bound = prepared.bind(&catalog, None).unwrap();
+        let field = bound.fields.into_iter().next().unwrap();
+        let plan = crate::compile_batch_plan(&catalog, &field).unwrap();
+        let posts_edge = plan
+            .edges()
+            .iter()
+            .find(|edge| edge.direct_table == "posts")
+            .expect("posts edge");
+        let keys = HashSet::from([Value::Int64(1), Value::Int64(2)]);
+
+        let buckets = try_ordered_reverse_window_fetch(&cache, posts_edge, &keys)
+            .unwrap()
+            .expect("ordered reverse relation should use composite prefix probe");
+
+        let user_1_ids: Vec<_> = buckets[&Value::Int64(1)]
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        let user_2_ids: Vec<_> = buckets[&Value::Int64(2)]
+            .iter()
+            .map(|row| row.id())
+            .collect();
+
+        assert_eq!(user_1_ids, alloc::vec![11]);
+        assert_eq!(user_2_ids, alloc::vec![12]);
+    }
+
+    #[test]
+    fn ordered_reverse_relation_prefix_probe_applies_filter_before_window() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query = "{ users(orderBy: [{ field: ID, direction: ASC }]) { id name posts(where: { id: { gte: 11 } }, orderBy: [{ field: ID, direction: ASC }], limit: 1) { id title } } }";
+
+        let expected = execute_query(&cache, &catalog, query, None, None).unwrap();
+        let actual = execute_with_batch(&cache, &catalog, query);
+        assert_eq!(actual, expected);
+
+        let prepared = PreparedQuery::parse(query).unwrap();
+        let bound = prepared.bind(&catalog, None).unwrap();
+        let field = bound.fields.into_iter().next().unwrap();
+        let plan = crate::compile_batch_plan(&catalog, &field).unwrap();
+        let posts_edge = plan
+            .edges()
+            .iter()
+            .find(|edge| edge.direct_table == "posts")
+            .expect("posts edge");
+        let keys = HashSet::from([Value::Int64(1), Value::Int64(2)]);
+        let buckets = try_ordered_reverse_window_fetch(&cache, posts_edge, &keys)
+            .unwrap()
+            .expect("filtered ordered reverse relation should use composite prefix probe");
+
+        let user_1_ids: Vec<_> = buckets[&Value::Int64(1)]
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        let user_2_ids: Vec<_> = buckets[&Value::Int64(2)]
+            .iter()
+            .map(|row| row.id())
+            .collect();
+
+        assert_eq!(user_1_ids, alloc::vec![11]);
+        assert_eq!(user_2_ids, alloc::vec![12]);
+    }
+
+    #[test]
     fn batch_plan_uses_indexed_probe_for_windowed_reverse_relation_without_order() {
         let cache = build_cache();
         let catalog = GraphqlCatalog::from_table_cache(&cache);
@@ -1623,11 +1863,15 @@ mod tests {
             .find(|edge| edge.direct_table == "posts")
             .expect("posts edge");
 
-        assert_eq!(posts_edge.strategy, RelationFetchStrategy::IndexedProbeBatch);
+        assert_eq!(
+            posts_edge.strategy,
+            RelationFetchStrategy::IndexedProbeBatch
+        );
     }
 
     #[test]
-    fn batch_renderer_matches_recursive_execution_for_reverse_relation_limit_offset_without_order() {
+    fn batch_renderer_matches_recursive_execution_for_reverse_relation_limit_offset_without_order()
+    {
         let cache = build_cache();
         let catalog = GraphqlCatalog::from_table_cache(&cache);
         let query = "{ users(orderBy: [{ field: ID, direction: ASC }]) { id name posts(limit: 1, offset: 1) { id title } } }";
@@ -1751,7 +1995,8 @@ mod tests {
     fn batch_invalidation_targets_changed_root_rows_without_flushing_unrelated_roots() {
         let cache = build_cache();
         let catalog = GraphqlCatalog::from_table_cache(&cache);
-        let query = "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
+        let query =
+            "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
 
         let (_field, plan, rows, mut state) = prepare_batch_execution(&cache, &catalog, query);
         let root_node = plan.root_node();
@@ -1780,7 +2025,8 @@ mod tests {
     fn batch_renderer_reuses_root_list_when_stable_root_update_keeps_response_equal() {
         let cache = build_cache();
         let catalog = GraphqlCatalog::from_table_cache(&cache);
-        let query = "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
+        let query =
+            "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
 
         let (field, plan, rows, mut state) = prepare_batch_execution(&cache, &catalog, query);
         let initial_list_ptr = root_list_ptr(&state.root_list_cache.as_ref().unwrap().list_value);
@@ -1807,7 +2053,8 @@ mod tests {
         let response =
             render_graphql_response(&cache, &catalog, &field, &plan, &mut state, &updated_rows)
                 .unwrap();
-        let rerendered_list_ptr = root_list_ptr(&state.root_list_cache.as_ref().unwrap().list_value);
+        let rerendered_list_ptr =
+            root_list_ptr(&state.root_list_cache.as_ref().unwrap().list_value);
 
         assert_eq!(response, execute_with_batch(&cache, &catalog, query));
         assert_eq!(rerendered_list_ptr, initial_list_ptr);
@@ -1817,7 +2064,8 @@ mod tests {
     fn batch_renderer_only_rebuilds_changed_root_object_when_positions_stay_stable() {
         let cache = build_cache();
         let catalog = GraphqlCatalog::from_table_cache(&cache);
-        let query = "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
+        let query =
+            "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
 
         let (field, plan, rows, mut state) = prepare_batch_execution(&cache, &catalog, query);
         let initial_items = state.root_list_cache.as_ref().unwrap().items.clone();
@@ -1846,7 +2094,8 @@ mod tests {
             },
         );
 
-        render_graphql_response(&cache, &catalog, &field, &plan, &mut state, &updated_rows).unwrap();
+        render_graphql_response(&cache, &catalog, &field, &plan, &mut state, &updated_rows)
+            .unwrap();
         let rerendered_items = &state.root_list_cache.as_ref().unwrap().items;
 
         assert_eq!(object_ptr(&rerendered_items[0]), initial_first_ptr);
@@ -1858,7 +2107,8 @@ mod tests {
     fn batch_renderer_reports_splice_patch_for_root_membership_change() {
         let cache = build_cache();
         let catalog = GraphqlCatalog::from_table_cache(&cache);
-        let query = "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
+        let query =
+            "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
 
         let (field, plan, rows, mut state) = prepare_batch_execution(&cache, &catalog, query);
         let updated_rows = alloc::vec![rows[0].clone(), rows[2].clone()];
@@ -1875,7 +2125,8 @@ mod tests {
             },
         );
 
-        render_graphql_response(&cache, &catalog, &field, &plan, &mut state, &updated_rows).unwrap();
+        render_graphql_response(&cache, &catalog, &field, &plan, &mut state, &updated_rows)
+            .unwrap();
 
         assert_eq!(
             state.last_root_patch(),

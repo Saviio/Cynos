@@ -384,10 +384,12 @@ impl InsertBatchProfiler {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum IndexKey {
     Scalar(Value),
     Composite(Vec<Value>),
+    CompositePrefixLower(Vec<Value>),
+    CompositePrefixUpper(Vec<Value>),
 }
 
 impl IndexKey {
@@ -403,6 +405,16 @@ impl IndexKey {
         } else {
             Self::Composite(values)
         }
+    }
+
+    #[inline]
+    fn composite_prefix_lower(values: &[Value]) -> Self {
+        Self::CompositePrefixLower(values.to_vec())
+    }
+
+    #[inline]
+    fn composite_prefix_upper(values: &[Value]) -> Self {
+        Self::CompositePrefixUpper(values.to_vec())
     }
 
     #[inline]
@@ -469,8 +481,101 @@ impl IndexKey {
     fn to_error_value(&self) -> Value {
         match self {
             Self::Scalar(value) => value.clone(),
-            Self::Composite(values) => Value::String(format!("{:?}", values)),
+            Self::Composite(values)
+            | Self::CompositePrefixLower(values)
+            | Self::CompositePrefixUpper(values) => Value::String(format!("{:?}", values)),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexKeyComponent<'a> {
+    Low,
+    End,
+    Value(&'a Value),
+    High,
+}
+
+impl IndexKey {
+    fn composite_component_at(&self, index: usize) -> IndexKeyComponent<'_> {
+        match self {
+            Self::Composite(values) => values
+                .get(index)
+                .map(IndexKeyComponent::Value)
+                .unwrap_or(IndexKeyComponent::End),
+            Self::CompositePrefixLower(values) => values
+                .get(index)
+                .map(IndexKeyComponent::Value)
+                .unwrap_or(IndexKeyComponent::Low),
+            Self::CompositePrefixUpper(values) => values
+                .get(index)
+                .map(IndexKeyComponent::Value)
+                .unwrap_or(IndexKeyComponent::High),
+            Self::Scalar(value) => {
+                if index == 0 {
+                    IndexKeyComponent::Value(value)
+                } else {
+                    IndexKeyComponent::End
+                }
+            }
+        }
+    }
+
+    fn composite_like_len(&self) -> usize {
+        match self {
+            Self::Scalar(_) => 1,
+            Self::Composite(values)
+            | Self::CompositePrefixLower(values)
+            | Self::CompositePrefixUpper(values) => values.len(),
+        }
+    }
+}
+
+impl Ord for IndexKey {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+
+        match (self, other) {
+            (Self::Scalar(left), Self::Scalar(right)) => left.cmp(right),
+            (Self::Scalar(_), _) => Ordering::Less,
+            (_, Self::Scalar(_)) => Ordering::Greater,
+            _ => {
+                let max_len = self
+                    .composite_like_len()
+                    .max(other.composite_like_len())
+                    .saturating_add(1);
+                for index in 0..max_len {
+                    let left = self.composite_component_at(index);
+                    let right = other.composite_component_at(index);
+                    let ordering = match (left, right) {
+                        (IndexKeyComponent::Low, IndexKeyComponent::Low)
+                        | (IndexKeyComponent::End, IndexKeyComponent::End)
+                        | (IndexKeyComponent::High, IndexKeyComponent::High) => Ordering::Equal,
+                        (IndexKeyComponent::Value(left), IndexKeyComponent::Value(right)) => {
+                            left.cmp(right)
+                        }
+                        (IndexKeyComponent::Low, _) => Ordering::Less,
+                        (_, IndexKeyComponent::Low) => Ordering::Greater,
+                        (IndexKeyComponent::End, IndexKeyComponent::Value(_))
+                        | (IndexKeyComponent::End, IndexKeyComponent::High) => Ordering::Less,
+                        (IndexKeyComponent::Value(_), IndexKeyComponent::End)
+                        | (IndexKeyComponent::High, IndexKeyComponent::End) => Ordering::Greater,
+                        (IndexKeyComponent::Value(_), IndexKeyComponent::High) => Ordering::Less,
+                        (IndexKeyComponent::High, IndexKeyComponent::Value(_)) => Ordering::Greater,
+                    };
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                Ordering::Equal
+            }
+        }
+    }
+}
+
+impl PartialOrd for IndexKey {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -2748,6 +2853,75 @@ impl RowStore {
                 visitor(row)
             },
         );
+    }
+
+    /// Gets rows by composite index prefix scan with limit, offset, and reverse option.
+    ///
+    /// The prefix must match the leading columns of a composite BTree index. This is useful for
+    /// top-N-per-parent probes such as scanning `(parent_id, created_at)` for one parent without
+    /// fetching the parent's full child fan-out first.
+    pub fn index_scan_composite_prefix_with_options(
+        &self,
+        index_name: &str,
+        prefix: &[Value],
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    ) -> Vec<Rc<Row>> {
+        let mut rows = Vec::new();
+        self.visit_index_scan_composite_prefix_with_options(
+            index_name,
+            prefix,
+            limit,
+            offset,
+            reverse,
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        rows
+    }
+
+    /// Visits rows by composite index prefix scan with limit, offset, and reverse option.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_index_scan_composite_prefix_with_options<F>(
+        &self,
+        index_name: &str,
+        prefix: &[Value],
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        if prefix.is_empty() {
+            self.visit_index_scan_composite_with_options(
+                index_name, None, limit, offset, reverse, visitor,
+            );
+            return;
+        }
+
+        let Some(idx) = self.secondary_indices.get(index_name) else {
+            return;
+        };
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return;
+        };
+        if columns.len() <= 1 || prefix.len() >= columns.len() {
+            return;
+        }
+
+        let lower = IndexKey::composite_prefix_lower(prefix);
+        let upper = IndexKey::composite_prefix_upper(prefix);
+        let range = KeyRange::bound(lower, upper, false, false);
+        idx.visit_range_index_keys(Some(&range), reverse, limit, offset, |row_id| {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                return true;
+            };
+            visitor(row)
+        });
     }
 
     /// Returns whether a row matches the tuple key range for a composite index.
@@ -5413,6 +5587,41 @@ mod tests {
             vec![4, 3],
             "Reverse composite range scans should still honor LIMIT/OFFSET in tuple order",
         );
+    }
+
+    #[test]
+    fn test_composite_secondary_index_prefix_scan_limit_offset() {
+        let mut store = RowStore::new(test_schema_with_composite_index());
+
+        for (id, a, b) in [
+            (1_u64, 1_i64, 1_i64),
+            (2, 1, 2),
+            (3, 1, 10),
+            (4, 2, 1),
+            (5, 2, 5),
+        ] {
+            store
+                .insert(Row::new(
+                    id,
+                    vec![Value::Int64(id as i64), Value::Int64(a), Value::Int64(b)],
+                ))
+                .unwrap();
+        }
+
+        let prefix = alloc::vec![Value::Int64(1)];
+        let forward_ids: Vec<RowId> = store
+            .index_scan_composite_prefix_with_options("idx_a_b", &prefix, Some(2), 1, false)
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        let reverse_ids: Vec<RowId> = store
+            .index_scan_composite_prefix_with_options("idx_a_b", &prefix, Some(2), 0, true)
+            .iter()
+            .map(|row| row.id())
+            .collect();
+
+        assert_eq!(forward_ids, vec![2, 3]);
+        assert_eq!(reverse_ids, vec![3, 2]);
     }
 
     #[test]
