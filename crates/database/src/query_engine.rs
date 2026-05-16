@@ -64,6 +64,88 @@ pub(crate) enum RootSubsetPlanVariant {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootSubsetCostPolicy {
+    /// Subset-driven execution remains cheap below this absolute row-count ceiling even when the
+    /// subset is not tiny relative to the table.
+    max_subset_driven_rows: usize,
+    /// Above the absolute ceiling, subset-driven execution is selected only while the affected
+    /// subset is at most `1 / subset_to_table_ratio_denominator` of the root table.
+    subset_to_table_ratio_denominator: usize,
+    /// Synthetic row count exposed to the planner for the small/subset-driven profile.
+    small_profile_effective_rows: usize,
+}
+
+impl RootSubsetCostPolicy {
+    pub(crate) const DEFAULT: Self = Self {
+        max_subset_driven_rows: 8_192,
+        subset_to_table_ratio_denominator: 4,
+        small_profile_effective_rows: 1_024,
+    };
+
+    fn choose_variant(
+        self,
+        allowed_row_count: usize,
+        table_row_count: usize,
+    ) -> RootSubsetPlanVariant {
+        if allowed_row_count <= self.max_subset_driven_rows
+            || allowed_row_count.saturating_mul(self.subset_to_table_ratio_denominator)
+                <= table_row_count
+        {
+            RootSubsetPlanVariant::Small
+        } else {
+            RootSubsetPlanVariant::Large
+        }
+    }
+
+    fn effective_subset_rows(
+        self,
+        variant: RootSubsetPlanVariant,
+        table_row_count: usize,
+    ) -> Option<usize> {
+        match variant {
+            RootSubsetPlanVariant::Small => {
+                Some(table_row_count.min(self.small_profile_effective_rows))
+            }
+            RootSubsetPlanVariant::Large => {
+                if table_row_count == 0 {
+                    return None;
+                }
+                let lower_bound = self
+                    .max_subset_driven_rows
+                    .saturating_add(1)
+                    .min(table_row_count.max(1));
+                let ratio_bound =
+                    core::cmp::max(table_row_count / self.subset_to_table_ratio_denominator, 1);
+                Some(core::cmp::max(lower_bound, ratio_bound))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PartialRefreshWindowPolicy {
+    min_overscan: usize,
+    max_overscan: usize,
+    overscan_divisor: usize,
+}
+
+impl PartialRefreshWindowPolicy {
+    pub(crate) const DEFAULT: Self = Self {
+        min_overscan: 256,
+        max_overscan: 1_024,
+        overscan_divisor: 4,
+    };
+
+    pub(crate) fn overscan_for_limit(self, limit: usize) -> usize {
+        let divisor = self.overscan_divisor.max(1);
+        core::cmp::max(
+            self.min_overscan,
+            core::cmp::min(limit / divisor, self.max_overscan),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SubsetExecutionMode {
     SubsetDriven,
     IndexDrivenIntersect,
@@ -103,11 +185,11 @@ pub(crate) fn choose_root_subset_plan_variant(
     allowed_row_count: usize,
     table_row_count: usize,
 ) -> RootSubsetPlanVariant {
-    if allowed_row_count <= 8192 || allowed_row_count.saturating_mul(4) <= table_row_count {
-        RootSubsetPlanVariant::Small
-    } else {
-        RootSubsetPlanVariant::Large
-    }
+    RootSubsetCostPolicy::DEFAULT.choose_variant(allowed_row_count, table_row_count)
+}
+
+pub(crate) fn partial_refresh_overscan_for_limit(limit: usize) -> usize {
+    PartialRefreshWindowPolicy::DEFAULT.overscan_for_limit(limit)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1198,22 +1280,10 @@ fn register_restricted_relation_intent(
         .get_table(restricted_table)
         .map(|store| store.len())
         .unwrap_or(0);
-    let effective_subset_rows = match profile.variant {
-        RootSubsetPlanVariant::Small => {
-            if table_rows == 0 {
-                0
-            } else {
-                table_rows.min(1024)
-            }
-        }
-        RootSubsetPlanVariant::Large => {
-            if table_rows == 0 {
-                return;
-            }
-            let lower_bound = 8193usize.min(table_rows.max(1));
-            let quarter = core::cmp::max(table_rows / 4, 1);
-            core::cmp::max(lower_bound, quarter)
-        }
+    let Some(effective_subset_rows) =
+        RootSubsetCostPolicy::DEFAULT.effective_subset_rows(profile.variant, table_rows)
+    else {
+        return;
     };
     let subset_fraction = if table_rows > 0 {
         Some(effective_subset_rows as f64 / table_rows as f64)
@@ -2010,7 +2080,10 @@ mod tests {
 
     #[test]
     fn test_choose_root_subset_plan_variant_uses_shared_thresholds() {
-        assert_eq!(choose_root_subset_plan_variant(64, 10_000), RootSubsetPlanVariant::Small);
+        assert_eq!(
+            choose_root_subset_plan_variant(64, 10_000),
+            RootSubsetPlanVariant::Small
+        );
         assert_eq!(
             choose_root_subset_plan_variant(2_500, 10_000),
             RootSubsetPlanVariant::Small
@@ -2023,6 +2096,32 @@ mod tests {
             choose_root_subset_plan_variant(10_000, 30_000),
             RootSubsetPlanVariant::Large
         );
+    }
+
+    #[test]
+    fn test_snapshot_refresh_cost_policies_preserve_cutoffs() {
+        let root_subset_policy = RootSubsetCostPolicy::DEFAULT;
+        assert_eq!(
+            root_subset_policy.choose_variant(8_192, 10_000),
+            RootSubsetPlanVariant::Small
+        );
+        assert_eq!(
+            root_subset_policy.choose_variant(8_193, 10_000),
+            RootSubsetPlanVariant::Large
+        );
+        assert_eq!(
+            root_subset_policy.effective_subset_rows(RootSubsetPlanVariant::Small, 4_096),
+            Some(1_024)
+        );
+        assert_eq!(
+            root_subset_policy.effective_subset_rows(RootSubsetPlanVariant::Large, 0),
+            None
+        );
+
+        let partial_policy = PartialRefreshWindowPolicy::DEFAULT;
+        assert_eq!(partial_policy.overscan_for_limit(100), 256);
+        assert_eq!(partial_policy.overscan_for_limit(4_096), 1_024);
+        assert_eq!(partial_policy.overscan_for_limit(20_000), 1_024);
     }
 
     #[test]

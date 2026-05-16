@@ -20,7 +20,8 @@ use crate::profiling::{now_ms, TraceInitProfile};
 use crate::query_engine::{
     compile_cached_plan_with_profile, compile_plan, execute_compiled_physical_plan,
     execute_compiled_physical_plan_with_summary, execute_physical_plan, execute_plan, explain_plan,
-    CompilePlanProfile, CompiledPhysicalPlan, QueryResultSummary, RootSubsetPlanningProfile,
+    partial_refresh_overscan_for_limit, CompilePlanProfile, CompiledPhysicalPlan,
+    QueryResultSummary, RootSubsetPlanningProfile,
 };
 use crate::reactive_bridge::{JsChangesStream, JsIvmObservableQuery, JsObservableQuery};
 use crate::JsSortOrder;
@@ -198,7 +199,7 @@ enum JoinType {
 
 impl SelectBuilder {
     fn partial_refresh_overscan(limit: usize) -> usize {
-        core::cmp::max(256, core::cmp::min(limit / 4, 1_024))
+        partial_refresh_overscan_for_limit(limit)
     }
 
     fn plan_cache_fingerprint(plan: &LogicalPlan, profile: CompilePlanProfile) -> u64 {
