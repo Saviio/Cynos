@@ -49,6 +49,37 @@ impl JsonbJsCachePolicy {
     }
 }
 
+pub(crate) fn prune_jsonb_js_cache(
+    jsonb_cache: &mut HashMap<Vec<u8>, JsValue>,
+    jsonb_cache_bytes: &mut usize,
+    policy: JsonbJsCachePolicy,
+) {
+    if !policy.should_prune(jsonb_cache.len(), *jsonb_cache_bytes) {
+        return;
+    }
+
+    let target_entries = policy.target_entries();
+    let target_bytes = policy.target_bytes();
+    let mut projected_len = jsonb_cache.len();
+    let mut projected_bytes = *jsonb_cache_bytes;
+    let mut keys_to_remove = Vec::new();
+
+    for key in jsonb_cache.keys() {
+        if projected_len <= target_entries && projected_bytes <= target_bytes {
+            break;
+        }
+        projected_len = projected_len.saturating_sub(1);
+        projected_bytes = projected_bytes.saturating_sub(key.len());
+        keys_to_remove.push(key.clone());
+    }
+
+    for key in keys_to_remove {
+        if jsonb_cache.remove(key.as_slice()).is_some() {
+            *jsonb_cache_bytes = (*jsonb_cache_bytes).saturating_sub(key.len());
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GraphqlJsEncodeCachePolicy {
     shared_max_entries: usize,
@@ -150,30 +181,7 @@ impl GraphqlJsEncodeCache {
     }
 
     fn maybe_prune_jsonb_with_policy(&mut self, policy: JsonbJsCachePolicy) {
-        if !policy.should_prune(self.jsonb_cache.len(), self.jsonb_cache_bytes) {
-            return;
-        }
-
-        let target_entries = policy.target_entries();
-        let target_bytes = policy.target_bytes();
-        let mut projected_len = self.jsonb_cache.len();
-        let mut projected_bytes = self.jsonb_cache_bytes;
-        let mut keys_to_remove = Vec::new();
-
-        for key in self.jsonb_cache.keys() {
-            if projected_len <= target_entries && projected_bytes <= target_bytes {
-                break;
-            }
-            projected_len = projected_len.saturating_sub(1);
-            projected_bytes = projected_bytes.saturating_sub(key.len());
-            keys_to_remove.push(key.clone());
-        }
-
-        for key in keys_to_remove {
-            if self.jsonb_cache.remove(key.as_slice()).is_some() {
-                self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_sub(key.len());
-            }
-        }
+        prune_jsonb_js_cache(&mut self.jsonb_cache, &mut self.jsonb_cache_bytes, policy);
     }
 
     fn evict_object_entries(&mut self, count: usize) {

@@ -14,7 +14,7 @@
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
 use crate::convert::{
     gql_response_to_js_with_cache, gql_response_to_js_with_root_list_patch, value_to_js,
-    GraphqlJsEncodeCache, GraphqlRootListJsCache, JsonbJsCachePolicy,
+    prune_jsonb_js_cache, GraphqlJsEncodeCache, GraphqlRootListJsCache, JsonbJsCachePolicy,
 };
 use crate::live_runtime::{
     RowsSnapshotDependencyGraph, RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey,
@@ -3058,32 +3058,11 @@ impl JsSnapshotRowsCache {
     }
 
     fn prune_jsonb_cache_if_needed(&mut self) {
-        let policy = JsonbJsCachePolicy::DEFAULT;
-        if !policy.should_prune(self.jsonb_cache.len(), self.jsonb_cache_bytes) {
-            return;
-        }
-
-        let target_entries = policy.target_entries();
-        let target_bytes = policy.target_bytes();
-        let mut projected_len = self.jsonb_cache.len();
-        let mut projected_bytes = self.jsonb_cache_bytes;
-        let mut keys_to_remove = Vec::new();
-
-        for key in self.jsonb_cache.keys() {
-            if projected_len <= target_entries && projected_bytes <= target_bytes {
-                break;
-            }
-
-            projected_len = projected_len.saturating_sub(1);
-            projected_bytes = projected_bytes.saturating_sub(key.len());
-            keys_to_remove.push(key.clone());
-        }
-
-        for key in keys_to_remove {
-            if self.jsonb_cache.remove(&key).is_some() {
-                self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_sub(key.len());
-            }
-        }
+        prune_jsonb_js_cache(
+            &mut self.jsonb_cache,
+            &mut self.jsonb_cache_bytes,
+            JsonbJsCachePolicy::DEFAULT,
+        );
     }
 }
 
