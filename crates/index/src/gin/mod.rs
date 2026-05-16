@@ -360,11 +360,11 @@ impl GinBulkBuilder {
             key_index: self
                 .key_index
                 .into_iter()
-                .map(|(key, rows)| (key, PostingList::from_sorted_unique(rows)))
+                .map(|(key, rows)| (key, PostingList::from_sorted_unique_unchecked(rows)))
                 .collect(),
             key_value_index: key_value_index
                 .into_iter()
-                .map(|(pair, rows)| (pair, PostingList::from_sorted_unique(rows)))
+                .map(|(pair, rows)| (pair, PostingList::from_sorted_unique_unchecked(rows)))
                 .collect(),
             key_add_count: self.key_add_count,
         }
@@ -1001,6 +1001,25 @@ mod tests {
         builder.add_key("status".into(), 3);
         builder.add_key_value("status".into(), "active".into(), 2);
         builder.add_key_value("status".into(), "active".into(), 3);
+
+        gin.apply_bulk_builder(builder);
+
+        assert_eq!(gin.get_by_key("status"), vec![1, 2, 3]);
+        assert_eq!(gin.get_by_key_value("status", "active"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_gin_bulk_builder_keeps_postings_sorted_for_out_of_order_rows() {
+        let mut gin = GinIndex::new();
+        let mut builder = GinBulkBuilder::new();
+        builder.add_key("status".into(), 3);
+        builder.add_key("status".into(), 1);
+        builder.add_key("status".into(), 2);
+        builder.add_key("status".into(), 2);
+        builder.add_key_value("status".into(), "active".into(), 3);
+        builder.add_key_value("status".into(), "active".into(), 1);
+        builder.add_key_value("status".into(), "active".into(), 2);
+        builder.add_key_value("status".into(), "active".into(), 2);
 
         gin.apply_bulk_builder(builder);
 

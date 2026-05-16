@@ -20,8 +20,20 @@ impl PostingList {
         Self { rows: Vec::new() }
     }
 
-    /// Creates a posting list from a pre-sorted, unique row-id vector.
-    pub fn from_sorted_unique(rows: Vec<RowId>) -> Self {
+    /// Creates a posting list from a row-id vector that is expected to be pre-sorted and unique.
+    ///
+    /// Public callers still get release-safe invariant preservation: invalid input is normalized
+    /// before storage. Internal GIN builders use `from_sorted_unique_unchecked` only after they
+    /// have already maintained the invariant while constructing the vector.
+    pub fn from_sorted_unique(mut rows: Vec<RowId>) -> Self {
+        if !is_strictly_sorted_unique(rows.as_slice()) {
+            rows.sort_unstable();
+            rows.dedup();
+        }
+        Self { rows }
+    }
+
+    pub(crate) fn from_sorted_unique_unchecked(rows: Vec<RowId>) -> Self {
         debug_assert!(rows.windows(2).all(|window| window[0] < window[1]));
         Self { rows }
     }
@@ -145,7 +157,7 @@ impl PostingList {
             }
         }
 
-        PostingList::from_sorted_unique(result)
+        PostingList::from_sorted_unique_unchecked(result)
     }
 
     /// Intersects this posting list with a sorted list of candidate row IDs.
@@ -208,7 +220,7 @@ impl PostingList {
             result.extend_from_slice(&other.rows[right..]);
         }
 
-        PostingList::from_sorted_unique(result)
+        PostingList::from_sorted_unique_unchecked(result)
     }
 
     /// Computes the difference of two posting lists (self - other).
@@ -236,8 +248,12 @@ impl PostingList {
             }
         }
 
-        PostingList::from_sorted_unique(result)
+        PostingList::from_sorted_unique_unchecked(result)
     }
+}
+
+fn is_strictly_sorted_unique(rows: &[RowId]) -> bool {
+    rows.windows(2).all(|window| window[0] < window[1])
 }
 
 #[cfg(test)]
@@ -264,6 +280,13 @@ mod tests {
         assert!(pl.contains(2));
         assert!(pl.contains(3));
         assert!(!pl.contains(4));
+    }
+
+    #[test]
+    fn test_posting_list_public_sorted_constructor_normalizes_input() {
+        let pl = PostingList::from_sorted_unique(vec![3, 1, 2, 2, 1]);
+
+        assert_eq!(pl.to_vec(), vec![1, 2, 3]);
     }
 
     #[test]
