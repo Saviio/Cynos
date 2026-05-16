@@ -662,10 +662,9 @@ fn compile_predicate(expr: &Expr) -> Box<dyn Fn(&Row) -> bool + Send + Sync> {
 fn compile_trace_predicate(
     expr: &Expr,
 ) -> Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> bool + Send + Sync> {
-    let expr = expr.clone();
+    let predicate = CompiledTracePredicate::compile(expr);
     Box::new(move |arena: &TraceTupleArena, handle: &TraceTupleHandle| {
-        let mut value_at = |index: usize| arena.value_at(handle, index);
-        matches!(eval_expr_with(&expr, &mut value_at), Value::Boolean(true))
+        predicate.eval(arena, handle)
     })
 }
 
@@ -683,6 +682,424 @@ fn compile_trace_mapper(
             .collect();
         Row::new_with_version(arena.row_id(handle), arena.version(handle), values)
     })
+}
+
+#[derive(Clone)]
+enum CompiledTracePredicate {
+    JsonPathEq {
+        column_index: usize,
+        path: CompiledTraceJsonPath,
+        expected: Value,
+    },
+    JsonPathExists {
+        column_index: usize,
+        path: CompiledTraceJsonPath,
+    },
+    And(Box<CompiledTracePredicate>, Box<CompiledTracePredicate>),
+    Or(Box<CompiledTracePredicate>, Box<CompiledTracePredicate>),
+    Not(Box<CompiledTracePredicate>),
+    Generic(Expr),
+}
+
+#[derive(Clone)]
+struct CompiledTraceJsonPath {
+    segments: Vec<CompiledTraceJsonPathSegment>,
+}
+
+#[derive(Clone)]
+enum CompiledTraceJsonPathSegment {
+    Field(String),
+    Index(usize),
+}
+
+impl CompiledTracePredicate {
+    fn compile(expr: &Expr) -> Self {
+        match expr {
+            Expr::Function { name, args } => Self::compile_json_function(name, args)
+                .unwrap_or_else(|| Self::Generic(expr.clone())),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => Self::And(
+                Box::new(Self::compile(left)),
+                Box::new(Self::compile(right)),
+            ),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Or,
+                right,
+            } => Self::Or(
+                Box::new(Self::compile(left)),
+                Box::new(Self::compile(right)),
+            ),
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                expr: inner,
+            } => {
+                let compiled = Self::compile(inner);
+                if compiled.is_boolean_output() {
+                    Self::Not(Box::new(compiled))
+                } else {
+                    Self::Generic(expr.clone())
+                }
+            }
+            _ => Self::Generic(expr.clone()),
+        }
+    }
+
+    fn compile_json_function(name: &str, args: &[Expr]) -> Option<Self> {
+        let name = name.to_ascii_uppercase();
+        match name.as_str() {
+            "JSONB_PATH_EQ" if args.len() >= 3 => {
+                let Expr::Column(column) = &args[0] else {
+                    return None;
+                };
+                let Expr::Literal(Value::String(path)) = &args[1] else {
+                    return None;
+                };
+                let Expr::Literal(expected) = &args[2] else {
+                    return None;
+                };
+                Some(Self::JsonPathEq {
+                    column_index: column.index,
+                    path: compile_trace_json_path(path)?,
+                    expected: expected.clone(),
+                })
+            }
+            "JSONB_EXISTS" if args.len() >= 2 => {
+                let Expr::Column(column) = &args[0] else {
+                    return None;
+                };
+                let Expr::Literal(Value::String(path)) = &args[1] else {
+                    return None;
+                };
+                Some(Self::JsonPathExists {
+                    column_index: column.index,
+                    path: compile_trace_json_path(path)?,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn is_boolean_output(&self) -> bool {
+        match self {
+            Self::JsonPathEq { .. }
+            | Self::JsonPathExists { .. }
+            | Self::And(_, _)
+            | Self::Or(_, _)
+            | Self::Not(_) => true,
+            Self::Generic(_) => false,
+        }
+    }
+
+    fn eval(&self, arena: &TraceTupleArena, handle: &TraceTupleHandle) -> bool {
+        match self {
+            Self::JsonPathEq {
+                column_index,
+                path,
+                expected,
+            } => {
+                let Some(Value::Jsonb(jsonb)) = arena.value_at(handle, *column_index) else {
+                    return false;
+                };
+                trace_json_extract_path_bytes(&jsonb, path)
+                    .map(|actual| trace_json_raw_eq_value(actual, expected))
+                    .unwrap_or(false)
+            }
+            Self::JsonPathExists { column_index, path } => {
+                let Some(Value::Jsonb(jsonb)) = arena.value_at(handle, *column_index) else {
+                    return false;
+                };
+                trace_json_extract_path_bytes(&jsonb, path).is_some()
+            }
+            Self::And(left, right) => left.eval(arena, handle) && right.eval(arena, handle),
+            Self::Or(left, right) => left.eval(arena, handle) || right.eval(arena, handle),
+            Self::Not(inner) => !inner.eval(arena, handle),
+            Self::Generic(expr) => {
+                let mut value_at = |index: usize| arena.value_at(handle, index);
+                matches!(eval_expr_with(expr, &mut value_at), Value::Boolean(true))
+            }
+        }
+    }
+}
+
+fn compile_trace_json_path(path: &str) -> Option<CompiledTraceJsonPath> {
+    let parsed = JsonPath::parse(path).ok()?;
+    let mut segments = Vec::new();
+    collect_trace_json_path_segments(&parsed, &mut segments)
+        .then_some(CompiledTraceJsonPath { segments })
+}
+
+fn collect_trace_json_path_segments(
+    path: &JsonPath,
+    segments: &mut Vec<CompiledTraceJsonPathSegment>,
+) -> bool {
+    match path {
+        JsonPath::Root => true,
+        JsonPath::Field(parent, field) => {
+            if !collect_trace_json_path_segments(parent, segments) {
+                return false;
+            }
+            segments.push(CompiledTraceJsonPathSegment::Field(field.clone()));
+            true
+        }
+        JsonPath::Index(parent, index) => {
+            if !collect_trace_json_path_segments(parent, segments) {
+                return false;
+            }
+            segments.push(CompiledTraceJsonPathSegment::Index(*index));
+            true
+        }
+        JsonPath::Slice(_, _, _)
+        | JsonPath::RecursiveField(_, _)
+        | JsonPath::Wildcard(_)
+        | JsonPath::Filter(_, _) => false,
+    }
+}
+
+fn trace_json_extract_path_bytes<'json>(
+    jsonb: &'json cynos_core::JsonbValue,
+    path: &CompiledTraceJsonPath,
+) -> Option<&'json [u8]> {
+    let mut current = trace_trim_json_bytes(&jsonb.0);
+    for segment in &path.segments {
+        current = match segment {
+            CompiledTraceJsonPathSegment::Field(field) => trace_json_extract_field(current, field)?,
+            CompiledTraceJsonPathSegment::Index(index) => {
+                trace_json_extract_index(current, *index)?
+            }
+        };
+    }
+    Some(trace_trim_json_bytes(current))
+}
+
+fn trace_json_extract_field<'json>(object: &'json [u8], field: &str) -> Option<&'json [u8]> {
+    let bytes = trace_trim_json_bytes(object);
+    if bytes.first() != Some(&b'{') || bytes.last() != Some(&b'}') {
+        return None;
+    }
+
+    let mut pos = 1usize;
+    loop {
+        pos = trace_skip_json_ws(bytes, pos);
+        match bytes.get(pos) {
+            Some(b'}') => return None,
+            Some(b'"') => {}
+            _ => return None,
+        }
+
+        let key_end = trace_scan_json_string_end(bytes, pos)?;
+        let key = trace_decode_json_string(&bytes[pos..key_end])?;
+
+        pos = trace_skip_json_ws(bytes, key_end);
+        if bytes.get(pos) != Some(&b':') {
+            return None;
+        }
+
+        pos = trace_skip_json_ws(bytes, pos + 1);
+        let value_start = pos;
+        let value_end = trace_scan_json_value_end(bytes, value_start)?;
+        if key == field {
+            return Some(trace_trim_json_bytes(&bytes[value_start..value_end]));
+        }
+
+        pos = trace_skip_json_ws(bytes, value_end);
+        match bytes.get(pos) {
+            Some(b',') => pos += 1,
+            Some(b'}') => return None,
+            _ => return None,
+        }
+    }
+}
+
+fn trace_json_extract_index(array: &[u8], target_index: usize) -> Option<&[u8]> {
+    let bytes = trace_trim_json_bytes(array);
+    if bytes.first() != Some(&b'[') || bytes.last() != Some(&b']') {
+        return None;
+    }
+
+    let mut pos = 1usize;
+    let mut current_index = 0usize;
+    loop {
+        pos = trace_skip_json_ws(bytes, pos);
+        match bytes.get(pos) {
+            Some(b']') | None => return None,
+            Some(_) => {}
+        }
+
+        let value_start = pos;
+        let value_end = trace_scan_json_value_end(bytes, value_start)?;
+        if current_index == target_index {
+            return Some(trace_trim_json_bytes(&bytes[value_start..value_end]));
+        }
+
+        current_index += 1;
+        pos = trace_skip_json_ws(bytes, value_end);
+        match bytes.get(pos) {
+            Some(b',') => pos += 1,
+            Some(b']') => return None,
+            _ => return None,
+        }
+    }
+}
+
+#[inline]
+fn trace_trim_json_bytes(bytes: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = bytes.len();
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+#[inline]
+fn trace_skip_json_ws(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    pos
+}
+
+fn trace_scan_json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+
+    let mut pos = start + 1;
+    let mut escaped = false;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return Some(pos + 1);
+        }
+        pos += 1;
+    }
+
+    None
+}
+
+fn trace_scan_json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let start = trace_skip_json_ws(bytes, start);
+    match bytes.get(start) {
+        Some(b'"') => trace_scan_json_string_end(bytes, start),
+        Some(b'{') | Some(b'[') => trace_scan_json_composite_end(bytes, start),
+        Some(_) => {
+            let mut pos = start;
+            while pos < bytes.len() {
+                match bytes[pos] {
+                    b',' | b']' | b'}' => break,
+                    _ => pos += 1,
+                }
+            }
+            Some(pos)
+        }
+        None => None,
+    }
+}
+
+fn trace_scan_json_composite_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, byte) in bytes[start..].iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn trace_decode_json_string(bytes: &[u8]) -> Option<String> {
+    let bytes = trace_trim_json_bytes(bytes);
+    if bytes.len() < 2 || bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') {
+        return None;
+    }
+
+    let inner = core::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()?;
+    let mut result = String::new();
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            result.push(ch);
+            continue;
+        }
+
+        match chars.next()? {
+            '"' => result.push('"'),
+            '\\' => result.push('\\'),
+            '/' => result.push('/'),
+            'n' => result.push('\n'),
+            'r' => result.push('\r'),
+            't' => result.push('\t'),
+            _ => return None,
+        }
+    }
+
+    Some(result)
+}
+
+fn trace_json_raw_eq_value(raw: &[u8], expected: &Value) -> bool {
+    let raw = trace_trim_json_bytes(raw);
+    match expected {
+        Value::Null => raw == b"null",
+        Value::Boolean(value) => {
+            let expected = if *value {
+                b"true".as_slice()
+            } else {
+                b"false".as_slice()
+            };
+            raw == expected
+        }
+        Value::Int32(value) => trace_json_raw_number_eq(raw, *value as f64),
+        Value::Int64(value) => trace_json_raw_number_eq(raw, *value as f64),
+        Value::Float64(value) => trace_json_raw_number_eq(raw, *value),
+        Value::String(value) => trace_decode_json_string(raw)
+            .map(|actual| actual == *value)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn trace_json_raw_number_eq(raw: &[u8], expected: f64) -> bool {
+    core::str::from_utf8(raw)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|actual| (actual - expected).abs() < f64::EPSILON)
+        .unwrap_or(false)
 }
 
 /// Evaluates an expression against a row.
@@ -1927,6 +2344,77 @@ mod tests {
         assert_eq!(update_deltas.len(), 1);
         assert!(update_deltas[0].is_delete());
         assert_eq!(view.len(), 0);
+    }
+
+    #[test]
+    fn test_compiled_trace_json_predicate_matches_generic_eval() {
+        let expr = Expr::and(
+            Expr::ge(
+                Expr::column("projects", "healthScore", 1),
+                Expr::literal(45i32),
+            ),
+            Expr::jsonb_path_eq(
+                Expr::column("projects", "metadata", 2),
+                "$.risk.bucket",
+                Value::String("high".into()),
+            ),
+        );
+        let compiled = CompiledTracePredicate::compile(&expr);
+        let arena = TraceTupleArena::default();
+
+        let matching = arena.owned(Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                Value::Int32(61),
+                jsonb_value(r#"{"risk":{"bucket":"high"}}"#),
+            ],
+        ));
+        let low_score = arena.owned(Row::new(
+            2,
+            vec![
+                Value::Int64(2),
+                Value::Int32(12),
+                jsonb_value(r#"{"risk":{"bucket":"high"}}"#),
+            ],
+        ));
+        let different_bucket = arena.owned(Row::new(
+            3,
+            vec![
+                Value::Int64(3),
+                Value::Int32(61),
+                jsonb_value(r#"{"risk":{"bucket":"low"}}"#),
+            ],
+        ));
+
+        assert!(compiled.eval(&arena, &matching));
+        assert!(!compiled.eval(&arena, &low_score));
+        assert!(!compiled.eval(&arena, &different_bucket));
+    }
+
+    #[test]
+    fn test_compiled_trace_json_exists_supports_array_index_path() {
+        let expr = Expr::Function {
+            name: "JSONB_EXISTS".into(),
+            args: alloc::vec![
+                Expr::column("projects", "metadata", 0),
+                Expr::literal("$.risk.history[1]"),
+            ],
+        };
+        let compiled = CompiledTracePredicate::compile(&expr);
+        let arena = TraceTupleArena::default();
+
+        let matching = arena.owned(Row::new(
+            1,
+            vec![jsonb_value(r#"{"risk":{"history":["low","high"]}}"#)],
+        ));
+        let missing = arena.owned(Row::new(
+            2,
+            vec![jsonb_value(r#"{"risk":{"history":["low"]}}"#)],
+        ));
+
+        assert!(compiled.eval(&arena, &matching));
+        assert!(!compiled.eval(&arena, &missing));
     }
 
     #[test]

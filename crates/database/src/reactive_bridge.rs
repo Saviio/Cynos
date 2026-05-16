@@ -27,9 +27,9 @@ use crate::profiling::{
 #[cfg(feature = "benchmark")]
 use crate::profiling::{GraphqlDeltaProfile, GraphqlSnapshotQueryProfile};
 use crate::query_engine::{
-    choose_root_subset_plan_variant,
-    execute_compiled_physical_plan_on_table_subset, execute_compiled_physical_plan_with_summary,
-    CompiledPhysicalPlan, QueryResultSummary, RootSubsetPlanVariant,
+    choose_root_subset_plan_variant, execute_compiled_physical_plan_on_table_subset,
+    execute_compiled_physical_plan_with_summary, CompiledPhysicalPlan, QueryResultSummary,
+    RootSubsetPlanVariant,
 };
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -633,9 +633,7 @@ fn build_graphql_response_batched_refs(
     state: &mut cynos_gql::GraphqlBatchState,
     rows: &[&Rc<Row>],
 ) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
-    cynos_gql::batch_render::render_graphql_response_refs(
-        cache, catalog, field, plan, state, rows,
-    )
+    cynos_gql::batch_render::render_graphql_response_refs(cache, catalog, field, plan, state, rows)
 }
 
 fn root_field_has_relations(field: &cynos_gql::bind::BoundRootField) -> bool {
@@ -1553,7 +1551,8 @@ impl GraphqlSubscriptionObservable {
             }
         }
 
-        let should_refresh_roots = !root_changed_ids.is_empty() || self.root_subset_refresh.is_some();
+        let should_refresh_roots =
+            !root_changed_ids.is_empty() || self.root_subset_refresh.is_some();
         let mut root_changed = false;
         let mut dirty_root_rows = HashSet::new();
         if should_refresh_roots {
@@ -1561,9 +1560,9 @@ impl GraphqlSubscriptionObservable {
             let refresh_started_at = now_ms();
             let refresh_outcome =
                 match self.refresh_root_rows(changes, delta_changes, &root_changed_ids) {
-                Some(outcome) => outcome,
-                None => return,
-            };
+                    Some(outcome) => outcome,
+                    None => return,
+                };
             root_changed = refresh_outcome.changed;
             dirty_root_rows = refresh_outcome.dirty_root_rows;
             #[cfg(feature = "benchmark")]
@@ -1640,7 +1639,9 @@ impl GraphqlSubscriptionObservable {
         changed_ids: &HashSet<u64>,
     ) -> Option<SnapshotRootRefreshOutcome> {
         let only_root_table_changes = !changes.is_empty()
-            && changes.keys().all(|table_id| self.root_table_ids.contains(table_id));
+            && changes
+                .keys()
+                .all(|table_id| self.root_table_ids.contains(table_id));
         if !changed_ids.is_empty() && only_root_table_changes {
             if let Some(changed_rows) =
                 collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
@@ -2123,10 +2124,8 @@ impl GraphqlDeltaObservable {
                 Some(Ok(mut invalidation)) => {
                     invalidation.root_changed = !output_deltas.is_empty();
                     if invalidation.root_changed {
-                        invalidation.dirty_root_rows = output_deltas
-                            .iter()
-                            .map(|delta| delta.data.id())
-                            .collect();
+                        invalidation.dirty_root_rows =
+                            output_deltas.iter().map(|delta| delta.data.id()).collect();
                         invalidation.stable_root_positions =
                             output_deltas_preserve_root_positions(&output_deltas);
                     }
@@ -2892,10 +2891,16 @@ struct CachedSnapshotRowJs {
     value: JsValue,
 }
 
+const SNAPSHOT_JSONB_CACHE_MAX_ENTRIES: usize = 8_192;
+const SNAPSHOT_JSONB_CACHE_TARGET_ENTRIES: usize = 6_144;
+const SNAPSHOT_JSONB_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const SNAPSHOT_JSONB_CACHE_TARGET_BYTES: usize = 3 * 1024 * 1024;
+
 #[derive(Default)]
 struct JsSnapshotRowsCache {
     rows: HashMap<u64, CachedSnapshotRowJs>,
     jsonb_cache: HashMap<Vec<u8>, JsValue>,
+    jsonb_cache_bytes: usize,
     epoch: u64,
 }
 
@@ -2965,7 +2970,7 @@ impl JsSnapshotRowsMaterializer {
             }
         }
 
-        let value = self.build_row_object(row, &mut cache.jsonb_cache);
+        let value = self.build_row_object(row, cache);
         cache.rows.insert(
             row.id(),
             CachedSnapshotRowJs {
@@ -2977,10 +2982,10 @@ impl JsSnapshotRowsMaterializer {
         value
     }
 
-    fn build_row_object(&self, row: &Row, jsonb_cache: &mut HashMap<Vec<u8>, JsValue>) -> JsValue {
+    fn build_row_object(&self, row: &Row, cache: &mut JsSnapshotRowsCache) -> JsValue {
         match self {
             Self::Full { property_keys } | Self::Projected { property_keys } => {
-                row_to_js_with_keys(row, property_keys, jsonb_cache)
+                row_to_js_with_keys(row, property_keys, cache)
             }
         }
     }
@@ -2989,11 +2994,11 @@ impl JsSnapshotRowsMaterializer {
         &self,
         arena: &TraceTupleArena,
         handle: &TraceTupleHandle,
-        jsonb_cache: &mut HashMap<Vec<u8>, JsValue>,
+        cache: &mut JsSnapshotRowsCache,
     ) -> JsValue {
         match self {
             Self::Full { property_keys } | Self::Projected { property_keys } => {
-                trace_handle_to_js_with_keys(arena, handle, property_keys, jsonb_cache)
+                trace_handle_to_js_with_keys(arena, handle, property_keys, cache)
             }
         }
     }
@@ -3015,7 +3020,7 @@ impl JsSnapshotRowsCache {
             }
         }
 
-        let value = materializer.build_trace_handle_object(arena, handle, &mut self.jsonb_cache);
+        let value = materializer.build_trace_handle_object(arena, handle, self);
         self.rows.insert(
             row_id,
             CachedSnapshotRowJs {
@@ -3029,6 +3034,53 @@ impl JsSnapshotRowsCache {
 
     fn remove_row(&mut self, row_id: u64) {
         self.rows.remove(&row_id);
+    }
+
+    fn value_to_js_cached(&mut self, value: &Value) -> JsValue {
+        match value {
+            Value::Jsonb(jsonb) => {
+                if let Some(cached) = self.jsonb_cache.get(jsonb.0.as_slice()) {
+                    return cached.clone();
+                }
+
+                let parsed = value_to_js(value);
+                self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_add(jsonb.0.len());
+                self.jsonb_cache.insert(jsonb.0.clone(), parsed.clone());
+                self.prune_jsonb_cache_if_needed();
+                parsed
+            }
+            _ => value_to_js(value),
+        }
+    }
+
+    fn prune_jsonb_cache_if_needed(&mut self) {
+        if self.jsonb_cache.len() <= SNAPSHOT_JSONB_CACHE_MAX_ENTRIES
+            && self.jsonb_cache_bytes <= SNAPSHOT_JSONB_CACHE_MAX_BYTES
+        {
+            return;
+        }
+
+        let mut projected_len = self.jsonb_cache.len();
+        let mut projected_bytes = self.jsonb_cache_bytes;
+        let mut keys_to_remove = Vec::new();
+
+        for key in self.jsonb_cache.keys() {
+            if projected_len <= SNAPSHOT_JSONB_CACHE_TARGET_ENTRIES
+                && projected_bytes <= SNAPSHOT_JSONB_CACHE_TARGET_BYTES
+            {
+                break;
+            }
+
+            projected_len = projected_len.saturating_sub(1);
+            projected_bytes = projected_bytes.saturating_sub(key.len());
+            keys_to_remove.push(key.clone());
+        }
+
+        for key in keys_to_remove {
+            if self.jsonb_cache.remove(&key).is_some() {
+                self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_sub(key.len());
+            }
+        }
     }
 }
 
@@ -3048,13 +3100,13 @@ fn projected_rows_to_js_array(rows: &[Rc<Row>], column_names: &[String]) -> JsVa
 fn row_to_js_with_keys(
     row: &Row,
     property_keys: &[JsValue],
-    jsonb_cache: &mut HashMap<Vec<u8>, JsValue>,
+    cache: &mut JsSnapshotRowsCache,
 ) -> JsValue {
     let obj = js_sys::Object::new();
 
     for (i, property_key) in property_keys.iter().enumerate() {
         if let Some(value) = row.get(i) {
-            let js_val = value_to_js_cached(value, jsonb_cache);
+            let js_val = cache.value_to_js_cached(value);
             js_sys::Reflect::set(&obj, property_key, &js_val).ok();
         }
     }
@@ -3066,33 +3118,18 @@ fn trace_handle_to_js_with_keys(
     arena: &TraceTupleArena,
     handle: &TraceTupleHandle,
     property_keys: &[JsValue],
-    jsonb_cache: &mut HashMap<Vec<u8>, JsValue>,
+    cache: &mut JsSnapshotRowsCache,
 ) -> JsValue {
     let obj = js_sys::Object::new();
 
     for (i, property_key) in property_keys.iter().enumerate() {
         if let Some(value) = arena.value_at(handle, i) {
-            let js_val = value_to_js_cached(&value, jsonb_cache);
+            let js_val = cache.value_to_js_cached(&value);
             js_sys::Reflect::set(&obj, property_key, &js_val).ok();
         }
     }
 
     obj.into()
-}
-
-fn value_to_js_cached(value: &Value, jsonb_cache: &mut HashMap<Vec<u8>, JsValue>) -> JsValue {
-    match value {
-        Value::Jsonb(jsonb) => {
-            if let Some(cached) = jsonb_cache.get(jsonb.0.as_slice()) {
-                return cached.clone();
-            }
-
-            let parsed = value_to_js(value);
-            jsonb_cache.insert(jsonb.0.clone(), parsed.clone());
-            parsed
-        }
-        _ => value_to_js(value),
-    }
 }
 
 #[cfg(test)]
@@ -3641,6 +3678,22 @@ mod tests {
         let js = rows_to_js_array(&rows, &schema);
         let arr = js_sys::Array::from(&js);
         assert_eq!(arr.length(), 2);
+    }
+
+    #[test]
+    fn test_snapshot_rows_cache_prunes_jsonb_entries_incrementally() {
+        let mut cache = JsSnapshotRowsCache::default();
+        for index in 0..SNAPSHOT_JSONB_CACHE_MAX_ENTRIES + 64 {
+            let mut key = alloc::vec![(index % 251) as u8; 1024];
+            key.extend_from_slice(&(index as u64).to_le_bytes());
+            cache.jsonb_cache_bytes += key.len();
+            cache.jsonb_cache.insert(key, JsValue::NULL);
+        }
+
+        cache.prune_jsonb_cache_if_needed();
+
+        assert!(cache.jsonb_cache.len() <= SNAPSHOT_JSONB_CACHE_TARGET_ENTRIES);
+        assert!(cache.jsonb_cache_bytes <= SNAPSHOT_JSONB_CACHE_TARGET_BYTES);
     }
 
     #[test]

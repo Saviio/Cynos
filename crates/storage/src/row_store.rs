@@ -97,15 +97,13 @@ impl JsonScalarIndexValue<'_> {
 impl GinIndexConfig {
     fn new(column_idx: usize, indexed_paths: Option<Vec<String>>) -> Self {
         let indexed_paths = indexed_paths.filter(|paths| !paths.is_empty());
-        let compiled_indexed_paths = indexed_paths
-            .as_ref()
-            .map(|paths| {
-                paths
-                    .iter()
-                    .cloned()
-                    .map(CompiledGinPath::new)
-                    .collect::<Vec<_>>()
-            });
+        let compiled_indexed_paths = indexed_paths.as_ref().map(|paths| {
+            paths
+                .iter()
+                .cloned()
+                .map(CompiledGinPath::new)
+                .collect::<Vec<_>>()
+        });
         let compiled_indexed_path_tree = compiled_indexed_paths
             .as_ref()
             .map(|paths| CompiledGinPathTree::new(paths));
@@ -146,7 +144,8 @@ impl CompiledGinPathTree {
             let mut node_index = 0usize;
             for segment in &path.segments {
                 let next_node_index = if let Some(array_index) = segment.array_index {
-                    if let Some(existing) = tree.nodes[node_index].array_children.get(&array_index) {
+                    if let Some(existing) = tree.nodes[node_index].array_children.get(&array_index)
+                    {
                         *existing
                     } else {
                         let next = tree.nodes.len();
@@ -173,7 +172,9 @@ impl CompiledGinPathTree {
                 node_index = next_node_index;
             }
 
-            tree.nodes[node_index].terminal_path_indices.push(path_index);
+            tree.nodes[node_index]
+                .terminal_path_indices
+                .push(path_index);
         }
 
         tree
@@ -1217,10 +1218,18 @@ impl RowStore {
             ));
         }
 
-        let secondary_defs: Vec<(String, Vec<usize>)> = self
+        let secondary_defs: Vec<BatchSecondaryDef> = self
             .index_columns
             .iter()
-            .map(|(name, cols)| (name.clone(), cols.clone()))
+            .map(|(name, cols)| BatchSecondaryDef {
+                name: name.clone(),
+                cols: cols.clone(),
+                unique: self
+                    .secondary_indices
+                    .get(name)
+                    .map(|idx| idx.is_unique())
+                    .unwrap_or(false),
+            })
             .collect();
         let gin_defs: Vec<(String, GinIndexConfig)> = self
             .gin_index_configs
@@ -1229,19 +1238,20 @@ impl RowStore {
             .collect();
         let mut profiler =
             InsertBatchProfiler::disabled(rows.len(), secondary_defs.len(), gin_defs.len());
+        self.validate_empty_bulk_load_rows(&rows, &secondary_defs)?;
         self.bulk_load_with_profiler(rows, &secondary_defs, &gin_defs, &mut profiler)
     }
 
     fn bulk_load_with_profiler(
         &mut self,
         rows: Vec<Row>,
-        secondary_defs: &[(String, Vec<usize>)],
+        secondary_defs: &[BatchSecondaryDef],
         gin_defs: &[(String, GinIndexConfig)],
         profiler: &mut InsertBatchProfiler,
     ) -> Result<usize> {
         debug_assert!(rows
             .windows(2)
-            .all(|window| window[0].id() <= window[1].id()));
+            .all(|window| window[0].id() < window[1].id()));
 
         let mut row_id_entries = Vec::with_capacity(rows.len());
         let mut primary_entries = self
@@ -1258,8 +1268,8 @@ impl RowStore {
             if let Some(entries) = primary_entries.as_mut() {
                 entries.push((extract_key(row, &self.pk_columns), row_id));
             }
-            for ((_, cols), entries) in secondary_defs.iter().zip(secondary_entries.iter_mut()) {
-                entries.push((extract_key(row, cols), row_id));
+            for (def, entries) in secondary_defs.iter().zip(secondary_entries.iter_mut()) {
+                entries.push((extract_key(row, &def.cols), row_id));
             }
         }
 
@@ -1295,10 +1305,10 @@ impl RowStore {
         }
 
         let started = profiler.start_timer();
-        for ((idx_name, _), entries) in secondary_defs.iter().zip(secondary_entries.iter()) {
+        for (def, entries) in secondary_defs.iter().zip(secondary_entries.iter()) {
             let mut violation = None;
             {
-                let Some(idx) = self.secondary_indices.get_mut(idx_name) else {
+                let Some(idx) = self.secondary_indices.get_mut(&def.name) else {
                     continue;
                 };
                 if idx.add_batch_index_keys(entries).is_err() {
@@ -1306,7 +1316,7 @@ impl RowStore {
                         .map(|key| key.to_error_value())
                         .unwrap_or(Value::Null);
                     violation = Some(Error::UniqueConstraint {
-                        column: idx_name.clone(),
+                        column: def.name.clone(),
                         value,
                     });
                 }
@@ -1435,11 +1445,7 @@ impl RowStore {
         let validation_started = profiler.start_timer();
         if self.is_empty() && self.can_use_bulk_insert_fast_path(&rows, secondary_defs) {
             profiler.finish_phase(InsertProfilePhase::Validation, validation_started);
-            let bulk_secondary_defs: Vec<(String, Vec<usize>)> = secondary_defs
-                .iter()
-                .map(|def| (def.name.clone(), def.cols.clone()))
-                .collect();
-            return self.bulk_load_with_profiler(rows, &bulk_secondary_defs, gin_defs, profiler);
+            return self.bulk_load_with_profiler(rows, secondary_defs, gin_defs, profiler);
         }
         let prepared_batch = self.prepare_batch_insert_merge(&rows, secondary_defs);
         profiler.finish_phase(InsertProfilePhase::Validation, validation_started);
@@ -1886,6 +1892,54 @@ impl RowStore {
         }
 
         true
+    }
+
+    fn validate_empty_bulk_load_rows(
+        &self,
+        rows: &[Row],
+        secondary_defs: &[BatchSecondaryDef],
+    ) -> Result<()> {
+        if !rows
+            .windows(2)
+            .all(|window| window[0].id() < window[1].id())
+        {
+            return Err(Error::invalid_operation(
+                "Bulk load rows must be sorted by strictly increasing row ID",
+            ));
+        }
+
+        let mut seen_primary_keys = (!self.pk_columns.is_empty()).then(BTreeSet::new);
+        let mut seen_secondary_keys: Vec<Option<BTreeSet<IndexKey>>> = secondary_defs
+            .iter()
+            .map(|def| def.unique.then(BTreeSet::new))
+            .collect();
+
+        for row in rows {
+            if let Some(seen) = seen_primary_keys.as_mut() {
+                let key = extract_key(row, &self.pk_columns);
+                if !seen.insert(key.clone()) {
+                    return Err(Error::UniqueConstraint {
+                        column: "primary_key".into(),
+                        value: key.to_error_value(),
+                    });
+                }
+            }
+
+            for (def, maybe_seen) in secondary_defs.iter().zip(seen_secondary_keys.iter_mut()) {
+                let Some(seen) = maybe_seen.as_mut() else {
+                    continue;
+                };
+                let key = extract_key(row, &def.cols);
+                if !seen.insert(key.clone()) {
+                    return Err(Error::UniqueConstraint {
+                        column: def.name.clone(),
+                        value: key.to_error_value(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Inserts a row into the store.
@@ -2918,9 +2972,12 @@ impl RowStore {
         indexed_path_tree: Option<&CompiledGinPathTree>,
     ) {
         if let Some(paths) = indexed_paths {
-            if let Some(extracted) =
-                Self::extract_selected_jsonb_entries_from_text(value, paths, indexed_path_tree, None)
-            {
+            if let Some(extracted) = Self::extract_selected_jsonb_entries_from_text(
+                value,
+                paths,
+                indexed_path_tree,
+                None,
+            ) {
                 Self::index_extracted_jsonb_selected_paths(gin_idx, row_id, paths, extracted);
                 return;
             }
@@ -2948,14 +3005,12 @@ impl RowStore {
         profiler: &mut InsertBatchProfiler,
     ) {
         if let Some(paths) = indexed_paths {
-            if let Some(extracted) =
-                Self::extract_selected_jsonb_entries_from_text(
-                    value,
-                    paths,
-                    indexed_path_tree,
-                    Some(profiler),
-                )
-            {
+            if let Some(extracted) = Self::extract_selected_jsonb_entries_from_text(
+                value,
+                paths,
+                indexed_path_tree,
+                Some(profiler),
+            ) {
                 Self::collect_extracted_jsonb_selected_paths_into_builder_profiled(
                     builder, row_id, paths, extracted, profiler,
                 );
@@ -3399,9 +3454,12 @@ impl RowStore {
         indexed_path_tree: Option<&CompiledGinPathTree>,
     ) {
         if let Some(paths) = indexed_paths {
-            if let Some(extracted) =
-                Self::extract_selected_jsonb_entries_from_text(value, paths, indexed_path_tree, None)
-            {
+            if let Some(extracted) = Self::extract_selected_jsonb_entries_from_text(
+                value,
+                paths,
+                indexed_path_tree,
+                None,
+            ) {
                 Self::remove_extracted_jsonb_selected_paths(gin_idx, row_id, paths, extracted);
                 return;
             }
@@ -3591,8 +3649,7 @@ impl RowStore {
 
     #[cfg(test)]
     fn json_text_scalar_to_index_value(value_slice: &str) -> Option<String> {
-        Self::json_text_scalar_to_index_value_ref(value_slice)
-            .map(JsonScalarIndexValue::into_owned)
+        Self::json_text_scalar_to_index_value_ref(value_slice).map(JsonScalarIndexValue::into_owned)
     }
 
     fn json_text_scalar_to_index_value_ref(value_slice: &str) -> Option<JsonScalarIndexValue<'_>> {
@@ -3848,13 +3905,12 @@ impl RowStore {
         indexed_path_tree: Option<&CompiledGinPathTree>,
         profiler: Option<&mut InsertBatchProfiler>,
     ) -> Option<Vec<(usize, ParsedJsonbValue)>> {
-        let extracted =
-            Self::extract_selected_jsonb_entries_from_text(
-                value,
-                indexed_paths,
-                indexed_path_tree,
-                profiler,
-            )?;
+        let extracted = Self::extract_selected_jsonb_entries_from_text(
+            value,
+            indexed_paths,
+            indexed_path_tree,
+            profiler,
+        )?;
         let mut parsed_values = Vec::with_capacity(extracted.len());
         for (path_index, value) in extracted {
             let parsed = match value {
@@ -4865,6 +4921,32 @@ mod tests {
         let rows = vec![
             Row::new(10, vec![Value::Int64(1), Value::String("Alice".into())]),
             Row::new(11, vec![Value::Int64(1), Value::String("Bob".into())]),
+        ];
+
+        assert!(store.bulk_load(rows).is_err());
+        assert!(store.is_empty());
+        assert!(store.scan().next().is_none());
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_rejects_unsorted_row_ids_without_leaking_state() {
+        let mut store = RowStore::new(test_schema());
+        let rows = vec![
+            Row::new(11, vec![Value::Int64(1), Value::String("Alice".into())]),
+            Row::new(10, vec![Value::Int64(2), Value::String("Bob".into())]),
+        ];
+
+        assert!(store.bulk_load(rows).is_err());
+        assert!(store.is_empty());
+        assert!(store.scan().next().is_none());
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_rejects_duplicate_row_ids_without_leaking_state() {
+        let mut store = RowStore::new(test_schema());
+        let rows = vec![
+            Row::new(10, vec![Value::Int64(1), Value::String("Alice".into())]),
+            Row::new(10, vec![Value::Int64(2), Value::String("Bob".into())]),
         ];
 
         assert!(store.bulk_load(rows).is_err());
