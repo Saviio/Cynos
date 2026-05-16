@@ -20,6 +20,7 @@ use cynos_incremental::{
     TraceTupleHandle,
 };
 use cynos_index::KeyRange;
+use cynos_jsonb::path::{decode_json_string_literal, trim_json_bytes, SimpleJsonPath};
 use cynos_jsonb::{JsonPath, JsonbObject, JsonbValue};
 use cynos_query::ast::JoinType as QueryJoinType;
 use cynos_query::ast::{AggregateFunc, BinaryOp, Expr, UnaryOp};
@@ -688,28 +689,17 @@ fn compile_trace_mapper(
 enum CompiledTracePredicate {
     JsonPathEq {
         column_index: usize,
-        path: CompiledTraceJsonPath,
+        path: SimpleJsonPath,
         expected: Value,
     },
     JsonPathExists {
         column_index: usize,
-        path: CompiledTraceJsonPath,
+        path: SimpleJsonPath,
     },
     And(Box<CompiledTracePredicate>, Box<CompiledTracePredicate>),
     Or(Box<CompiledTracePredicate>, Box<CompiledTracePredicate>),
     Not(Box<CompiledTracePredicate>),
     Generic(Expr),
-}
-
-#[derive(Clone)]
-struct CompiledTraceJsonPath {
-    segments: Vec<CompiledTraceJsonPathSegment>,
-}
-
-#[derive(Clone)]
-enum CompiledTraceJsonPathSegment {
-    Field(String),
-    Index(usize),
 }
 
 impl CompiledTracePredicate {
@@ -763,7 +753,7 @@ impl CompiledTracePredicate {
                 };
                 Some(Self::JsonPathEq {
                     column_index: column.index,
-                    path: compile_trace_json_path(path)?,
+                    path: SimpleJsonPath::parse(path)?,
                     expected: expected.clone(),
                 })
             }
@@ -776,7 +766,7 @@ impl CompiledTracePredicate {
                 };
                 Some(Self::JsonPathExists {
                     column_index: column.index,
-                    path: compile_trace_json_path(path)?,
+                    path: SimpleJsonPath::parse(path)?,
                 })
             }
             _ => None,
@@ -804,7 +794,7 @@ impl CompiledTracePredicate {
                 let Some(Value::Jsonb(jsonb)) = arena.value_at(handle, *column_index) else {
                     return false;
                 };
-                trace_json_extract_path_bytes(&jsonb, path)
+                path.extract(&jsonb.0)
                     .map(|actual| trace_json_raw_eq_value(actual, expected))
                     .unwrap_or(false)
             }
@@ -812,7 +802,7 @@ impl CompiledTracePredicate {
                 let Some(Value::Jsonb(jsonb)) = arena.value_at(handle, *column_index) else {
                     return false;
                 };
-                trace_json_extract_path_bytes(&jsonb, path).is_some()
+                path.extract(&jsonb.0).is_some()
             }
             Self::And(left, right) => left.eval(arena, handle) && right.eval(arena, handle),
             Self::Or(left, right) => left.eval(arena, handle) || right.eval(arena, handle),
@@ -825,255 +815,8 @@ impl CompiledTracePredicate {
     }
 }
 
-fn compile_trace_json_path(path: &str) -> Option<CompiledTraceJsonPath> {
-    let parsed = JsonPath::parse(path).ok()?;
-    let mut segments = Vec::new();
-    collect_trace_json_path_segments(&parsed, &mut segments)
-        .then_some(CompiledTraceJsonPath { segments })
-}
-
-fn collect_trace_json_path_segments(
-    path: &JsonPath,
-    segments: &mut Vec<CompiledTraceJsonPathSegment>,
-) -> bool {
-    match path {
-        JsonPath::Root => true,
-        JsonPath::Field(parent, field) => {
-            if !collect_trace_json_path_segments(parent, segments) {
-                return false;
-            }
-            segments.push(CompiledTraceJsonPathSegment::Field(field.clone()));
-            true
-        }
-        JsonPath::Index(parent, index) => {
-            if !collect_trace_json_path_segments(parent, segments) {
-                return false;
-            }
-            segments.push(CompiledTraceJsonPathSegment::Index(*index));
-            true
-        }
-        JsonPath::Slice(_, _, _)
-        | JsonPath::RecursiveField(_, _)
-        | JsonPath::Wildcard(_)
-        | JsonPath::Filter(_, _) => false,
-    }
-}
-
-fn trace_json_extract_path_bytes<'json>(
-    jsonb: &'json cynos_core::JsonbValue,
-    path: &CompiledTraceJsonPath,
-) -> Option<&'json [u8]> {
-    let mut current = trace_trim_json_bytes(&jsonb.0);
-    for segment in &path.segments {
-        current = match segment {
-            CompiledTraceJsonPathSegment::Field(field) => trace_json_extract_field(current, field)?,
-            CompiledTraceJsonPathSegment::Index(index) => {
-                trace_json_extract_index(current, *index)?
-            }
-        };
-    }
-    Some(trace_trim_json_bytes(current))
-}
-
-fn trace_json_extract_field<'json>(object: &'json [u8], field: &str) -> Option<&'json [u8]> {
-    let bytes = trace_trim_json_bytes(object);
-    if bytes.first() != Some(&b'{') || bytes.last() != Some(&b'}') {
-        return None;
-    }
-
-    let mut pos = 1usize;
-    loop {
-        pos = trace_skip_json_ws(bytes, pos);
-        match bytes.get(pos) {
-            Some(b'}') => return None,
-            Some(b'"') => {}
-            _ => return None,
-        }
-
-        let key_end = trace_scan_json_string_end(bytes, pos)?;
-        let key = trace_decode_json_string(&bytes[pos..key_end])?;
-
-        pos = trace_skip_json_ws(bytes, key_end);
-        if bytes.get(pos) != Some(&b':') {
-            return None;
-        }
-
-        pos = trace_skip_json_ws(bytes, pos + 1);
-        let value_start = pos;
-        let value_end = trace_scan_json_value_end(bytes, value_start)?;
-        if key == field {
-            return Some(trace_trim_json_bytes(&bytes[value_start..value_end]));
-        }
-
-        pos = trace_skip_json_ws(bytes, value_end);
-        match bytes.get(pos) {
-            Some(b',') => pos += 1,
-            Some(b'}') => return None,
-            _ => return None,
-        }
-    }
-}
-
-fn trace_json_extract_index(array: &[u8], target_index: usize) -> Option<&[u8]> {
-    let bytes = trace_trim_json_bytes(array);
-    if bytes.first() != Some(&b'[') || bytes.last() != Some(&b']') {
-        return None;
-    }
-
-    let mut pos = 1usize;
-    let mut current_index = 0usize;
-    loop {
-        pos = trace_skip_json_ws(bytes, pos);
-        match bytes.get(pos) {
-            Some(b']') | None => return None,
-            Some(_) => {}
-        }
-
-        let value_start = pos;
-        let value_end = trace_scan_json_value_end(bytes, value_start)?;
-        if current_index == target_index {
-            return Some(trace_trim_json_bytes(&bytes[value_start..value_end]));
-        }
-
-        current_index += 1;
-        pos = trace_skip_json_ws(bytes, value_end);
-        match bytes.get(pos) {
-            Some(b',') => pos += 1,
-            Some(b']') => return None,
-            _ => return None,
-        }
-    }
-}
-
-#[inline]
-fn trace_trim_json_bytes(bytes: &[u8]) -> &[u8] {
-    let mut start = 0usize;
-    let mut end = bytes.len();
-    while start < end && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while end > start && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &bytes[start..end]
-}
-
-#[inline]
-fn trace_skip_json_ws(bytes: &[u8], mut pos: usize) -> usize {
-    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-        pos += 1;
-    }
-    pos
-}
-
-fn trace_scan_json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
-    if bytes.get(start) != Some(&b'"') {
-        return None;
-    }
-
-    let mut pos = start + 1;
-    let mut escaped = false;
-    while pos < bytes.len() {
-        let byte = bytes[pos];
-        if escaped {
-            escaped = false;
-        } else if byte == b'\\' {
-            escaped = true;
-        } else if byte == b'"' {
-            return Some(pos + 1);
-        }
-        pos += 1;
-    }
-
-    None
-}
-
-fn trace_scan_json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let start = trace_skip_json_ws(bytes, start);
-    match bytes.get(start) {
-        Some(b'"') => trace_scan_json_string_end(bytes, start),
-        Some(b'{') | Some(b'[') => trace_scan_json_composite_end(bytes, start),
-        Some(_) => {
-            let mut pos = start;
-            while pos < bytes.len() {
-                match bytes[pos] {
-                    b',' | b']' | b'}' => break,
-                    _ => pos += 1,
-                }
-            }
-            Some(pos)
-        }
-        None => None,
-    }
-}
-
-fn trace_scan_json_composite_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (offset, byte) in bytes[start..].iter().copied().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match byte {
-            b'"' => in_string = true,
-            b'{' | b'[' => depth += 1,
-            b'}' | b']' => {
-                if depth == 0 {
-                    return None;
-                }
-                depth -= 1;
-                if depth == 0 {
-                    return Some(start + offset + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn trace_decode_json_string(bytes: &[u8]) -> Option<String> {
-    let bytes = trace_trim_json_bytes(bytes);
-    if bytes.len() < 2 || bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') {
-        return None;
-    }
-
-    let inner = core::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()?;
-    let mut result = String::new();
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            result.push(ch);
-            continue;
-        }
-
-        match chars.next()? {
-            '"' => result.push('"'),
-            '\\' => result.push('\\'),
-            '/' => result.push('/'),
-            'n' => result.push('\n'),
-            'r' => result.push('\r'),
-            't' => result.push('\t'),
-            _ => return None,
-        }
-    }
-
-    Some(result)
-}
-
 fn trace_json_raw_eq_value(raw: &[u8], expected: &Value) -> bool {
-    let raw = trace_trim_json_bytes(raw);
+    let raw = trim_json_bytes(raw);
     match expected {
         Value::Null => raw == b"null",
         Value::Boolean(value) => {
@@ -1087,7 +830,7 @@ fn trace_json_raw_eq_value(raw: &[u8], expected: &Value) -> bool {
         Value::Int32(value) => trace_json_raw_number_eq(raw, *value as f64),
         Value::Int64(value) => trace_json_raw_number_eq(raw, *value as f64),
         Value::Float64(value) => trace_json_raw_number_eq(raw, *value),
-        Value::String(value) => trace_decode_json_string(raw)
+        Value::String(value) => decode_json_string_literal(raw)
             .map(|actual| actual == *value)
             .unwrap_or(false),
         _ => false,
@@ -1275,8 +1018,7 @@ fn jsonb_path_eq(jsonb: &cynos_core::JsonbValue, path: &str, expected: &Value) -
         Err(_) => return Value::Boolean(false),
     };
 
-    let results = json_value.query(&json_path);
-    match results.first() {
+    match json_value.query_first(&json_path) {
         Some(actual) => Value::Boolean(compare_jsonb_with_value(actual, expected)),
         None => Value::Boolean(false),
     }
@@ -1293,7 +1035,7 @@ fn jsonb_path_exists(jsonb: &cynos_core::JsonbValue, path: &str) -> Value {
         Err(_) => return Value::Boolean(false),
     };
 
-    Value::Boolean(!json_value.query(&json_path).is_empty())
+    Value::Boolean(json_value.query_first(&json_path).is_some())
 }
 
 fn jsonb_contains(jsonb: &cynos_core::JsonbValue, path: &str, expected: &Value) -> Value {
@@ -1307,8 +1049,7 @@ fn jsonb_contains(jsonb: &cynos_core::JsonbValue, path: &str, expected: &Value) 
         Err(_) => return Value::Boolean(false),
     };
 
-    let results = json_value.query(&json_path);
-    let Some(actual) = results.first() else {
+    let Some(actual) = json_value.query_first(&json_path) else {
         return Value::Boolean(false);
     };
 
@@ -2415,6 +2156,29 @@ mod tests {
 
         assert!(compiled.eval(&arena, &matching));
         assert!(!compiled.eval(&arena, &missing));
+    }
+
+    #[test]
+    fn test_compiled_trace_json_predicate_matches_generic_escaped_value() {
+        let expr = Expr::jsonb_path_eq(
+            Expr::column("projects", "metadata", 0),
+            "$.risk.label",
+            Value::String("hi\nthere".into()),
+        );
+        let compiled = CompiledTracePredicate::compile(&expr);
+        let arena = TraceTupleArena::default();
+
+        let matching = arena.owned(Row::new(
+            1,
+            vec![jsonb_value(r#"{"risk":{"label":"hi\nthere"}}"#)],
+        ));
+        let different = arena.owned(Row::new(
+            2,
+            vec![jsonb_value(r#"{"risk":{"label":"hi there"}}"#)],
+        ));
+
+        assert!(compiled.eval(&arena, &matching));
+        assert!(!compiled.eval(&arena, &different));
     }
 
     #[test]

@@ -18,6 +18,11 @@ use cynos_index::{
     contains_trigram_pairs, BTreeIndex, GinBulkBuilder, GinIndex, HashIndex, Index, KeyRange,
     RangeIndex,
 };
+use cynos_jsonb::path::{
+    scan_json_string_end as scan_json_string_end_bytes,
+    scan_json_value_end as scan_json_value_end_bytes,
+    skip_json_whitespace as skip_json_whitespace_bytes,
+};
 use cynos_jsonb::{JsonbObject, JsonbValue as ParsedJsonbValue};
 
 /// Row ID lookup backend: HashMap (O(1) lookup) or BTreeMap (O(log n) lookup).
@@ -4831,105 +4836,6 @@ fn split_json_top_level(s: &str, separator: char) -> Vec<&str> {
     }
 
     parts
-}
-
-fn skip_json_whitespace_bytes(bytes: &[u8], mut index: usize) -> usize {
-    while let Some(byte) = bytes.get(index).copied() {
-        if !byte.is_ascii_whitespace() {
-            break;
-        }
-        index += 1;
-    }
-    index
-}
-
-fn scan_json_string_end_bytes(bytes: &[u8], start: usize) -> Option<usize> {
-    if bytes.get(start).copied() != Some(b'"') {
-        return None;
-    }
-
-    let mut index = start + 1;
-    let mut escape = false;
-    while let Some(byte) = bytes.get(index).copied() {
-        if escape {
-            escape = false;
-            index += 1;
-            continue;
-        }
-        match byte {
-            b'\\' => {
-                escape = true;
-                index += 1;
-            }
-            b'"' => return Some(index + 1),
-            _ => index += 1,
-        }
-    }
-
-    None
-}
-
-fn scan_json_value_end_bytes(bytes: &[u8], start: usize) -> Option<usize> {
-    let start = skip_json_whitespace_bytes(bytes, start);
-    let first = *bytes.get(start)?;
-    match first {
-        b'"' => scan_json_string_end_bytes(bytes, start),
-        b'{' | b'[' => {
-            let mut index = start;
-            let mut depth = 0i32;
-            let mut in_string = false;
-            let mut escape = false;
-            while let Some(byte) = bytes.get(index).copied() {
-                if escape {
-                    escape = false;
-                    index += 1;
-                    continue;
-                }
-                if in_string {
-                    match byte {
-                        b'\\' => escape = true,
-                        b'"' => in_string = false,
-                        _ => {}
-                    }
-                    index += 1;
-                    continue;
-                }
-
-                match byte {
-                    b'"' => {
-                        in_string = true;
-                        index += 1;
-                    }
-                    b'{' | b'[' => {
-                        depth += 1;
-                        index += 1;
-                    }
-                    b'}' | b']' => {
-                        depth -= 1;
-                        index += 1;
-                        if depth == 0 {
-                            return Some(index);
-                        }
-                    }
-                    _ => index += 1,
-                }
-            }
-            None
-        }
-        _ => {
-            let mut index = start;
-            while let Some(byte) = bytes.get(index).copied() {
-                if matches!(byte, b',' | b']' | b'}') {
-                    break;
-                }
-                index += 1;
-            }
-            while index > start && bytes[index - 1].is_ascii_whitespace() {
-                index -= 1;
-            }
-            Some(index)
-        }
-    }
 }
 
 fn find_json_colon(s: &str) -> Option<usize> {

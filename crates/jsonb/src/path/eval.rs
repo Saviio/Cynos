@@ -17,7 +17,7 @@ impl JsonbValue {
 
     /// Evaluates a JSONPath expression and returns the first matching value.
     pub fn query_first<'a>(&'a self, path: &JsonPath) -> Option<&'a JsonbValue> {
-        self.query(path).into_iter().next()
+        eval_path_first(self, path)
     }
 }
 
@@ -103,6 +103,86 @@ fn eval_path_collect<'a>(value: &'a JsonbValue, path: &JsonPath) -> Vec<&'a Json
     results
 }
 
+fn eval_path_first<'a>(value: &'a JsonbValue, path: &JsonPath) -> Option<&'a JsonbValue> {
+    let mut first = None;
+    eval_path_until(value, path, &mut |candidate| {
+        first = Some(candidate);
+        true
+    });
+    first
+}
+
+fn eval_path_until<'a>(
+    value: &'a JsonbValue,
+    path: &JsonPath,
+    visit: &mut dyn FnMut(&'a JsonbValue) -> bool,
+) -> bool {
+    match path {
+        JsonPath::Root => visit(value),
+        JsonPath::Field(parent, field) => eval_path_until(value, parent, &mut |v| {
+            if let Some(obj) = v.as_object() {
+                if let Some(field_value) = obj.get(field) {
+                    return visit(field_value);
+                }
+            }
+            false
+        }),
+        JsonPath::Index(parent, index) => eval_path_until(value, parent, &mut |v| {
+            if let Some(arr) = v.as_array() {
+                if let Some(item) = arr.get(*index) {
+                    return visit(item);
+                }
+            }
+            false
+        }),
+        JsonPath::Slice(parent, start, end) => eval_path_until(value, parent, &mut |v| {
+            if let Some(arr) = v.as_array() {
+                let start_idx = start.unwrap_or(0);
+                let end_idx = end.unwrap_or(arr.len());
+                for item in arr.iter().skip(start_idx).take(end_idx - start_idx) {
+                    if visit(item) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }),
+        JsonPath::Wildcard(parent) => eval_path_until(value, parent, &mut |v| {
+            match v {
+                JsonbValue::Array(arr) => {
+                    for item in arr {
+                        if visit(item) {
+                            return true;
+                        }
+                    }
+                }
+                JsonbValue::Object(obj) => {
+                    for (_, val) in obj.iter() {
+                        if visit(val) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            false
+        }),
+        JsonPath::RecursiveField(parent, field) => eval_path_until(value, parent, &mut |v| {
+            recursive_field_search_until(v, field, visit)
+        }),
+        JsonPath::Filter(parent, predicate) => eval_path_until(value, parent, &mut |v| {
+            if let Some(arr) = v.as_array() {
+                for item in arr {
+                    if eval_predicate(item, predicate) && visit(item) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }),
+    }
+}
+
 fn recursive_field_search<'a>(
     value: &'a JsonbValue,
     field: &str,
@@ -124,6 +204,36 @@ fn recursive_field_search<'a>(
         }
         _ => {}
     }
+}
+
+fn recursive_field_search_until<'a>(
+    value: &'a JsonbValue,
+    field: &str,
+    visit: &mut dyn FnMut(&'a JsonbValue) -> bool,
+) -> bool {
+    match value {
+        JsonbValue::Object(obj) => {
+            if let Some(v) = obj.get(field) {
+                if visit(v) {
+                    return true;
+                }
+            }
+            for (_, v) in obj.iter() {
+                if recursive_field_search_until(v, field, visit) {
+                    return true;
+                }
+            }
+        }
+        JsonbValue::Array(arr) => {
+            for item in arr {
+                if recursive_field_search_until(item, field, visit) {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    false
 }
 
 fn eval_predicate(value: &JsonbValue, predicate: &JsonPathPredicate) -> bool {
@@ -296,6 +406,23 @@ mod tests {
         let path = JsonPath::parse("$.user.name").unwrap();
         let result = json.query_first(&path);
         assert_eq!(result, Some(&JsonbValue::String("Alice".into())));
+    }
+
+    #[test]
+    fn test_query_first_checks_later_parent_matches() {
+        let mut first = JsonbObject::new();
+        first.insert("other".into(), JsonbValue::String("skip".into()));
+
+        let mut second = JsonbObject::new();
+        second.insert("name".into(), JsonbValue::String("Alice".into()));
+
+        let json = JsonbValue::Array(vec![JsonbValue::Object(first), JsonbValue::Object(second)]);
+        let path = JsonPath::parse("$[*].name").unwrap();
+
+        assert_eq!(
+            json.query_first(&path),
+            Some(&JsonbValue::String("Alice".into()))
+        );
     }
 
     #[test]
