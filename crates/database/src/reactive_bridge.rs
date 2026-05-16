@@ -611,6 +611,87 @@ impl GraphqlSubscribers {
     }
 }
 
+enum GraphqlResponseEncoding<'a> {
+    Plain,
+    BatchedRootList {
+        patch: Option<&'a cynos_gql::GraphqlRootListPatch>,
+    },
+}
+
+fn graphql_response_encoding<'a>(
+    batch_plan: Option<&cynos_gql::GraphqlBatchPlan>,
+    batch_state: &'a cynos_gql::GraphqlBatchState,
+) -> GraphqlResponseEncoding<'a> {
+    match batch_plan {
+        Some(_) => GraphqlResponseEncoding::BatchedRootList {
+            patch: batch_state.last_root_patch(),
+        },
+        None => GraphqlResponseEncoding::Plain,
+    }
+}
+
+#[derive(Default)]
+struct GraphqlResponsePayloadCache {
+    response: Option<cynos_gql::GraphqlResponse>,
+    response_js: Option<JsValue>,
+    encode_cache: GraphqlJsEncodeCache,
+    root_list_js_cache: GraphqlRootListJsCache,
+    dirty: bool,
+}
+
+impl GraphqlResponsePayloadCache {
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn has_clean_response(&self) -> bool {
+        self.response.is_some() && !self.dirty
+    }
+
+    fn current_response(&self) -> Option<&cynos_gql::GraphqlResponse> {
+        self.response.as_ref()
+    }
+
+    fn cached_js_value(&mut self, encoding: GraphqlResponseEncoding<'_>) -> JsValue {
+        if let Some(payload) = &self.response_js {
+            return payload.clone();
+        }
+
+        let Some(response) = self.response.as_ref() else {
+            return JsValue::NULL;
+        };
+        let payload = encode_graphql_response_js(
+            response,
+            &mut self.encode_cache,
+            &mut self.root_list_js_cache,
+            encoding,
+        );
+        self.response_js = Some(payload.clone());
+        payload
+    }
+
+    fn encode_response(
+        &mut self,
+        response: &cynos_gql::GraphqlResponse,
+        encoding: GraphqlResponseEncoding<'_>,
+    ) -> JsValue {
+        encode_graphql_response_js(
+            response,
+            &mut self.encode_cache,
+            &mut self.root_list_js_cache,
+            encoding,
+        )
+    }
+
+    fn finish_materialize(&mut self, response: cynos_gql::GraphqlResponse, changed: bool) {
+        if changed {
+            self.response = Some(response);
+            self.response_js = None;
+        }
+        self.dirty = false;
+    }
+}
+
 fn build_graphql_response(
     cache: &TableCache,
     catalog: &cynos_gql::GraphqlCatalog,
@@ -766,21 +847,26 @@ fn output_deltas_preserve_root_positions(output_deltas: &[Delta<Row>]) -> bool {
         && output_deltas.len() == insert_ids.len().saturating_mul(2)
 }
 
-fn graphql_response_to_js_value(
-    response: &cynos_gql::GraphqlResponse,
-    encode_cache: &mut GraphqlJsEncodeCache,
-) -> JsValue {
-    gql_response_to_js_with_cache(response, encode_cache).unwrap_or(JsValue::NULL)
-}
-
-fn graphql_response_to_js_value_batched(
+fn encode_graphql_response_js(
     response: &cynos_gql::GraphqlResponse,
     encode_cache: &mut GraphqlJsEncodeCache,
     root_list_cache: &mut GraphqlRootListJsCache,
-    patch: Option<&cynos_gql::GraphqlRootListPatch>,
+    encoding: GraphqlResponseEncoding<'_>,
 ) -> JsValue {
-    gql_response_to_js_with_root_list_patch(response, encode_cache, root_list_cache, patch)
-        .unwrap_or(JsValue::NULL)
+    match encoding {
+        GraphqlResponseEncoding::Plain => {
+            gql_response_to_js_with_cache(response, encode_cache).unwrap_or(JsValue::NULL)
+        }
+        GraphqlResponseEncoding::BatchedRootList { patch } => {
+            gql_response_to_js_with_root_list_patch(
+                response,
+                encode_cache,
+                root_list_cache,
+                patch,
+            )
+            .unwrap_or(JsValue::NULL)
+        }
+    }
 }
 
 fn batch_response_changed(state: &cynos_gql::GraphqlBatchState) -> Option<bool> {
@@ -1379,11 +1465,7 @@ pub struct GraphqlSubscriptionObservable {
     root_rows: Vec<Rc<Row>>,
     root_summary: QueryResultSummary,
     root_subset_refresh: Option<RootSubsetRefreshRuntime>,
-    response: Option<cynos_gql::GraphqlResponse>,
-    response_js: Option<JsValue>,
-    response_encode_cache: GraphqlJsEncodeCache,
-    response_root_list_js_cache: GraphqlRootListJsCache,
-    response_dirty: bool,
+    response_payload: GraphqlResponsePayloadCache,
     subscribers: GraphqlSubscribers,
 }
 
@@ -1418,11 +1500,10 @@ impl GraphqlSubscriptionObservable {
             root_rows: initial_rows,
             root_summary: initial_summary,
             root_subset_refresh,
-            response: None,
-            response_js: None,
-            response_encode_cache: GraphqlJsEncodeCache::default(),
-            response_root_list_js_cache: GraphqlRootListJsCache::default(),
-            response_dirty: true,
+            response_payload: GraphqlResponsePayloadCache {
+                dirty: true,
+                ..GraphqlResponsePayloadCache::default()
+            },
             subscribers: GraphqlSubscribers::default(),
         }
     }
@@ -1432,25 +1513,9 @@ impl GraphqlSubscriptionObservable {
     }
 
     pub fn response_js_value(&mut self) -> JsValue {
-        if self.response.is_some() && !self.response_dirty {
-            if let Some(payload) = &self.response_js {
-                return payload.clone();
-            }
-
-            let payload = match self.batch_plan.as_ref() {
-                Some(_) => graphql_response_to_js_value_batched(
-                    self.response.as_ref().unwrap(),
-                    &mut self.response_encode_cache,
-                    &mut self.response_root_list_js_cache,
-                    self.batch_state.last_root_patch(),
-                ),
-                None => graphql_response_to_js_value(
-                    self.response.as_ref().unwrap(),
-                    &mut self.response_encode_cache,
-                ),
-            };
-            self.response_js = Some(payload.clone());
-            return payload;
+        if self.response_payload.has_clean_response() {
+            let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
+            return self.response_payload.cached_js_value(encoding);
         }
 
         if self.subscribers.callback_count() == 0 {
@@ -1461,24 +1526,8 @@ impl GraphqlSubscriptionObservable {
             return JsValue::NULL;
         }
 
-        if let Some(payload) = &self.response_js {
-            payload.clone()
-        } else {
-            let payload = match self.batch_plan.as_ref() {
-                Some(_) => graphql_response_to_js_value_batched(
-                    self.response.as_ref().unwrap(),
-                    &mut self.response_encode_cache,
-                    &mut self.response_root_list_js_cache,
-                    self.batch_state.last_root_patch(),
-                ),
-                None => graphql_response_to_js_value(
-                    self.response.as_ref().unwrap(),
-                    &mut self.response_encode_cache,
-                ),
-            };
-            self.response_js = Some(payload.clone());
-            payload
-        }
+        let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
+        self.response_payload.cached_js_value(encoding)
     }
 
     pub fn subscribe<F: Fn(&JsValue) + 'static>(&mut self, callback: F) -> usize {
@@ -1603,7 +1652,7 @@ impl GraphqlSubscriptionObservable {
                 profile.batch_invalidation_ms += now_ms() - invalidation_started_at;
             }
         }
-        self.response_dirty = true;
+        self.response_payload.mark_dirty();
         if self.subscribers.callback_count() == 0 {
             return;
         }
@@ -1616,7 +1665,7 @@ impl GraphqlSubscriptionObservable {
                 profile.render_ms += now_ms() - render_started_at;
             }
             if changed {
-                if self.response.is_some() {
+                if self.response_payload.current_response().is_some() {
                     #[cfg(feature = "benchmark")]
                     let encode_started_at = now_ms();
                     let payload = self.response_js_value();
@@ -1776,7 +1825,7 @@ impl GraphqlSubscriptionObservable {
     }
 
     fn materialize_response_if_dirty(&mut self) -> Option<bool> {
-        if !self.response_dirty && self.response.is_some() {
+        if self.response_payload.has_clean_response() {
             return Some(false);
         }
 
@@ -1797,26 +1846,22 @@ impl GraphqlSubscriptionObservable {
         };
         let changed = match self.batch_plan.as_ref() {
             Some(_) => batch_response_changed(&self.batch_state).unwrap_or_else(|| {
-                self.response
-                    .as_ref()
+                self.response_payload
+                    .current_response()
                     .map_or(true, |current| *current != response)
             }),
             None => self
-                .response
-                .as_ref()
+                .response_payload
+                .current_response()
                 .map_or(true, |current| *current != response),
         };
-        if changed {
-            self.response = Some(response);
-            self.response_js = None;
-        }
-        self.response_dirty = false;
+        self.response_payload.finish_materialize(response, changed);
         Some(changed)
     }
 
     fn current_response(&mut self) -> Option<&cynos_gql::GraphqlResponse> {
         self.materialize_response_if_dirty()?;
-        self.response.as_ref()
+        self.response_payload.current_response()
     }
 
     fn render_response_js_value(&mut self) -> JsValue {
@@ -1833,15 +1878,10 @@ impl GraphqlSubscriptionObservable {
             None => build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows),
         };
         match response {
-            Ok(response) => match self.batch_plan.as_ref() {
-                Some(_) => graphql_response_to_js_value_batched(
-                    &response,
-                    &mut self.response_encode_cache,
-                    &mut self.response_root_list_js_cache,
-                    self.batch_state.last_root_patch(),
-                ),
-                None => graphql_response_to_js_value(&response, &mut self.response_encode_cache),
-            },
+            Ok(response) => {
+                let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
+                self.response_payload.encode_response(&response, encoding)
+            }
             Err(_) => JsValue::NULL,
         }
     }
@@ -1856,11 +1896,7 @@ pub struct GraphqlDeltaObservable {
     batch_state: cynos_gql::GraphqlBatchState,
     dependency_table_names: HashMap<TableId, String>,
     has_nested_relations: bool,
-    response: Option<cynos_gql::GraphqlResponse>,
-    response_js: Option<JsValue>,
-    response_encode_cache: GraphqlJsEncodeCache,
-    response_root_list_js_cache: GraphqlRootListJsCache,
-    response_dirty: bool,
+    response_payload: GraphqlResponsePayloadCache,
     subscribers: GraphqlSubscribers,
 }
 
@@ -1884,11 +1920,10 @@ impl GraphqlDeltaObservable {
             catalog,
             has_nested_relations: root_field_has_relations(&field),
             field,
-            response: None,
-            response_js: None,
-            response_encode_cache: GraphqlJsEncodeCache::default(),
-            response_root_list_js_cache: GraphqlRootListJsCache::default(),
-            response_dirty: true,
+            response_payload: GraphqlResponsePayloadCache {
+                dirty: true,
+                ..GraphqlResponsePayloadCache::default()
+            },
             subscribers: GraphqlSubscribers::default(),
         }
     }
@@ -1913,11 +1948,10 @@ impl GraphqlDeltaObservable {
             catalog,
             has_nested_relations: root_field_has_relations(&field),
             field,
-            response: None,
-            response_js: None,
-            response_encode_cache: GraphqlJsEncodeCache::default(),
-            response_root_list_js_cache: GraphqlRootListJsCache::default(),
-            response_dirty: true,
+            response_payload: GraphqlResponsePayloadCache {
+                dirty: true,
+                ..GraphqlResponsePayloadCache::default()
+            },
             subscribers: GraphqlSubscribers::default(),
         }
     }
@@ -1953,11 +1987,10 @@ impl GraphqlDeltaObservable {
             catalog,
             has_nested_relations: root_field_has_relations(&field),
             field,
-            response: None,
-            response_js: None,
-            response_encode_cache: GraphqlJsEncodeCache::default(),
-            response_root_list_js_cache: GraphqlRootListJsCache::default(),
-            response_dirty: true,
+            response_payload: GraphqlResponsePayloadCache {
+                dirty: true,
+                ..GraphqlResponsePayloadCache::default()
+            },
             subscribers: GraphqlSubscribers::default(),
         }
     }
@@ -1993,11 +2026,10 @@ impl GraphqlDeltaObservable {
             catalog,
             has_nested_relations: root_field_has_relations(&field),
             field,
-            response: None,
-            response_js: None,
-            response_encode_cache: GraphqlJsEncodeCache::default(),
-            response_root_list_js_cache: GraphqlRootListJsCache::default(),
-            response_dirty: true,
+            response_payload: GraphqlResponsePayloadCache {
+                dirty: true,
+                ..GraphqlResponsePayloadCache::default()
+            },
             subscribers: GraphqlSubscribers::default(),
         }
     }
@@ -2007,25 +2039,9 @@ impl GraphqlDeltaObservable {
     }
 
     pub fn response_js_value(&mut self) -> JsValue {
-        if self.response.is_some() && !self.response_dirty {
-            if let Some(payload) = &self.response_js {
-                return payload.clone();
-            }
-
-            let payload = match self.batch_plan.as_ref() {
-                Some(_) => graphql_response_to_js_value_batched(
-                    self.response.as_ref().unwrap(),
-                    &mut self.response_encode_cache,
-                    &mut self.response_root_list_js_cache,
-                    self.batch_state.last_root_patch(),
-                ),
-                None => graphql_response_to_js_value(
-                    self.response.as_ref().unwrap(),
-                    &mut self.response_encode_cache,
-                ),
-            };
-            self.response_js = Some(payload.clone());
-            return payload;
+        if self.response_payload.has_clean_response() {
+            let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
+            return self.response_payload.cached_js_value(encoding);
         }
 
         if self.subscribers.callback_count() == 0 {
@@ -2036,24 +2052,8 @@ impl GraphqlDeltaObservable {
             return JsValue::NULL;
         }
 
-        if let Some(payload) = &self.response_js {
-            payload.clone()
-        } else {
-            let payload = match self.batch_plan.as_ref() {
-                Some(_) => graphql_response_to_js_value_batched(
-                    self.response.as_ref().unwrap(),
-                    &mut self.response_encode_cache,
-                    &mut self.response_root_list_js_cache,
-                    self.batch_state.last_root_patch(),
-                ),
-                None => graphql_response_to_js_value(
-                    self.response.as_ref().unwrap(),
-                    &mut self.response_encode_cache,
-                ),
-            };
-            self.response_js = Some(payload.clone());
-            payload
-        }
+        let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
+        self.response_payload.cached_js_value(encoding)
     }
 
     pub fn dependencies(&self) -> &[TableId] {
@@ -2150,7 +2150,7 @@ impl GraphqlDeltaObservable {
                 profile.invalidation_ms += now_ms() - invalidation_started_at;
             }
         }
-        self.response_dirty = true;
+        self.response_payload.mark_dirty();
         if self.subscribers.callback_count() == 0 {
             return;
         }
@@ -2163,7 +2163,7 @@ impl GraphqlDeltaObservable {
                 profile.render_ms += now_ms() - render_started_at;
             }
             if changed {
-                if self.response.is_some() {
+                if self.response_payload.current_response().is_some() {
                     #[cfg(feature = "benchmark")]
                     let encode_started_at = now_ms();
                     let payload = self.response_js_value();
@@ -2189,7 +2189,7 @@ impl GraphqlDeltaObservable {
     }
 
     fn materialize_response_if_dirty(&mut self) -> Option<bool> {
-        if !self.response_dirty && self.response.is_some() {
+        if self.response_payload.has_clean_response() {
             return Some(false);
         }
 
@@ -2214,26 +2214,22 @@ impl GraphqlDeltaObservable {
         };
         let changed = match self.batch_plan.as_ref() {
             Some(_) => batch_response_changed(&self.batch_state).unwrap_or_else(|| {
-                self.response
-                    .as_ref()
+                self.response_payload
+                    .current_response()
                     .map_or(true, |current| *current != response)
             }),
             None => self
-                .response
-                .as_ref()
+                .response_payload
+                .current_response()
                 .map_or(true, |current| *current != response),
         };
-        if changed {
-            self.response = Some(response);
-            self.response_js = None;
-        }
-        self.response_dirty = false;
+        self.response_payload.finish_materialize(response, changed);
         Some(changed)
     }
 
     fn current_response(&mut self) -> Option<&cynos_gql::GraphqlResponse> {
         self.materialize_response_if_dirty()?;
-        self.response.as_ref()
+        self.response_payload.current_response()
     }
 
     fn render_response_js_value(&mut self) -> JsValue {
@@ -2256,15 +2252,10 @@ impl GraphqlDeltaObservable {
             }
         };
         match response {
-            Ok(response) => match self.batch_plan.as_ref() {
-                Some(_) => graphql_response_to_js_value_batched(
-                    &response,
-                    &mut self.response_encode_cache,
-                    &mut self.response_root_list_js_cache,
-                    self.batch_state.last_root_patch(),
-                ),
-                None => graphql_response_to_js_value(&response, &mut self.response_encode_cache),
-            },
+            Ok(response) => {
+                let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
+                self.response_payload.encode_response(&response, encoding)
+            }
             Err(_) => JsValue::NULL,
         }
     }
