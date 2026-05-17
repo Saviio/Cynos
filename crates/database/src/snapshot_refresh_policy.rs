@@ -210,6 +210,21 @@ pub(crate) struct PartialRefreshWindowDecision {
     pub reason: PartialRefreshWindowReason,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PartialRefreshWindowCostInput {
+    pub visible_limit: usize,
+    pub hints: SnapshotRefreshCostHints,
+}
+
+impl PartialRefreshWindowCostInput {
+    pub(crate) fn new(visible_limit: usize) -> Self {
+        Self {
+            visible_limit,
+            hints: SnapshotRefreshCostHints::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PartialRefreshWindowPolicy {
     min_overscan: usize,
@@ -224,9 +239,12 @@ impl PartialRefreshWindowPolicy {
         overscan_divisor: 4,
     };
 
-    pub(crate) fn decide(self, limit: usize) -> PartialRefreshWindowDecision {
+    pub(crate) fn decide_for(
+        self,
+        input: PartialRefreshWindowCostInput,
+    ) -> PartialRefreshWindowDecision {
         let divisor = self.overscan_divisor.max(1);
-        let proportional = limit / divisor;
+        let proportional = input.visible_limit / divisor;
         let capped = core::cmp::min(proportional, self.max_overscan);
         let overscan = core::cmp::max(self.min_overscan, capped);
         let reason = if proportional < self.min_overscan {
@@ -267,10 +285,10 @@ impl SnapshotRefreshCostModel {
         self.root_subset.planning_decision_for(input)
     }
 
-    pub(crate) fn decide_partial_refresh_window(
+    pub(crate) fn decide_partial_refresh_window_for(
         self,
-        visible_limit: usize,
+        input: PartialRefreshWindowCostInput,
     ) -> PartialRefreshWindowDecision {
-        self.partial_window.decide(visible_limit)
+        self.partial_window.decide_for(input)
     }
 }

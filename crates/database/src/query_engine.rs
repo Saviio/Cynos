@@ -23,8 +23,8 @@ use cynos_storage::TableCache;
 use hashbrown::HashSet;
 
 pub(crate) use crate::snapshot_refresh_policy::{
-    RootSubsetPlanVariant, RootSubsetPlanningCostInput, RootSubsetRefreshCostInput,
-    RootSubsetRefreshDecision, SnapshotRefreshCostModel,
+    PartialRefreshWindowCostInput, RootSubsetPlanVariant, RootSubsetPlanningCostInput,
+    RootSubsetRefreshCostInput, RootSubsetRefreshDecision, SnapshotRefreshCostModel,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -78,7 +78,7 @@ impl RootSubsetPlanningProfile {
 
 pub(crate) fn partial_refresh_overscan_for_limit(limit: usize) -> usize {
     SnapshotRefreshCostModel::DEFAULT
-        .decide_partial_refresh_window(limit)
+        .decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(limit))
         .overscan
 }
 
@@ -2034,13 +2034,22 @@ mod tests {
             None
         );
 
-        assert_eq!(cost_model.decide_partial_refresh_window(100).overscan, 256);
         assert_eq!(
-            cost_model.decide_partial_refresh_window(4_096).overscan,
+            cost_model
+                .decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(100))
+                .overscan,
+            256
+        );
+        assert_eq!(
+            cost_model
+                .decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(4_096))
+                .overscan,
             1_024
         );
         assert_eq!(
-            cost_model.decide_partial_refresh_window(20_000).overscan,
+            cost_model
+                .decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(20_000))
+                .overscan,
             1_024
         );
     }
@@ -2089,6 +2098,15 @@ mod tests {
                     planning_input.table_row_count
                 ))
                 .expect("legacy planning decision")
+        );
+
+        let window_input = PartialRefreshWindowCostInput {
+            hints: future_hints,
+            ..PartialRefreshWindowCostInput::new(4_096)
+        };
+        assert_eq!(
+            cost_model.decide_partial_refresh_window_for(window_input),
+            cost_model.decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(4_096))
         );
     }
 
