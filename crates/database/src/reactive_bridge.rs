@@ -611,6 +611,12 @@ impl GraphqlSubscribers {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphqlPayloadMode {
+    FullPayload,
+}
+
+#[derive(Clone, Copy)]
 enum GraphqlResponseEncoding<'a> {
     Plain,
     BatchedRootList {
@@ -618,15 +624,43 @@ enum GraphqlResponseEncoding<'a> {
     },
 }
 
-fn graphql_response_encoding<'a>(
-    batch_plan: Option<&cynos_gql::GraphqlBatchPlan>,
-    batch_state: &'a cynos_gql::GraphqlBatchState,
-) -> GraphqlResponseEncoding<'a> {
-    match batch_plan {
-        Some(_) => GraphqlResponseEncoding::BatchedRootList {
-            patch: batch_state.last_root_patch(),
-        },
-        None => GraphqlResponseEncoding::Plain,
+#[derive(Clone, Copy)]
+struct GraphqlOutputAdapter<'a> {
+    mode: GraphqlPayloadMode,
+    encoding: GraphqlResponseEncoding<'a>,
+}
+
+impl<'a> GraphqlOutputAdapter<'a> {
+    fn full_payload_for(
+        batch_plan: Option<&cynos_gql::GraphqlBatchPlan>,
+        batch_state: &'a cynos_gql::GraphqlBatchState,
+    ) -> Self {
+        let encoding = match batch_plan {
+            Some(_) => GraphqlResponseEncoding::BatchedRootList {
+                patch: batch_state.last_root_patch(),
+            },
+            None => GraphqlResponseEncoding::Plain,
+        };
+        Self {
+            mode: GraphqlPayloadMode::FullPayload,
+            encoding,
+        }
+    }
+
+    fn response_changed(
+        self,
+        current: Option<&cynos_gql::GraphqlResponse>,
+        next: &cynos_gql::GraphqlResponse,
+    ) -> bool {
+        match self.mode {
+            GraphqlPayloadMode::FullPayload => match self.encoding {
+                GraphqlResponseEncoding::BatchedRootList { .. } => {
+                    batch_response_changed_from_encoding(self.encoding)
+                        .unwrap_or_else(|| current.map_or(true, |current| current != next))
+                }
+                GraphqlResponseEncoding::Plain => current.map_or(true, |current| current != next),
+            },
+        }
     }
 }
 
@@ -652,7 +686,7 @@ impl GraphqlResponsePayloadCache {
         self.response.as_ref()
     }
 
-    fn cached_js_value(&mut self, encoding: GraphqlResponseEncoding<'_>) -> JsValue {
+    fn cached_js_value(&mut self, adapter: GraphqlOutputAdapter<'_>) -> JsValue {
         if let Some(payload) = &self.response_js {
             return payload.clone();
         }
@@ -664,7 +698,7 @@ impl GraphqlResponsePayloadCache {
             response,
             &mut self.encode_cache,
             &mut self.root_list_js_cache,
-            encoding,
+            adapter,
         );
         self.response_js = Some(payload.clone());
         payload
@@ -673,13 +707,13 @@ impl GraphqlResponsePayloadCache {
     fn encode_response(
         &mut self,
         response: &cynos_gql::GraphqlResponse,
-        encoding: GraphqlResponseEncoding<'_>,
+        adapter: GraphqlOutputAdapter<'_>,
     ) -> JsValue {
         encode_graphql_response_js(
             response,
             &mut self.encode_cache,
             &mut self.root_list_js_cache,
-            encoding,
+            adapter,
         )
     }
 
@@ -851,34 +885,44 @@ fn encode_graphql_response_js(
     response: &cynos_gql::GraphqlResponse,
     encode_cache: &mut GraphqlJsEncodeCache,
     root_list_cache: &mut GraphqlRootListJsCache,
-    encoding: GraphqlResponseEncoding<'_>,
+    adapter: GraphqlOutputAdapter<'_>,
 ) -> JsValue {
-    match encoding {
-        GraphqlResponseEncoding::Plain => {
-            gql_response_to_js_with_cache(response, encode_cache).unwrap_or(JsValue::NULL)
-        }
-        GraphqlResponseEncoding::BatchedRootList { patch } => {
-            gql_response_to_js_with_root_list_patch(response, encode_cache, root_list_cache, patch)
+    match adapter.mode {
+        GraphqlPayloadMode::FullPayload => match adapter.encoding {
+            GraphqlResponseEncoding::Plain => {
+                gql_response_to_js_with_cache(response, encode_cache).unwrap_or(JsValue::NULL)
+            }
+            GraphqlResponseEncoding::BatchedRootList { patch } => {
+                gql_response_to_js_with_root_list_patch(
+                    response,
+                    encode_cache,
+                    root_list_cache,
+                    patch,
+                )
                 .unwrap_or(JsValue::NULL)
-        }
+            }
+        },
     }
 }
 
-fn batch_response_changed(state: &cynos_gql::GraphqlBatchState) -> Option<bool> {
-    match state.last_root_patch() {
-        Some(cynos_gql::GraphqlRootListPatch::StablePositions(positions)) => {
-            Some(!positions.is_empty())
-        }
-        Some(cynos_gql::GraphqlRootListPatch::Splice {
-            removed_positions,
-            inserted_positions,
-            updated_positions,
-        }) => Some(
-            !removed_positions.is_empty()
-                || !inserted_positions.is_empty()
-                || !updated_positions.is_empty(),
-        ),
-        None => None,
+fn batch_response_changed_from_encoding(encoding: GraphqlResponseEncoding<'_>) -> Option<bool> {
+    match encoding {
+        GraphqlResponseEncoding::Plain => None,
+        GraphqlResponseEncoding::BatchedRootList { patch } => match patch {
+            Some(cynos_gql::GraphqlRootListPatch::StablePositions(positions)) => {
+                Some(!positions.is_empty())
+            }
+            Some(cynos_gql::GraphqlRootListPatch::Splice {
+                removed_positions,
+                inserted_positions,
+                updated_positions,
+            }) => Some(
+                !removed_positions.is_empty()
+                    || !inserted_positions.is_empty()
+                    || !updated_positions.is_empty(),
+            ),
+            None => None,
+        },
     }
 }
 
@@ -1509,8 +1553,9 @@ impl GraphqlSubscriptionObservable {
 
     pub fn response_js_value(&mut self) -> JsValue {
         if self.response_payload.has_clean_response() {
-            let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
-            return self.response_payload.cached_js_value(encoding);
+            let adapter =
+                GraphqlOutputAdapter::full_payload_for(self.batch_plan.as_ref(), &self.batch_state);
+            return self.response_payload.cached_js_value(adapter);
         }
 
         if self.subscribers.callback_count() == 0 {
@@ -1521,8 +1566,9 @@ impl GraphqlSubscriptionObservable {
             return JsValue::NULL;
         }
 
-        let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
-        self.response_payload.cached_js_value(encoding)
+        let adapter =
+            GraphqlOutputAdapter::full_payload_for(self.batch_plan.as_ref(), &self.batch_state);
+        self.response_payload.cached_js_value(adapter)
     }
 
     pub fn subscribe<F: Fn(&JsValue) + 'static>(&mut self, callback: F) -> usize {
@@ -1839,17 +1885,9 @@ impl GraphqlSubscriptionObservable {
                 build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows).ok()?
             }
         };
-        let changed = match self.batch_plan.as_ref() {
-            Some(_) => batch_response_changed(&self.batch_state).unwrap_or_else(|| {
-                self.response_payload
-                    .current_response()
-                    .map_or(true, |current| *current != response)
-            }),
-            None => self
-                .response_payload
-                .current_response()
-                .map_or(true, |current| *current != response),
-        };
+        let adapter =
+            GraphqlOutputAdapter::full_payload_for(self.batch_plan.as_ref(), &self.batch_state);
+        let changed = adapter.response_changed(self.response_payload.current_response(), &response);
         self.response_payload.finish_materialize(response, changed);
         Some(changed)
     }
@@ -1874,9 +1912,11 @@ impl GraphqlSubscriptionObservable {
         };
         match response {
             Ok(response) => {
-                let encoding =
-                    graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
-                self.response_payload.encode_response(&response, encoding)
+                let adapter = GraphqlOutputAdapter::full_payload_for(
+                    self.batch_plan.as_ref(),
+                    &self.batch_state,
+                );
+                self.response_payload.encode_response(&response, adapter)
             }
             Err(_) => JsValue::NULL,
         }
@@ -2025,8 +2065,9 @@ impl GraphqlDeltaObservable {
 
     pub fn response_js_value(&mut self) -> JsValue {
         if self.response_payload.has_clean_response() {
-            let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
-            return self.response_payload.cached_js_value(encoding);
+            let adapter =
+                GraphqlOutputAdapter::full_payload_for(self.batch_plan.as_ref(), &self.batch_state);
+            return self.response_payload.cached_js_value(adapter);
         }
 
         if self.subscribers.callback_count() == 0 {
@@ -2037,8 +2078,9 @@ impl GraphqlDeltaObservable {
             return JsValue::NULL;
         }
 
-        let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
-        self.response_payload.cached_js_value(encoding)
+        let adapter =
+            GraphqlOutputAdapter::full_payload_for(self.batch_plan.as_ref(), &self.batch_state);
+        self.response_payload.cached_js_value(adapter)
     }
 
     pub fn dependencies(&self) -> &[TableId] {
@@ -2197,17 +2239,9 @@ impl GraphqlDeltaObservable {
                 build_graphql_response(&cache, &self.catalog, &self.field, &rows).ok()?
             }
         };
-        let changed = match self.batch_plan.as_ref() {
-            Some(_) => batch_response_changed(&self.batch_state).unwrap_or_else(|| {
-                self.response_payload
-                    .current_response()
-                    .map_or(true, |current| *current != response)
-            }),
-            None => self
-                .response_payload
-                .current_response()
-                .map_or(true, |current| *current != response),
-        };
+        let adapter =
+            GraphqlOutputAdapter::full_payload_for(self.batch_plan.as_ref(), &self.batch_state);
+        let changed = adapter.response_changed(self.response_payload.current_response(), &response);
         self.response_payload.finish_materialize(response, changed);
         Some(changed)
     }
@@ -2238,9 +2272,11 @@ impl GraphqlDeltaObservable {
         };
         match response {
             Ok(response) => {
-                let encoding =
-                    graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
-                self.response_payload.encode_response(&response, encoding)
+                let adapter = GraphqlOutputAdapter::full_payload_for(
+                    self.batch_plan.as_ref(),
+                    &self.batch_state,
+                );
+                self.response_payload.encode_response(&response, adapter)
             }
             Err(_) => JsValue::NULL,
         }
