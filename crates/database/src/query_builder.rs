@@ -34,6 +34,7 @@ use core::cell::RefCell;
 use cynos_core::schema::Table;
 use cynos_core::{reserve_row_ids, DataType, Row, Value};
 use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, Delta};
+use cynos_jsonb::path::{raw_json_contains_value, raw_json_eq_value, SimpleJsonPath};
 use cynos_query::ast::{AggregateFunc, SortOrder};
 use cynos_query::plan_cache::{compute_plan_fingerprint, PlanCache};
 use cynos_query::planner::{LogicalPlan, PhysicalPlan};
@@ -2375,7 +2376,8 @@ impl SelectBuilder {
         trace_init_profile.compile_to_dataflow_ms = now_ms() - compile_to_dataflow_started_at;
 
         let compile_trace_program_started_at = now_ms();
-        let compiled_ivm_plan = CompiledIvmPlan::compile_with_trace_program(&compile_result.dataflow);
+        let compiled_ivm_plan =
+            CompiledIvmPlan::compile_with_trace_program(&compile_result.dataflow);
         let compile_ivm_finished_at = now_ms();
         trace_init_profile.compile_ivm_plan_ms =
             compile_ivm_finished_at - compile_trace_program_started_at;
@@ -3390,6 +3392,17 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 _ => return false,
             };
 
+            let cmp_val = match js_to_value(value, DataType::String) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            if let Some(compiled_path) = SimpleJsonPath::parse(path) {
+                return compiled_path
+                    .extract(&jsonb_val.0)
+                    .map(|actual| raw_json_eq_value(actual, &cmp_val))
+                    .unwrap_or(false);
+            }
+
             // Parse JSON text bytes → cynos_jsonb::JsonbValue, then query path
             let json_str = match core::str::from_utf8(&jsonb_val.0) {
                 Ok(s) => s,
@@ -3409,11 +3422,7 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
             }
 
             // Compare first result with expected value
-            if let Ok(cmp_val) = js_to_value(value, DataType::String) {
-                compare_jsonb_with_value(results[0], &cmp_val)
-            } else {
-                false
-            }
+            compare_jsonb_with_value(results[0], &cmp_val)
         }
         ExprInner::JsonbContains {
             column,
@@ -3430,6 +3439,17 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 Some(Value::Jsonb(j)) => j,
                 _ => return false,
             };
+
+            let cmp_val = match js_to_value(value, DataType::String) {
+                Ok(Value::String(value)) => Value::String(value),
+                Ok(_) | Err(_) => return false,
+            };
+            if let Some(compiled_path) = SimpleJsonPath::parse(path) {
+                return compiled_path
+                    .extract(&jsonb_val.0)
+                    .map(|actual| raw_json_contains_value(actual, &cmp_val))
+                    .unwrap_or(false);
+            }
 
             let json_str = match core::str::from_utf8(&jsonb_val.0) {
                 Ok(s) => s,
@@ -3448,14 +3468,10 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 return false;
             }
 
-            if let Ok(cmp_val) = js_to_value(value, DataType::String) {
-                if let Value::String(s) = &cmp_val {
-                    // Check if the extracted value's string representation contains the search string
-                    let extracted_str = jsonb_value_to_string(results[0]);
-                    extracted_str.contains(s.as_str())
-                } else {
-                    false
-                }
+            if let Value::String(s) = &cmp_val {
+                // Check if the extracted value's string representation contains the search string
+                let extracted_str = jsonb_value_to_string(results[0]);
+                extracted_str.contains(s.as_str())
             } else {
                 false
             }
@@ -3471,6 +3487,10 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 Some(Value::Jsonb(j)) => j,
                 _ => return false,
             };
+
+            if let Some(compiled_path) = SimpleJsonPath::parse(path) {
+                return compiled_path.extract(&jsonb_val.0).is_some();
+            }
 
             let json_str = match core::str::from_utf8(&jsonb_val.0) {
                 Ok(s) => s,
