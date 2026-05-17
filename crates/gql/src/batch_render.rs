@@ -1284,9 +1284,9 @@ fn indexed_probe_fetch(
                     index_name,
                     &edge.relation.child_column,
                     key,
-                    (query.filter.is_none() && query.order_by.is_empty()).then_some(query),
+                    query.order_by.is_empty().then_some(query),
                 );
-                let rows = if query.filter.is_none() && query.order_by.is_empty() {
+                let rows = if query.order_by.is_empty() {
                     rows
                 } else {
                     apply_collection_query(rows, query)
@@ -1490,13 +1490,47 @@ fn fetch_rows_by_known_index_or_scan_windowed(
     windowed_query: Option<&BoundCollectionQuery>,
 ) -> Vec<Rc<Row>> {
     if let Some(query) = windowed_query {
+        if query.limit == Some(0) {
+            return Vec::new();
+        }
+
         if store.schema().get_index(index_name).is_some() {
-            return store.index_scan_with_limit_offset(
-                index_name,
-                Some(&KeyRange::only(value.clone())),
-                query.limit,
-                query.offset,
-            );
+            let range = KeyRange::only(value.clone());
+            if query.filter.is_none() {
+                return store.index_scan_with_limit_offset(
+                    index_name,
+                    Some(&range),
+                    query.limit,
+                    query.offset,
+                );
+            }
+
+            let mut rows = Vec::new();
+            let mut skipped = 0usize;
+            let mut emitted = 0usize;
+            store.visit_index_scan_with_options(index_name, Some(&range), None, 0, false, |row| {
+                if !query
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| matches_filter(row.as_ref(), filter))
+                {
+                    return true;
+                }
+                if skipped < query.offset {
+                    skipped += 1;
+                    return true;
+                }
+                if let Some(limit) = query.limit {
+                    if emitted >= limit {
+                        return false;
+                    }
+                }
+
+                rows.push(row.clone());
+                emitted += 1;
+                query.limit.is_none_or(|limit| emitted < limit)
+            });
+            return rows;
         }
 
         let Some(column_index) = store.schema().get_column_index(column_name) else {
@@ -1513,6 +1547,13 @@ fn fetch_rows_by_known_index_or_scan_windowed(
             if !matches {
                 return true;
             }
+            if !query
+                .filter
+                .as_ref()
+                .is_none_or(|filter| matches_filter(row.as_ref(), filter))
+            {
+                return true;
+            }
             if skipped < query.offset {
                 skipped += 1;
                 return true;
@@ -1524,7 +1565,7 @@ fn fetch_rows_by_known_index_or_scan_windowed(
             }
             rows.push(row.clone());
             emitted += 1;
-            true
+            query.limit.is_none_or(|limit| emitted < limit)
         });
         return rows;
     }
@@ -1880,6 +1921,45 @@ mod tests {
         let actual = execute_with_batch(&cache, &catalog, query);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn indexed_reverse_probe_applies_filter_before_window_without_order() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query = "{ users(orderBy: [{ field: ID, direction: ASC }]) { id name posts(where: { id: { gte: 11 } }, limit: 1) { id title } } }";
+
+        let expected = execute_query(&cache, &catalog, query, None, None).unwrap();
+        let actual = execute_with_batch(&cache, &catalog, query);
+        assert_eq!(actual, expected);
+
+        let prepared = PreparedQuery::parse(query).unwrap();
+        let bound = prepared.bind(&catalog, None).unwrap();
+        let field = bound.fields.into_iter().next().unwrap();
+        let plan = crate::compile_batch_plan(&catalog, &field).unwrap();
+        let posts_edge = plan
+            .edges()
+            .iter()
+            .find(|edge| edge.direct_table == "posts")
+            .expect("posts edge");
+        assert_eq!(
+            posts_edge.strategy,
+            RelationFetchStrategy::IndexedProbeBatch
+        );
+
+        let keys = HashSet::from([Value::Int64(1), Value::Int64(2)]);
+        let buckets = indexed_probe_fetch(&cache, posts_edge, &keys).unwrap();
+        let user_1_ids: Vec<_> = buckets[&Value::Int64(1)]
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        let user_2_ids: Vec<_> = buckets[&Value::Int64(2)]
+            .iter()
+            .map(|row| row.id())
+            .collect();
+
+        assert_eq!(user_1_ids, alloc::vec![11]);
+        assert_eq!(user_2_ids, alloc::vec![12]);
     }
 
     #[test]
