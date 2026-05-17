@@ -1111,7 +1111,7 @@ export interface InitOutput {
     readonly schemalayout_rowStride: (a: number) => number;
     readonly __wasm_bindgen_func_elem_88: (a: number, b: number) => void;
     readonly __wasm_bindgen_func_elem_3644: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_9144: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_9130: (a: number, b: number, c: number, d: number) => void;
     readonly __wasm_bindgen_func_elem_3651: (a: number, b: number, c: number) => void;
     readonly __wasm_bindgen_func_elem_1531: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;

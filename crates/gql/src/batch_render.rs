@@ -47,6 +47,12 @@ pub struct GraphqlInvalidation {
     pub dirty_table_rows: HashMap<String, HashSet<u64>>,
 }
 
+impl GraphqlInvalidation {
+    fn table_changed(&self, table_name: &str) -> bool {
+        self.changed_tables.iter().any(|changed| changed == table_name)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct RowCacheKey {
     node_id: NodeId,
@@ -122,7 +128,6 @@ impl GraphqlBatchState {
         plan: &GraphqlBatchPlan,
         invalidation: &GraphqlInvalidation,
     ) {
-        let changed_tables: HashSet<String> = invalidation.changed_tables.iter().cloned().collect();
         let mut pending = Vec::new();
         let mut seen = HashSet::new();
 
@@ -154,7 +159,7 @@ impl GraphqlBatchState {
         let mut targeted_edges = HashSet::new();
         for edge in plan.edges() {
             let keys = invalidation.dirty_edge_keys.get(&edge.id);
-            let edge_changed = changed_tables.contains(&edge.direct_table);
+            let edge_changed = invalidation.table_changed(&edge.direct_table);
             if !edge_changed && keys.is_none() {
                 continue;
             }
@@ -191,9 +196,8 @@ impl GraphqlBatchState {
             if row_key.node_id == plan.root_node() {
                 self.dirty_root_rows.insert(row_key.row_id);
             }
-            let parents = self.parent_rows_for_row(plan, row_key);
+            self.collect_parent_rows_for_row(plan, row_key, &mut pending);
             self.remove_row_entry(row_key);
-            pending.extend(parents);
         }
     }
 
@@ -269,16 +273,16 @@ impl GraphqlBatchState {
         }
     }
 
-    fn parent_rows_for_row(
+    fn collect_parent_rows_for_row(
         &self,
         plan: &GraphqlBatchPlan,
         row_key: RowCacheKey,
-    ) -> Vec<RowCacheKey> {
+        pending: &mut Vec<RowCacheKey>,
+    ) {
         let Some(row) = self.row_sources.get(&row_key) else {
-            return Vec::new();
+            return;
         };
 
-        let mut parents = HashSet::new();
         for &edge_id in plan.incoming_edges(row_key.node_id) {
             let edge = plan.edge(edge_id);
             let Some(key) = row.get(edge_target_column_index(edge)).cloned() else {
@@ -289,12 +293,10 @@ impl GraphqlBatchState {
             }
             if let Some(edge_membership) = self.edge_parent_membership.get(&edge_id) {
                 if let Some(parent_rows) = edge_membership.get(&key) {
-                    parents.extend(parent_rows.iter().copied());
+                    pending.extend(parent_rows.iter().copied());
                 }
             }
         }
-
-        parents.into_iter().collect()
     }
 
     fn remove_row_entry(&mut self, row_key: RowCacheKey) {
