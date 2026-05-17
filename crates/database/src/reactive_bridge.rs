@@ -13,8 +13,8 @@
 
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
 use crate::convert::{
-    gql_response_to_js_with_cache, gql_response_to_js_with_root_list_patch, value_to_js,
-    prune_jsonb_js_cache, GraphqlJsEncodeCache, GraphqlRootListJsCache, JsonbJsCachePolicy,
+    gql_response_to_js_with_cache, gql_response_to_js_with_root_list_patch, prune_jsonb_js_cache,
+    value_to_js, GraphqlJsEncodeCache, GraphqlRootListJsCache, JsonbJsCachePolicy,
 };
 use crate::live_runtime::{
     RowsSnapshotDependencyGraph, RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey,
@@ -28,8 +28,8 @@ use crate::profiling::{
 use crate::profiling::{GraphqlDeltaProfile, GraphqlSnapshotQueryProfile};
 use crate::query_engine::{
     execute_compiled_physical_plan_on_table_subset, execute_compiled_physical_plan_with_summary,
-    CompiledPhysicalPlan, QueryResultSummary, RootSubsetPlanVariant, RootSubsetRefreshDecision,
-    SnapshotRefreshCostModel,
+    CompiledPhysicalPlan, QueryResultSummary, RootSubsetPlanVariant, RootSubsetRefreshCostInput,
+    RootSubsetRefreshDecision, SnapshotRefreshCostModel,
 };
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -245,8 +245,8 @@ impl RootSubsetRefreshRuntime {
             .get_table(&self.metadata.root_table)
             .map(|store| store.len())
             .unwrap_or(0);
-        SnapshotRefreshCostModel::DEFAULT
-            .decide_root_subset_refresh(affected_root_ids.len(), table_row_count)
+        let input = RootSubsetRefreshCostInput::new(affected_root_ids.len(), table_row_count);
+        SnapshotRefreshCostModel::DEFAULT.decide_root_subset_refresh_for(input)
     }
 
     fn select_variant(
@@ -858,13 +858,8 @@ fn encode_graphql_response_js(
             gql_response_to_js_with_cache(response, encode_cache).unwrap_or(JsValue::NULL)
         }
         GraphqlResponseEncoding::BatchedRootList { patch } => {
-            gql_response_to_js_with_root_list_patch(
-                response,
-                encode_cache,
-                root_list_cache,
-                patch,
-            )
-            .unwrap_or(JsValue::NULL)
+            gql_response_to_js_with_root_list_patch(response, encode_cache, root_list_cache, patch)
+                .unwrap_or(JsValue::NULL)
         }
     }
 }
@@ -1879,7 +1874,8 @@ impl GraphqlSubscriptionObservable {
         };
         match response {
             Ok(response) => {
-                let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
+                let encoding =
+                    graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
                 self.response_payload.encode_response(&response, encoding)
             }
             Err(_) => JsValue::NULL,
@@ -2242,7 +2238,8 @@ impl GraphqlDeltaObservable {
         };
         match response {
             Ok(response) => {
-                let encoding = graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
+                let encoding =
+                    graphql_response_encoding(self.batch_plan.as_ref(), &self.batch_state);
                 self.response_payload.encode_response(&response, encoding)
             }
             Err(_) => JsValue::NULL,

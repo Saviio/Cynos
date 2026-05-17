@@ -24,6 +24,65 @@ pub(crate) enum RootSubsetDecisionReason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccessPathLocality {
+    Sequential,
+    Clustered,
+    Scattered,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SnapshotRefreshCostHints {
+    pub estimated_row_width_bytes: Option<usize>,
+    pub estimated_join_fanout: Option<f64>,
+    pub estimated_index_selectivity: Option<f64>,
+    pub access_path_locality: Option<AccessPathLocality>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RootSubsetRefreshCostInput {
+    pub affected_row_count: usize,
+    pub table_row_count: usize,
+    pub hints: SnapshotRefreshCostHints,
+}
+
+impl RootSubsetRefreshCostInput {
+    pub(crate) fn new(affected_row_count: usize, table_row_count: usize) -> Self {
+        Self {
+            affected_row_count,
+            table_row_count,
+            hints: SnapshotRefreshCostHints::default(),
+        }
+    }
+
+    pub(crate) fn with_hints(mut self, hints: SnapshotRefreshCostHints) -> Self {
+        self.hints = hints;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RootSubsetPlanningCostInput {
+    pub variant: RootSubsetPlanVariant,
+    pub table_row_count: usize,
+    pub hints: SnapshotRefreshCostHints,
+}
+
+impl RootSubsetPlanningCostInput {
+    pub(crate) fn new(variant: RootSubsetPlanVariant, table_row_count: usize) -> Self {
+        Self {
+            variant,
+            table_row_count,
+            hints: SnapshotRefreshCostHints::default(),
+        }
+    }
+
+    pub(crate) fn with_hints(mut self, hints: SnapshotRefreshCostHints) -> Self {
+        self.hints = hints;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RootSubsetRefreshDecision {
     pub variant: RootSubsetPlanVariant,
     pub reason: RootSubsetDecisionReason,
@@ -68,13 +127,25 @@ impl RootSubsetCostPolicy {
         affected_row_count: usize,
         table_row_count: usize,
     ) -> RootSubsetRefreshDecision {
-        let (variant, reason) = if affected_row_count <= self.max_subset_driven_rows {
+        self.decide_refresh_for(RootSubsetRefreshCostInput::new(
+            affected_row_count,
+            table_row_count,
+        ))
+    }
+
+    pub(crate) fn decide_refresh_for(
+        self,
+        input: RootSubsetRefreshCostInput,
+    ) -> RootSubsetRefreshDecision {
+        let (variant, reason) = if input.affected_row_count <= self.max_subset_driven_rows {
             (
                 RootSubsetPlanVariant::Small,
                 RootSubsetDecisionReason::WithinAbsoluteSubsetCeiling,
             )
-        } else if affected_row_count.saturating_mul(self.subset_to_table_ratio_denominator)
-            <= table_row_count
+        } else if input
+            .affected_row_count
+            .saturating_mul(self.subset_to_table_ratio_denominator)
+            <= input.table_row_count
         {
             (
                 RootSubsetPlanVariant::Small,
@@ -90,8 +161,8 @@ impl RootSubsetCostPolicy {
         RootSubsetRefreshDecision {
             variant,
             reason,
-            affected_row_count,
-            table_row_count,
+            affected_row_count: input.affected_row_count,
+            table_row_count: input.table_row_count,
             preferred_access_mode: variant.preferred_access_mode(),
         }
     }
@@ -101,22 +172,30 @@ impl RootSubsetCostPolicy {
         variant: RootSubsetPlanVariant,
         table_row_count: usize,
     ) -> Option<RootSubsetPlanningDecision> {
-        let effective_subset_rows = self.effective_subset_rows(variant, table_row_count)?;
-        let subset_fraction = if table_row_count > 0 {
-            Some(effective_subset_rows as f64 / table_row_count as f64)
+        self.planning_decision_for(RootSubsetPlanningCostInput::new(variant, table_row_count))
+    }
+
+    pub(crate) fn planning_decision_for(
+        self,
+        input: RootSubsetPlanningCostInput,
+    ) -> Option<RootSubsetPlanningDecision> {
+        let effective_subset_rows =
+            self.effective_subset_rows(input.variant, input.table_row_count)?;
+        let subset_fraction = if input.table_row_count > 0 {
+            Some(effective_subset_rows as f64 / input.table_row_count as f64)
         } else {
             None
         };
 
         Some(RootSubsetPlanningDecision {
-            variant,
-            reason: match variant {
+            variant: input.variant,
+            reason: match input.variant {
                 RootSubsetPlanVariant::Small => RootSubsetDecisionReason::CompiledSmallProfile,
                 RootSubsetPlanVariant::Large => RootSubsetDecisionReason::CompiledLargeProfile,
             },
             effective_subset_rows,
             subset_fraction,
-            preferred_access_mode: variant.preferred_access_mode(),
+            preferred_access_mode: input.variant.preferred_access_mode(),
         })
     }
 
@@ -219,12 +298,26 @@ impl SnapshotRefreshCostModel {
             .decide_refresh(affected_row_count, table_row_count)
     }
 
+    pub(crate) fn decide_root_subset_refresh_for(
+        self,
+        input: RootSubsetRefreshCostInput,
+    ) -> RootSubsetRefreshDecision {
+        self.root_subset.decide_refresh_for(input)
+    }
+
     pub(crate) fn root_subset_planning_decision(
         self,
         variant: RootSubsetPlanVariant,
         table_row_count: usize,
     ) -> Option<RootSubsetPlanningDecision> {
         self.root_subset.planning_decision(variant, table_row_count)
+    }
+
+    pub(crate) fn root_subset_planning_decision_for(
+        self,
+        input: RootSubsetPlanningCostInput,
+    ) -> Option<RootSubsetPlanningDecision> {
+        self.root_subset.planning_decision_for(input)
     }
 
     pub(crate) fn decide_partial_refresh_window(

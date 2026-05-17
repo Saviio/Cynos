@@ -23,7 +23,8 @@ use cynos_storage::TableCache;
 use hashbrown::HashSet;
 
 pub(crate) use crate::snapshot_refresh_policy::{
-    RootSubsetPlanVariant, RootSubsetRefreshDecision, SnapshotRefreshCostModel,
+    RootSubsetPlanVariant, RootSubsetPlanningCostInput, RootSubsetRefreshCostInput,
+    RootSubsetRefreshDecision, SnapshotRefreshCostModel,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -201,8 +202,9 @@ impl<'a> TableSubsetDataSource<'a> {
             .ok_or_else(|| ExecutionError::TableNotFound(subset_table.into()))?;
         let mut sorted_allowed_row_ids: Vec<u64> = allowed_row_ids.iter().copied().collect();
         sorted_allowed_row_ids.sort_unstable();
-        let subset_decision = SnapshotRefreshCostModel::DEFAULT
-            .decide_root_subset_refresh(allowed_row_ids.len(), store.len());
+        let subset_cost = RootSubsetRefreshCostInput::new(allowed_row_ids.len(), store.len());
+        let subset_decision =
+            SnapshotRefreshCostModel::DEFAULT.decide_root_subset_refresh_for(subset_cost);
 
         Ok(Self {
             cache,
@@ -1170,8 +1172,9 @@ fn register_restricted_relation_intent(
         .get_table(restricted_table)
         .map(|store| store.len())
         .unwrap_or(0);
-    let Some(decision) = SnapshotRefreshCostModel::DEFAULT
-        .root_subset_planning_decision(profile.variant, table_rows)
+    let planning_input = RootSubsetPlanningCostInput::new(profile.variant, table_rows);
+    let Some(decision) =
+        SnapshotRefreshCostModel::DEFAULT.root_subset_planning_decision_for(planning_input)
     else {
         return;
     };
@@ -1700,7 +1703,9 @@ pub fn execute_compiled_physical_plan_with_summary_on_table_subset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot_refresh_policy::RootSubsetDecisionReason;
+    use crate::snapshot_refresh_policy::{
+        AccessPathLocality, RootSubsetDecisionReason, SnapshotRefreshCostHints,
+    };
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Row, Value};
     use cynos_query::ast::Expr as AstExpr;
@@ -2021,6 +2026,53 @@ mod tests {
         assert_eq!(
             cost_model.decide_partial_refresh_window(20_000).overscan,
             1_024
+        );
+    }
+
+    #[test]
+    fn test_snapshot_refresh_cost_inputs_preserve_current_behavior() {
+        let cost_model = SnapshotRefreshCostModel::DEFAULT;
+        let _locality_variants = [
+            AccessPathLocality::Sequential,
+            AccessPathLocality::Clustered,
+            AccessPathLocality::Scattered,
+        ];
+        let future_hints = SnapshotRefreshCostHints {
+            estimated_row_width_bytes: Some(512),
+            estimated_join_fanout: Some(3.5),
+            estimated_index_selectivity: Some(0.08),
+            access_path_locality: Some(AccessPathLocality::Clustered),
+        };
+
+        let refresh_input = RootSubsetRefreshCostInput::new(8_193, 10_000).with_hints(future_hints);
+        let refresh_decision = cost_model.decide_root_subset_refresh_for(refresh_input);
+        assert_eq!(
+            refresh_decision,
+            cost_model.decide_root_subset_refresh(
+                refresh_input.affected_row_count,
+                refresh_input.table_row_count
+            )
+        );
+        assert_eq!(refresh_decision.variant, RootSubsetPlanVariant::Large);
+        assert_eq!(
+            refresh_decision.reason,
+            RootSubsetDecisionReason::PreferIndexDrivenIntersect
+        );
+
+        let planning_input = RootSubsetPlanningCostInput::new(RootSubsetPlanVariant::Small, 4_096)
+            .with_hints(future_hints);
+        let planning_decision = cost_model
+            .root_subset_planning_decision_for(planning_input)
+            .expect("small root-subset planning decision");
+        assert_eq!(planning_decision.effective_subset_rows, 1_024);
+        assert_eq!(
+            planning_decision,
+            cost_model
+                .root_subset_planning_decision(
+                    planning_input.variant,
+                    planning_input.table_row_count
+                )
+                .expect("legacy planning decision")
         );
     }
 
