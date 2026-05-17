@@ -64,6 +64,26 @@ impl RowCacheKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphqlBatchCachePolicy {
+    row_max_entries: usize,
+    row_target_entries: usize,
+}
+
+impl GraphqlBatchCachePolicy {
+    const DEFAULT: Self = Self {
+        row_max_entries: 131_072,
+        row_target_entries: 98_304,
+    };
+
+    fn row_limits(self) -> (usize, usize) {
+        (
+            self.row_max_entries,
+            self.row_target_entries.min(self.row_max_entries),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GraphqlBatchState {
     row_cache: HashMap<RowCacheKey, ResponseValue>,
@@ -278,6 +298,10 @@ impl GraphqlBatchState {
     }
 
     fn remove_row_entry(&mut self, row_key: RowCacheKey) {
+        self.remove_row_entry_inner(row_key, true);
+    }
+
+    fn remove_row_entry_inner(&mut self, row_key: RowCacheKey, mark_root_dirty: bool) {
         self.row_cache.remove(&row_key);
 
         if let Some(dependencies) = self.row_dependencies.remove(&row_key) {
@@ -312,13 +336,95 @@ impl GraphqlBatchState {
             }
         }
 
-        if self
-            .root_list_cache
-            .as_ref()
-            .is_some_and(|cache| cache.row_positions.contains_key(&row_key.row_id))
+        if mark_root_dirty
+            && self
+                .root_list_cache
+                .as_ref()
+                .is_some_and(|cache| cache.row_positions.contains_key(&row_key.row_id))
         {
             self.dirty_root_rows.insert(row_key.row_id);
         }
+    }
+
+    fn prune_if_needed(&mut self, plan: &GraphqlBatchPlan) {
+        let (max_entries, target_entries) = GraphqlBatchCachePolicy::DEFAULT.row_limits();
+        self.prune_rows_with_limits(plan, max_entries, target_entries);
+    }
+
+    fn prune_rows_with_limits(
+        &mut self,
+        plan: &GraphqlBatchPlan,
+        max_entries: usize,
+        target_entries: usize,
+    ) {
+        if self.row_cache.len() <= max_entries {
+            return;
+        }
+        let Some(_) = self.root_list_cache.as_ref() else {
+            return;
+        };
+
+        let target_entries = target_entries.min(max_entries);
+        let live_rows = self.collect_live_rows_from_root_list(plan);
+        let mut projected_len = self.row_cache.len();
+        let row_keys = self.row_cache.keys().copied().collect::<Vec<_>>();
+        for row_key in row_keys {
+            if projected_len <= target_entries {
+                break;
+            }
+            if live_rows.contains(&row_key) {
+                continue;
+            }
+            self.remove_row_entry_inner(row_key, false);
+            projected_len = projected_len.saturating_sub(1);
+        }
+        self.prune_unreferenced_edge_buckets();
+    }
+
+    fn collect_live_rows_from_root_list(&self, plan: &GraphqlBatchPlan) -> HashSet<RowCacheKey> {
+        let mut live_rows = HashSet::new();
+        let mut pending = self
+            .root_list_cache
+            .as_ref()
+            .map(|cache| cache.row_keys.clone())
+            .unwrap_or_default();
+
+        while let Some(row_key) = pending.pop() {
+            if !live_rows.insert(row_key) {
+                continue;
+            }
+            let Some(dependencies) = self.row_dependencies.get(&row_key) else {
+                continue;
+            };
+            for (edge_id, key) in dependencies {
+                let edge = plan.edge(*edge_id);
+                let Some(child_rows) = self
+                    .edge_bucket_cache
+                    .get(edge_id)
+                    .and_then(|buckets| buckets.get(key))
+                else {
+                    continue;
+                };
+                for row in child_rows {
+                    pending.push(RowCacheKey::new(edge.child_node, row));
+                }
+            }
+        }
+
+        live_rows
+    }
+
+    fn prune_unreferenced_edge_buckets(&mut self) {
+        let edge_parent_membership = &self.edge_parent_membership;
+        self.edge_bucket_cache.retain(|edge_id, buckets| {
+            buckets.retain(|key, _| {
+                edge_parent_membership
+                    .get(edge_id)
+                    .and_then(|membership| membership.get(key))
+                    .is_some_and(|parents| !parents.is_empty())
+            });
+            !buckets.is_empty()
+        });
     }
 
     fn clear_root_list_cache(&mut self) {
@@ -453,6 +559,7 @@ fn render_root_node_list<R: RowRenderRef>(
     if let Some(list_value) =
         try_render_root_node_list_cached(cache, catalog, plan, state, node_id, rows)?
     {
+        state.prune_if_needed(plan);
         return Ok(list_value);
     }
 
@@ -461,7 +568,9 @@ fn render_root_node_list<R: RowRenderRef>(
         .iter()
         .map(|row| RowCacheKey::new(node_id, row.row_rc()))
         .collect();
-    Ok(state.update_root_list_cache(row_keys, items))
+    let list_value = state.update_root_list_cache(row_keys, items);
+    state.prune_if_needed(plan);
+    Ok(list_value)
 }
 
 fn try_render_root_node_list_cached<R: RowRenderRef>(
@@ -2069,6 +2178,42 @@ mod tests {
             .any(|key| key.node_id == user_node_id && key.row_id == 2);
         assert!(cached_user_1);
         assert!(!cached_user_2);
+    }
+
+    #[test]
+    fn batch_state_prunes_unreachable_rows_without_dropping_live_graph() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query =
+            "{ posts(orderBy: [{ field: ID, direction: ASC }]) { id title author { id name } } }";
+
+        let (_field, plan, rows, mut state) = prepare_batch_execution(&cache, &catalog, query);
+        let root_node = plan.root_node();
+        let live_root_key = RowCacheKey::new(root_node, &rows[0]);
+        let live_rows_before = state.collect_live_rows_from_root_list(&plan);
+
+        let dead_key = RowCacheKey {
+            node_id: root_node,
+            row_id: 999,
+            row_version: 1,
+        };
+        state.row_cache.insert(dead_key, ResponseValue::Null);
+        state
+            .edge_bucket_cache
+            .insert(999, HashMap::from([(Value::Int64(999), Vec::new())]));
+
+        let target_entries = state.row_cache.len().saturating_sub(1);
+        state.prune_rows_with_limits(&plan, target_entries, target_entries);
+
+        assert!(!state.row_cache.contains_key(&dead_key));
+        assert!(state.row_cache.contains_key(&live_root_key));
+        for row_key in live_rows_before {
+            assert!(
+                state.row_cache.contains_key(&row_key),
+                "live cached row {row_key:?} should survive pruning"
+            );
+        }
+        assert!(!state.edge_bucket_cache.contains_key(&999));
     }
 
     #[test]
