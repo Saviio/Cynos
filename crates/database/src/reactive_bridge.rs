@@ -616,11 +616,82 @@ enum GraphqlPayloadMode {
     FullPayload,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphqlPayloadChange<'a> {
+    Unknown,
+    RootList(GraphqlRootListDelta<'a>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphqlRootListDelta<'a> {
+    StablePositions(&'a [usize]),
+    Splice {
+        removed_positions: &'a [usize],
+        inserted_positions: &'a [usize],
+        updated_positions: &'a [usize],
+    },
+}
+
+impl<'a> GraphqlPayloadChange<'a> {
+    fn from_root_list_patch(patch: Option<&'a cynos_gql::GraphqlRootListPatch>) -> Self {
+        match patch {
+            Some(cynos_gql::GraphqlRootListPatch::StablePositions(positions)) => {
+                Self::RootList(GraphqlRootListDelta::StablePositions(positions.as_slice()))
+            }
+            Some(cynos_gql::GraphqlRootListPatch::Splice {
+                removed_positions,
+                inserted_positions,
+                updated_positions,
+            }) => Self::RootList(GraphqlRootListDelta::Splice {
+                removed_positions: removed_positions.as_slice(),
+                inserted_positions: inserted_positions.as_slice(),
+                updated_positions: updated_positions.as_slice(),
+            }),
+            None => Self::Unknown,
+        }
+    }
+
+    fn as_root_list_patch(
+        self,
+        patch: Option<&'a cynos_gql::GraphqlRootListPatch>,
+    ) -> Option<&'a cynos_gql::GraphqlRootListPatch> {
+        match self {
+            Self::RootList(_) => patch,
+            Self::Unknown => None,
+        }
+    }
+
+    fn changed_hint(self) -> Option<bool> {
+        match self {
+            Self::Unknown => None,
+            Self::RootList(delta) => Some(delta.is_non_empty()),
+        }
+    }
+}
+
+impl<'a> GraphqlRootListDelta<'a> {
+    fn is_non_empty(self) -> bool {
+        match self {
+            Self::StablePositions(positions) => !positions.is_empty(),
+            Self::Splice {
+                removed_positions,
+                inserted_positions,
+                updated_positions,
+            } => {
+                !removed_positions.is_empty()
+                    || !inserted_positions.is_empty()
+                    || !updated_positions.is_empty()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum GraphqlResponseEncoding<'a> {
     Plain,
     BatchedRootList {
         patch: Option<&'a cynos_gql::GraphqlRootListPatch>,
+        change: GraphqlPayloadChange<'a>,
     },
 }
 
@@ -638,6 +709,7 @@ impl<'a> GraphqlOutputAdapter<'a> {
         let encoding = match batch_plan {
             Some(_) => GraphqlResponseEncoding::BatchedRootList {
                 patch: batch_state.last_root_patch(),
+                change: GraphqlPayloadChange::from_root_list_patch(batch_state.last_root_patch()),
             },
             None => GraphqlResponseEncoding::Plain,
         };
@@ -654,10 +726,9 @@ impl<'a> GraphqlOutputAdapter<'a> {
     ) -> bool {
         match self.mode {
             GraphqlPayloadMode::FullPayload => match self.encoding {
-                GraphqlResponseEncoding::BatchedRootList { .. } => {
-                    batch_response_changed_from_encoding(self.encoding)
-                        .unwrap_or_else(|| current.map_or(true, |current| current != next))
-                }
+                GraphqlResponseEncoding::BatchedRootList { change, .. } => change
+                    .changed_hint()
+                    .unwrap_or_else(|| current.map_or(true, |current| current != next)),
                 GraphqlResponseEncoding::Plain => current.map_or(true, |current| current != next),
             },
         }
@@ -892,36 +963,15 @@ fn encode_graphql_response_js(
             GraphqlResponseEncoding::Plain => {
                 gql_response_to_js_with_cache(response, encode_cache).unwrap_or(JsValue::NULL)
             }
-            GraphqlResponseEncoding::BatchedRootList { patch } => {
+            GraphqlResponseEncoding::BatchedRootList { patch, change } => {
                 gql_response_to_js_with_root_list_patch(
                     response,
                     encode_cache,
                     root_list_cache,
-                    patch,
+                    change.as_root_list_patch(patch),
                 )
                 .unwrap_or(JsValue::NULL)
             }
-        },
-    }
-}
-
-fn batch_response_changed_from_encoding(encoding: GraphqlResponseEncoding<'_>) -> Option<bool> {
-    match encoding {
-        GraphqlResponseEncoding::Plain => None,
-        GraphqlResponseEncoding::BatchedRootList { patch } => match patch {
-            Some(cynos_gql::GraphqlRootListPatch::StablePositions(positions)) => {
-                Some(!positions.is_empty())
-            }
-            Some(cynos_gql::GraphqlRootListPatch::Splice {
-                removed_positions,
-                inserted_positions,
-                updated_positions,
-            }) => Some(
-                !removed_positions.is_empty()
-                    || !inserted_positions.is_empty()
-                    || !updated_positions.is_empty(),
-            ),
-            None => None,
         },
     }
 }
@@ -3757,6 +3807,47 @@ mod tests {
 
         assert!(cache.rows.len() <= 2);
         assert!(cache.rows.contains_key(&0));
+    }
+
+    #[test]
+    fn test_graphql_payload_change_describes_root_list_deltas() {
+        let unknown = GraphqlPayloadChange::from_root_list_patch(None);
+        assert_eq!(unknown.changed_hint(), None);
+        assert!(unknown.as_root_list_patch(None).is_none());
+
+        let stable_empty = cynos_gql::GraphqlRootListPatch::StablePositions(Vec::new());
+        let stable_change = GraphqlPayloadChange::from_root_list_patch(Some(&stable_empty));
+        assert_eq!(stable_change.changed_hint(), Some(false));
+        assert_eq!(
+            stable_change.as_root_list_patch(Some(&stable_empty)),
+            Some(&stable_empty)
+        );
+
+        let stable_updated = cynos_gql::GraphqlRootListPatch::StablePositions(alloc::vec![2]);
+        assert_eq!(
+            GraphqlPayloadChange::from_root_list_patch(Some(&stable_updated)).changed_hint(),
+            Some(true)
+        );
+
+        let splice_empty = cynos_gql::GraphqlRootListPatch::Splice {
+            removed_positions: Vec::new(),
+            inserted_positions: Vec::new(),
+            updated_positions: Vec::new(),
+        };
+        assert_eq!(
+            GraphqlPayloadChange::from_root_list_patch(Some(&splice_empty)).changed_hint(),
+            Some(false)
+        );
+
+        let splice_changed = cynos_gql::GraphqlRootListPatch::Splice {
+            removed_positions: alloc::vec![1],
+            inserted_positions: Vec::new(),
+            updated_positions: Vec::new(),
+        };
+        assert_eq!(
+            GraphqlPayloadChange::from_root_list_patch(Some(&splice_changed)).changed_hint(),
+            Some(true)
+        );
     }
 
     #[test]
