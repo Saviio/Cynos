@@ -36,7 +36,11 @@ struct RelationLoweringState<'a> {
 }
 
 impl<'a> RelationLoweringState<'a> {
-    fn new(root_table_name: &'a str, root_table: &'a TableMeta, _catalog: &'a GraphqlCatalog) -> Self {
+    fn new(
+        root_table_name: &'a str,
+        root_table: &'a TableMeta,
+        _catalog: &'a GraphqlCatalog,
+    ) -> Self {
         let root_path = Vec::new();
         let mut paths_by_table = BTreeMap::new();
         paths_by_table.insert(root_table.table_name.clone(), root_path.clone());
@@ -70,7 +74,8 @@ impl<'a> RelationLoweringState<'a> {
             return Ok(existing.clone());
         }
 
-        if target_table.table_name == current_table.table_name || target_table.table_name == self.root_table_name
+        if target_table.table_name == current_table.table_name
+            || target_table.table_name == self.root_table_name
         {
             return Err(GqlError::new(
                 GqlErrorKind::Unsupported,
@@ -110,7 +115,8 @@ impl<'a> RelationLoweringState<'a> {
             },
             condition,
         );
-        self.joins_by_path.insert(path.clone(), target_table.table_name.clone());
+        self.joins_by_path
+            .insert(path.clone(), target_table.table_name.clone());
         self.paths_by_table
             .insert(target_table.table_name.clone(), path);
         Ok(target_table.table_name.clone())
@@ -356,8 +362,13 @@ fn build_filter_expr(
             })?;
             let mut path = current_path.to_vec();
             path.push(predicate.relation.name.clone());
-            let joined_table_name =
-                lowering.ensure_join(table_name, table, &predicate.relation, target_table, path.clone())?;
+            let joined_table_name = lowering.ensure_join(
+                table_name,
+                table,
+                &predicate.relation,
+                target_table,
+                path.clone(),
+            )?;
             let nested = build_filter_expr(
                 catalog,
                 &joined_table_name,
@@ -414,56 +425,62 @@ fn build_relation_join_condition(
     target_table_name: &str,
     target_table: &TableMeta,
 ) -> GqlResult<AstExpr> {
-    if current_table.table_name == relation.child_table && target_table.table_name == relation.parent_table
+    if current_table.table_name == relation.child_table
+        && target_table.table_name == relation.parent_table
     {
-        let left = current_table.column_by_index(relation.child_column_index).ok_or_else(|| {
-            GqlError::new(
-                GqlErrorKind::Binding,
-                format!(
-                    "column index {} was not found on `{}`",
-                    relation.child_column_index,
-                    current_table.table_name
-                ),
-            )
-        })?;
-        let right = target_table.column_by_index(relation.parent_column_index).ok_or_else(|| {
-            GqlError::new(
-                GqlErrorKind::Binding,
-                format!(
-                    "column index {} was not found on `{}`",
-                    relation.parent_column_index,
-                    target_table.table_name
-                ),
-            )
-        })?;
+        let left = current_table
+            .column_by_index(relation.child_column_index)
+            .ok_or_else(|| {
+                GqlError::new(
+                    GqlErrorKind::Binding,
+                    format!(
+                        "column index {} was not found on `{}`",
+                        relation.child_column_index, current_table.table_name
+                    ),
+                )
+            })?;
+        let right = target_table
+            .column_by_index(relation.parent_column_index)
+            .ok_or_else(|| {
+                GqlError::new(
+                    GqlErrorKind::Binding,
+                    format!(
+                        "column index {} was not found on `{}`",
+                        relation.parent_column_index, target_table.table_name
+                    ),
+                )
+            })?;
         return Ok(AstExpr::eq(
             AstExpr::column(current_table_name, &left.name, left.index),
             AstExpr::column(target_table_name, &right.name, right.index),
         ));
     }
 
-    if current_table.table_name == relation.parent_table && target_table.table_name == relation.child_table
+    if current_table.table_name == relation.parent_table
+        && target_table.table_name == relation.child_table
     {
-        let left = current_table.column_by_index(relation.parent_column_index).ok_or_else(|| {
-            GqlError::new(
-                GqlErrorKind::Binding,
-                format!(
-                    "column index {} was not found on `{}`",
-                    relation.parent_column_index,
-                    current_table.table_name
-                ),
-            )
-        })?;
-        let right = target_table.column_by_index(relation.child_column_index).ok_or_else(|| {
-            GqlError::new(
-                GqlErrorKind::Binding,
-                format!(
-                    "column index {} was not found on `{}`",
-                    relation.child_column_index,
-                    target_table.table_name
-                ),
-            )
-        })?;
+        let left = current_table
+            .column_by_index(relation.parent_column_index)
+            .ok_or_else(|| {
+                GqlError::new(
+                    GqlErrorKind::Binding,
+                    format!(
+                        "column index {} was not found on `{}`",
+                        relation.parent_column_index, current_table.table_name
+                    ),
+                )
+            })?;
+        let right = target_table
+            .column_by_index(relation.child_column_index)
+            .ok_or_else(|| {
+                GqlError::new(
+                    GqlErrorKind::Binding,
+                    format!(
+                        "column index {} was not found on `{}`",
+                        relation.child_column_index, target_table.table_name
+                    ),
+                )
+            })?;
         return Ok(AstExpr::eq(
             AstExpr::column(current_table_name, &left.name, left.index),
             AstExpr::column(target_table_name, &right.name, right.index),

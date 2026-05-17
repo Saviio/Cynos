@@ -1109,11 +1109,11 @@ export interface InitOutput {
     readonly schemalayout_columnType: (a: number, b: number) => number;
     readonly schemalayout_nullMaskSize: (a: number) => number;
     readonly schemalayout_rowStride: (a: number) => number;
-    readonly __wasm_bindgen_func_elem_89: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_3651: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_9140: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_3658: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_1535: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_90: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_3679: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_9205: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_3686: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1543: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

@@ -32,10 +32,20 @@ impl<'a> OuterJoinRemoval<'a> {
     fn rewrite(&self, plan: LogicalPlan, required_tables: &HashSet<String>) -> LogicalPlan {
         match plan {
             LogicalPlan::Filter { input, predicate } => {
-                let mut child_required = required_tables.clone();
-                self.collect_expr_tables(&predicate, &mut child_required);
+                let mut predicate_tables = HashSet::new();
+                self.collect_expr_tables(&predicate, &mut predicate_tables);
+                let rewritten_input = if predicate_tables
+                    .iter()
+                    .all(|table| required_tables.contains(table))
+                {
+                    self.rewrite(*input, required_tables)
+                } else {
+                    let mut child_required = required_tables.clone();
+                    child_required.extend(predicate_tables);
+                    self.rewrite(*input, &child_required)
+                };
                 LogicalPlan::Filter {
-                    input: Box::new(self.rewrite(*input, &child_required)),
+                    input: Box::new(rewritten_input),
                     predicate,
                 }
             }
@@ -65,12 +75,22 @@ impl<'a> OuterJoinRemoval<'a> {
             }
 
             LogicalPlan::Sort { input, order_by } => {
-                let mut child_required = required_tables.clone();
+                let mut sort_tables = HashSet::new();
                 for (expr, _) in &order_by {
-                    self.collect_expr_tables(expr, &mut child_required);
+                    self.collect_expr_tables(expr, &mut sort_tables);
                 }
+                let rewritten_input = if sort_tables
+                    .iter()
+                    .all(|table| required_tables.contains(table))
+                {
+                    self.rewrite(*input, required_tables)
+                } else {
+                    let mut child_required = required_tables.clone();
+                    child_required.extend(sort_tables);
+                    self.rewrite(*input, &child_required)
+                };
                 LogicalPlan::Sort {
-                    input: Box::new(self.rewrite(*input, &child_required)),
+                    input: Box::new(rewritten_input),
                     order_by,
                 }
             }

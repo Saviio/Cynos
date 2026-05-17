@@ -18,6 +18,9 @@ use core::mem;
 use cynos_core::{aggregate_group_row_id, Row, RowId, Value};
 use hashbrown::HashMap;
 
+// Tiny flushes are common for live updates; scan them linearly to avoid HashMap allocation.
+const JOIN_NORMALIZE_LINEAR_SCAN_LIMIT: usize = 16;
+
 // ---------------------------------------------------------------------------
 // JoinState — supports Inner, Left, Right, Full Outer joins via DBSP
 // ---------------------------------------------------------------------------
@@ -178,15 +181,20 @@ impl JoinSideState {
 }
 
 fn repair_bucket_positions(bucket: &mut Vec<usize>, slots: &mut [Option<JoinSlot>], key: &JoinKey) {
-    bucket.retain(|slot_id| {
-        slots
-            .get(*slot_id)
-            .and_then(Option::as_ref)
-            .map(|slot| slot.key == *key)
-            .unwrap_or(false)
-    });
-    bucket.sort_unstable();
-    bucket.dedup();
+    let mut write = 0usize;
+    for read in 0..bucket.len() {
+        let slot_id = bucket[read];
+        let Some(slot) = slots.get_mut(slot_id).and_then(Option::as_mut) else {
+            continue;
+        };
+        if slot.key != *key || slot.bucket_pos == usize::MAX {
+            continue;
+        }
+        slot.bucket_pos = usize::MAX;
+        bucket[write] = slot_id;
+        write += 1;
+    }
+    bucket.truncate(write);
 
     for (bucket_pos, slot_id) in bucket.iter().copied().enumerate() {
         if let Some(slot) = slots.get_mut(slot_id).and_then(Option::as_mut) {
@@ -1320,7 +1328,8 @@ impl CompiledIvmPlan {
     }
 
     fn ensure_trace_program(&mut self, node: &DataflowNode) -> &mut CompiledTraceProgram {
-        self.program.get_or_insert_with(|| compile_trace_program(node))
+        self.program
+            .get_or_insert_with(|| compile_trace_program(node))
     }
 
     #[cfg(test)]
@@ -2386,19 +2395,53 @@ fn normalize_join_side_deltas(
     key_spec: &JoinKeySpec,
     arena: &TraceTupleArena,
 ) -> Vec<NormalizedJoinSideAction> {
-    let mut pending_deletes = HashMap::<RowId, usize>::new();
-    let mut updates_by_delete = HashMap::<usize, SameKeyTraceUpdate>::new();
-    let mut skip_indices = HashMap::<usize, ()>::new();
+    if deltas.len() < 2 {
+        return deltas
+            .iter()
+            .cloned()
+            .map(NormalizedJoinSideAction::Delta)
+            .collect();
+    }
+
+    let mut has_delete = false;
+    let mut has_insert = false;
+    for delta in deltas {
+        has_delete |= delta.is_delete();
+        has_insert |= delta.is_insert();
+        if has_delete && has_insert {
+            break;
+        }
+    }
+    if !has_delete || !has_insert {
+        return deltas
+            .iter()
+            .cloned()
+            .map(NormalizedJoinSideAction::Delta)
+            .collect();
+    }
+
+    if deltas.len() <= JOIN_NORMALIZE_LINEAR_SCAN_LIMIT {
+        return normalize_join_side_deltas_linear(deltas, key_spec, arena);
+    }
+
+    let mut pending_deletes = None;
+    let mut updates_by_delete = None;
+    let mut skip_indices = Vec::new();
 
     for (index, delta) in deltas.iter().enumerate() {
         if delta.is_delete() {
-            pending_deletes.insert(delta.data.row_id(), index);
+            pending_deletes
+                .get_or_insert_with(HashMap::<RowId, usize>::new)
+                .insert(delta.data.row_id(), index);
             continue;
         }
         if !delta.is_insert() {
             continue;
         }
 
+        let Some(pending_deletes) = pending_deletes.as_mut() else {
+            continue;
+        };
         let Some(delete_index) = pending_deletes.remove(&delta.data.row_id()) else {
             continue;
         };
@@ -2408,27 +2451,116 @@ fn normalize_join_side_deltas(
         if old_key != new_key {
             continue;
         }
-        updates_by_delete.insert(
-            delete_index,
-            SameKeyTraceUpdate {
-                old_row: old_delta.data.clone(),
-                new_row: delta.data.clone(),
-                key: old_key,
-            },
-        );
-        skip_indices.insert(index, ());
+        let updates = updates_by_delete.get_or_insert_with(|| {
+            let mut updates = Vec::with_capacity(deltas.len());
+            updates.resize_with(deltas.len(), || None);
+            updates
+        });
+        updates[delete_index] = Some(SameKeyTraceUpdate {
+            old_row: old_delta.data.clone(),
+            new_row: delta.data.clone(),
+            key: old_key,
+        });
+        skip_indices.push(index);
+    }
+
+    let Some(mut updates_by_delete) = updates_by_delete else {
+        return deltas
+            .iter()
+            .cloned()
+            .map(NormalizedJoinSideAction::Delta)
+            .collect();
+    };
+
+    if skip_indices.len() > 1 {
+        skip_indices.sort_unstable();
+    }
+
+    let mut normalized = Vec::with_capacity(deltas.len());
+    let mut skip_offset = 0usize;
+    for (index, delta) in deltas.iter().enumerate() {
+        if let Some(update) = updates_by_delete[index].take() {
+            normalized.push(NormalizedJoinSideAction::SameKeyUpdate(update));
+            continue;
+        }
+        if skip_indices
+            .get(skip_offset)
+            .copied()
+            .is_some_and(|skip_index| skip_index == index)
+        {
+            skip_offset += 1;
+            continue;
+        }
+        normalized.push(NormalizedJoinSideAction::Delta(delta.clone()));
+    }
+    normalized
+}
+
+fn normalize_join_side_deltas_linear(
+    deltas: &[Delta<TraceTupleHandle>],
+    key_spec: &JoinKeySpec,
+    arena: &TraceTupleArena,
+) -> Vec<NormalizedJoinSideAction> {
+    let mut updates_by_delete: Vec<Option<SameKeyTraceUpdate>> = Vec::new();
+    updates_by_delete.resize_with(deltas.len(), || None);
+    let mut skip_indices = Vec::new();
+    let mut pending_deletes: Vec<(RowId, usize)> = Vec::new();
+
+    for (index, delta) in deltas.iter().enumerate() {
+        if delta.is_delete() {
+            let row_id = delta.data.row_id();
+            if let Some((_, delete_index)) = pending_deletes
+                .iter_mut()
+                .find(|(pending_row_id, _)| *pending_row_id == row_id)
+            {
+                *delete_index = index;
+            } else {
+                pending_deletes.push((row_id, index));
+            }
+            continue;
+        }
+        if !delta.is_insert() {
+            continue;
+        }
+
+        let row_id = delta.data.row_id();
+        let Some(pending_index) = pending_deletes
+            .iter()
+            .position(|(pending_row_id, _)| *pending_row_id == row_id)
+        else {
+            continue;
+        };
+        let (_, delete_index) = pending_deletes.swap_remove(pending_index);
+        let old_delta = &deltas[delete_index];
+        let old_key = extract_join_key_handle(key_spec, arena, &old_delta.data);
+        let new_key = extract_join_key_handle(key_spec, arena, &delta.data);
+        if old_key != new_key {
+            continue;
+        }
+
+        updates_by_delete[delete_index] = Some(SameKeyTraceUpdate {
+            old_row: old_delta.data.clone(),
+            new_row: delta.data.clone(),
+            key: old_key,
+        });
+        skip_indices.push(index);
+    }
+
+    if skip_indices.is_empty() {
+        return deltas
+            .iter()
+            .cloned()
+            .map(NormalizedJoinSideAction::Delta)
+            .collect();
     }
 
     let mut normalized = Vec::with_capacity(deltas.len());
     for (index, delta) in deltas.iter().enumerate() {
-        if let Some(update) = updates_by_delete.remove(&index) {
+        if let Some(update) = updates_by_delete[index].take() {
             normalized.push(NormalizedJoinSideAction::SameKeyUpdate(update));
-            continue;
+        } else if !skip_indices.contains(&index) {
+            normalized.push(NormalizedJoinSideAction::Delta(delta.clone()));
         }
-        if skip_indices.contains_key(&index) {
-            continue;
-        }
-        normalized.push(NormalizedJoinSideAction::Delta(delta.clone()));
     }
     normalized
 }
@@ -3003,11 +3135,7 @@ impl MaterializedView {
         compiled_plan: CompiledIvmPlan,
         initial: Vec<Rc<Row>>,
     ) -> Self {
-        Self::with_compiled_initial_only(
-            dataflow,
-            compiled_plan,
-            initial,
-        )
+        Self::with_compiled_initial_only(dataflow, compiled_plan, initial)
     }
 
     fn with_compiled_initial_only(
@@ -3412,7 +3540,9 @@ fn propagate_row_deltas(
             }
         }
         (
-            DataflowNode::Filter { input, predicate, .. },
+            DataflowNode::Filter {
+                input, predicate, ..
+            },
             CompiledIvmNodeKind::Filter { input: input_meta },
         ) => {
             let input_deltas = propagate_row_deltas(
@@ -3433,7 +3563,9 @@ fn propagate_row_deltas(
         }
         (
             DataflowNode::Project { input, columns },
-            CompiledIvmNodeKind::Project { input: input_meta, .. },
+            CompiledIvmNodeKind::Project {
+                input: input_meta, ..
+            },
         ) => {
             let input_deltas = propagate_row_deltas(
                 input,

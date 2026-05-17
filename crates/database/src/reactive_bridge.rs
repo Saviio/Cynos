@@ -343,36 +343,46 @@ impl RootSubsetRefreshRuntime {
             next_visible_root_order.push(root_key);
         }
 
-        let mut new_root_keys: Vec<SnapshotRootKey> = recomputed_groups.keys().cloned().collect();
-        new_root_keys.sort_by_key(|root_key| {
-            self.root_ordinals
-                .get(root_key)
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
+        let mut new_root_entries: Vec<_> = recomputed_groups
+            .into_iter()
+            .map(|(root_key, group)| {
+                let ordinal = self
+                    .root_ordinals
+                    .get(&root_key)
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                (root_key, group, ordinal)
+            })
+            .collect();
+        new_root_entries.sort_by_key(|(_, _, ordinal)| *ordinal);
 
-        for root_key in new_root_keys {
-            let group = recomputed_groups.remove(&root_key).unwrap_or_default();
-            self.root_rows.insert(root_key.clone(), group);
-            let ordinal = self
-                .root_ordinals
-                .get(&root_key)
-                .copied()
-                .unwrap_or(usize::MAX);
-            let insert_at = next_visible_root_order
-                .iter()
-                .position(|candidate| {
+        if new_root_entries.is_empty() {
+            self.visible_root_order = next_visible_root_order;
+        } else {
+            let mut merged_order =
+                Vec::with_capacity(next_visible_root_order.len() + new_root_entries.len());
+            let mut existing_order = next_visible_root_order.into_iter().peekable();
+
+            for (root_key, group, ordinal) in new_root_entries {
+                while existing_order.peek().is_some_and(|candidate| {
                     self.root_ordinals
                         .get(candidate)
                         .copied()
                         .unwrap_or(usize::MAX)
-                        > ordinal
-                })
-                .unwrap_or(next_visible_root_order.len());
-            next_visible_root_order.insert(insert_at, root_key);
-        }
+                        <= ordinal
+                }) {
+                    if let Some(existing_root_key) = existing_order.next() {
+                        merged_order.push(existing_root_key);
+                    }
+                }
 
-        self.visible_root_order = next_visible_root_order;
+                self.root_rows.insert(root_key.clone(), group);
+                merged_order.push(root_key);
+            }
+
+            merged_order.extend(existing_order);
+            self.visible_root_order = merged_order;
+        }
 
         let total_rows = self
             .visible_root_order
@@ -873,7 +883,12 @@ fn build_snapshot_batch_invalidation(
         };
         let table_deltas = delta_changes.and_then(|changes| changes.get(table_id));
         if let Some(deltas) = table_deltas.filter(|deltas| !deltas.is_empty()) {
-            collect_dirty_edge_keys_for_table_deltas(plan, table_name, deltas, &mut dirty_edge_keys);
+            collect_dirty_edge_keys_for_table_deltas(
+                plan,
+                table_name,
+                deltas,
+                &mut dirty_edge_keys,
+            );
         } else {
             // Without row deltas we cannot know which relation keys moved, so
             // keep the coarse table-level invalidation as the safe fallback.
@@ -1330,7 +1345,7 @@ impl ReQueryObservable {
     ) -> Option<bool> {
         profile.partial_refresh_attempted = self.partial_refresh.is_some();
         let collect_started_at = now_ms();
-        let (affected_root_ids, affected_candidate_rows, partial_metadata, current_candidate_rows) = {
+        let (affected_root_ids, affected_candidate_rows, partial_metadata) = {
             let partial_refresh = self.partial_refresh.as_ref()?;
             let affected_root_ids = Self::collect_affected_root_row_ids(
                 &self.cache,
@@ -1351,7 +1366,6 @@ impl ReQueryObservable {
                 affected_root_ids,
                 affected_candidate_rows,
                 partial_refresh.metadata.clone(),
-                partial_refresh.candidate_rows.clone(),
             )
         };
         profile.partial_refresh_collect_ms += now_ms() - collect_started_at;
@@ -1374,12 +1388,15 @@ impl ReQueryObservable {
         profile.partial_refresh_requery_ms += now_ms() - requery_started_at;
 
         let apply_started_at = now_ms();
-        let unaffected = current_candidate_rows
-            .iter()
-            .filter(|entry| !affected_root_ids.contains(&entry.root_row_id))
-            .cloned();
-        let mut merged_rows: Vec<PartialRefreshCandidateRow> =
-            unaffected.chain(recomputed_rows.into_iter()).collect();
+        let mut merged_rows: Vec<PartialRefreshCandidateRow> = {
+            let current_candidate_rows = &self.partial_refresh.as_ref()?.candidate_rows;
+            current_candidate_rows
+                .iter()
+                .filter(|entry| !affected_root_ids.contains(&entry.root_row_id))
+                .cloned()
+                .chain(recomputed_rows.into_iter())
+                .collect()
+        };
         merged_rows.sort_by(|left, right| {
             compare_partial_refresh_rows(left, right, &partial_metadata.order_keys)
         });
@@ -1388,9 +1405,8 @@ impl ReQueryObservable {
             .visible_offset
             .saturating_add(partial_metadata.visible_limit)
             .saturating_add(partial_metadata.overscan);
-        if merged_rows.len() < min_shadow_window
-            && current_candidate_rows.len() >= min_shadow_window
-        {
+        let current_candidate_len = self.partial_refresh.as_ref()?.candidate_rows.len();
+        if merged_rows.len() < min_shadow_window && current_candidate_len >= min_shadow_window {
             return None;
         }
 
@@ -3408,10 +3424,7 @@ mod tests {
         }
     }
 
-    fn graphql_users_posts_batch_plan() -> (
-        cynos_gql::GraphqlBatchPlan,
-        HashMap<TableId, String>,
-    ) {
+    fn graphql_users_posts_batch_plan() -> (cynos_gql::GraphqlBatchPlan, HashMap<TableId, String>) {
         let mut cache = TableCache::new();
         let users = TableBuilder::new("users")
             .unwrap()

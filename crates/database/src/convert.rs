@@ -26,6 +26,7 @@ pub(crate) struct JsonbJsCachePolicy {
     target_entries: usize,
     max_bytes: usize,
     target_bytes: usize,
+    max_entry_bytes: usize,
 }
 
 impl JsonbJsCachePolicy {
@@ -34,6 +35,7 @@ impl JsonbJsCachePolicy {
         target_entries: 6_144,
         max_bytes: 4 * 1024 * 1024,
         target_bytes: 3 * 1024 * 1024,
+        max_entry_bytes: 64 * 1024,
     };
 
     pub(crate) fn should_prune(self, entries: usize, bytes: usize) -> bool {
@@ -46,6 +48,10 @@ impl JsonbJsCachePolicy {
 
     pub(crate) fn target_bytes(self) -> usize {
         self.target_bytes.min(self.max_bytes)
+    }
+
+    pub(crate) fn should_cache_entry(self, bytes: usize) -> bool {
+        bytes <= self.max_entry_bytes.min(self.target_bytes())
     }
 }
 
@@ -62,20 +68,20 @@ pub(crate) fn prune_jsonb_js_cache(
     let target_bytes = policy.target_bytes();
     let mut projected_len = jsonb_cache.len();
     let mut projected_bytes = *jsonb_cache_bytes;
-    let mut keys_to_remove = Vec::new();
+    let mut keys_to_remove: Vec<_> = jsonb_cache
+        .keys()
+        .map(|key| (key.len(), key.clone()))
+        .collect();
+    keys_to_remove.sort_unstable_by(|left, right| right.0.cmp(&left.0));
 
-    for key in jsonb_cache.keys() {
+    for (key_len, key) in keys_to_remove {
         if projected_len <= target_entries && projected_bytes <= target_bytes {
             break;
         }
         projected_len = projected_len.saturating_sub(1);
-        projected_bytes = projected_bytes.saturating_sub(key.len());
-        keys_to_remove.push(key.clone());
-    }
-
-    for key in keys_to_remove {
+        projected_bytes = projected_bytes.saturating_sub(key_len);
         if jsonb_cache.remove(key.as_slice()).is_some() {
-            *jsonb_cache_bytes = (*jsonb_cache_bytes).saturating_sub(key.len());
+            *jsonb_cache_bytes = (*jsonb_cache_bytes).saturating_sub(key_len);
         }
     }
 }
@@ -238,9 +244,12 @@ impl GraphqlJsEncodeCache {
                 }
 
                 let parsed = value_to_js(value);
-                self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_add(jsonb.0.len());
-                self.jsonb_cache.insert(jsonb.0.clone(), parsed.clone());
-                self.maybe_prune_jsonb_with_policy(JsonbJsCachePolicy::DEFAULT);
+                let policy = JsonbJsCachePolicy::DEFAULT;
+                if policy.should_cache_entry(jsonb.0.len()) {
+                    self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_add(jsonb.0.len());
+                    self.jsonb_cache.insert(jsonb.0.clone(), parsed.clone());
+                    self.maybe_prune_jsonb_with_policy(policy);
+                }
                 parsed
             }
             _ => value_to_js(value),
@@ -374,7 +383,9 @@ fn value_to_js_with_cache(value: &Value, jsonb_cache: &mut JsonbJsCache) -> JsVa
             }
 
             let parsed = value_to_js(value);
-            jsonb_cache.insert(j.0.clone(), parsed.clone());
+            if JsonbJsCachePolicy::DEFAULT.should_cache_entry(j.0.len()) {
+                jsonb_cache.insert(j.0.clone(), parsed.clone());
+            }
             parsed
         }
         _ => value_to_js(value),
@@ -979,11 +990,39 @@ mod tests {
             target_entries: 3,
             max_bytes: 12,
             target_bytes: 9,
+            max_entry_bytes: 9,
         });
 
         assert!(cache.jsonb_cache.len() <= 3);
         assert!(cache.jsonb_cache_bytes <= 9);
         assert!(!cache.jsonb_cache.is_empty());
+    }
+
+    #[test]
+    fn test_graphql_js_encode_cache_prunes_largest_jsonb_entries_first() {
+        let mut cache = GraphqlJsEncodeCache::default();
+        for key in [vec![1u8; 2], vec![2u8; 9], vec![3u8; 2]] {
+            cache.jsonb_cache_bytes += key.len();
+            cache.jsonb_cache.insert(key, JsValue::NULL);
+        }
+
+        cache.maybe_prune_jsonb_with_policy(JsonbJsCachePolicy {
+            max_entries: 3,
+            target_entries: 3,
+            max_bytes: 10,
+            target_bytes: 4,
+            max_entry_bytes: 9,
+        });
+
+        assert!(!cache.jsonb_cache.contains_key([2u8; 9].as_slice()));
+        assert!(cache.jsonb_cache_bytes <= 4);
+    }
+
+    #[test]
+    fn test_graphql_js_encode_cache_policy_skips_oversized_jsonb_entries() {
+        let policy = JsonbJsCachePolicy::DEFAULT;
+        assert!(policy.should_cache_entry(policy.target_bytes().min(64)));
+        assert!(!policy.should_cache_entry(policy.target_bytes().saturating_add(1)));
     }
 
     #[test]

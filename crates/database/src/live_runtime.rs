@@ -1,10 +1,10 @@
 use crate::binary_protocol::SchemaLayout;
-#[cfg(feature = "benchmark")]
-use crate::profiling::{GraphqlDeltaProfile, SnapshotInitProfile};
 use crate::profiling::{
     now_ms, DeltaFlushProfile, IvmBridgeProfile, IvmBridgeProfiler, SnapshotFlushProfile,
     TraceInitProfile,
 };
+#[cfg(feature = "benchmark")]
+use crate::profiling::{GraphqlDeltaProfile, SnapshotInitProfile};
 use crate::query_engine::{CompiledPhysicalPlan, QueryResultSummary, RootSubsetPlanVariant};
 use crate::reactive_bridge::{
     GraphqlDeltaObservable, GraphqlSubscriptionObservable, JsGraphqlSubscription,
@@ -1157,7 +1157,9 @@ impl DeltaSubscription {
                     .on_table_change_profiled(table_id, deltas, Some(now_ms)),
             ),
             Self::Graphql(query) => DeltaQueryUpdateProfile::from_graphql(
-                query.borrow_mut().on_table_change_profiled(table_id, deltas),
+                query
+                    .borrow_mut()
+                    .on_table_change_profiled(table_id, deltas),
             ),
         }
     }
@@ -1334,7 +1336,9 @@ impl LiveRegistry {
                 .borrow_mut()
                 .on_change_with_deltas_profiled(&changes, delta_changes);
             #[cfg(not(feature = "benchmark"))]
-            query.borrow_mut().on_change_with_deltas(&changes, delta_changes);
+            query
+                .borrow_mut()
+                .on_change_with_deltas(&changes, delta_changes);
             profile.graphql_query_count += 1;
             profile.graphql_query_on_change_ms += now_ms() - query_started_at;
             #[cfg(feature = "benchmark")]

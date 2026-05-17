@@ -315,7 +315,12 @@ fn choose_forward_strategy(
 }
 
 fn choose_reverse_strategy(query: &BoundCollectionQuery) -> RelationFetchStrategy {
-    if query.order_by.is_empty() && query.filter.as_ref().is_none_or(|filter| !uses_relation_filter(filter)) {
+    if query.order_by.is_empty()
+        && query
+            .filter
+            .as_ref()
+            .is_none_or(|filter| !uses_relation_filter(filter))
+    {
         RelationFetchStrategy::IndexedProbeBatch
     } else {
         RelationFetchStrategy::PlannerBatch

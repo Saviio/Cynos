@@ -49,7 +49,9 @@ pub struct GraphqlInvalidation {
 
 impl GraphqlInvalidation {
     fn table_changed(&self, table_name: &str) -> bool {
-        self.changed_tables.iter().any(|changed| changed == table_name)
+        self.changed_tables
+            .iter()
+            .any(|changed| changed == table_name)
     }
 }
 
@@ -369,16 +371,19 @@ impl GraphqlBatchState {
         let target_entries = target_entries.min(max_entries);
         let live_rows = self.collect_live_rows_from_root_list(plan);
         let mut projected_len = self.row_cache.len();
-        let row_keys = self.row_cache.keys().copied().collect::<Vec<_>>();
-        for row_key in row_keys {
+        let mut row_keys_to_remove = Vec::new();
+        for row_key in self.row_cache.keys().copied() {
             if projected_len <= target_entries {
                 break;
             }
             if live_rows.contains(&row_key) {
                 continue;
             }
-            self.remove_row_entry_inner(row_key, false);
+            row_keys_to_remove.push(row_key);
             projected_len = projected_len.saturating_sub(1);
+        }
+        for row_key in row_keys_to_remove {
+            self.remove_row_entry_inner(row_key, false);
         }
         self.prune_unreferenced_edge_buckets();
     }
@@ -607,9 +612,8 @@ fn try_render_root_node_list_cached<R: RowRenderRef>(
 
             match dirty_positions {
                 Ok(dirty_positions) => {
-                    let mut row_keys = cached.row_keys.clone();
-                    let mut items = cached.items.as_ref().to_vec();
-                    let mut changed = false;
+                    let mut row_key_updates = Vec::with_capacity(dirty_positions.len());
+                    let mut items = None;
                     let mut applied_positions = Vec::with_capacity(dirty_positions.len());
 
                     for position in dirty_positions {
@@ -622,7 +626,7 @@ fn try_render_root_node_list_cached<R: RowRenderRef>(
                                         "root row position out of bounds",
                                     )
                                 })?;
-                        if row.id() != row_keys[position].row_id {
+                        if row.id() != cached.row_keys[position].row_id {
                             state.root_list_requires_full_rebuild = true;
                             break;
                         }
@@ -634,28 +638,25 @@ fn try_render_root_node_list_cached<R: RowRenderRef>(
                         }
                         let rendered =
                             render_node_object(cache, catalog, plan, state, node_id, row)?;
-                        if items[position] != rendered {
+                        if cached.items[position] != rendered {
+                            let items = items.get_or_insert_with(|| cached.items.as_ref().to_vec());
                             items[position] = rendered;
-                            changed = true;
                         }
-                        row_keys[position] = RowCacheKey::new(node_id, row);
+                        row_key_updates.push((position, RowCacheKey::new(node_id, row)));
                         applied_positions.push(position);
                     }
 
                     if !state.root_list_requires_full_rebuild {
-                        if changed {
-                            let list_value = state.update_root_list_cache(row_keys, items);
+                        for (position, row_key) in row_key_updates {
+                            cached.row_keys[position] = row_key;
+                        }
+
+                        if let Some(items) = items {
+                            let list_value = state.update_root_list_cache(cached.row_keys, items);
                             state.last_root_patch =
                                 Some(GraphqlRootListPatch::StablePositions(applied_positions));
                             return Ok(Some(list_value));
                         }
-                        cached.row_keys = row_keys;
-                        cached.row_positions = cached
-                            .row_keys
-                            .iter()
-                            .enumerate()
-                            .map(|(index, row_key)| (row_key.row_id, index))
-                            .collect();
                         state.dirty_root_rows.clear();
                         state.last_root_patch =
                             Some(GraphqlRootListPatch::StablePositions(Vec::new()));

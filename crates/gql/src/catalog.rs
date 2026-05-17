@@ -402,9 +402,7 @@ fn build_table_meta(
 
 fn is_single_column_unique_key(table: &Table, column_name: &str) -> bool {
     table.indices().iter().any(|index| {
-        index.is_unique()
-            && index.columns().len() == 1
-            && index.columns()[0].name == column_name
+        index.is_unique() && index.columns().len() == 1 && index.columns()[0].name == column_name
     }) || table.primary_key().is_some_and(|primary_key| {
         primary_key.columns().len() == 1 && primary_key.columns()[0].name == column_name
     })

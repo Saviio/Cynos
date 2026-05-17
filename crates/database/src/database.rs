@@ -29,8 +29,8 @@ use cynos_core::Row;
 use cynos_gql::bind::{BoundFilter, BoundRootField, BoundRootFieldKind};
 use cynos_gql::{PreparedQuery as GqlPreparedQuery, SchemaCache as GraphqlSchemaCache};
 use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, Delta};
-use cynos_query::planner::PhysicalPlan;
 use cynos_query::plan_cache::PlanCache;
+use cynos_query::planner::PhysicalPlan;
 use cynos_reactive::TableId;
 #[cfg(feature = "benchmark")]
 use cynos_storage::StorageInsertProfile;
@@ -1707,7 +1707,9 @@ fn graphql_snapshot_plan_supports_root_subset_refresh(
     plan: &PhysicalPlan,
     root_table: &str,
 ) -> bool {
-    plan.collect_tables().iter().any(|table| table == root_table)
+    plan.collect_tables()
+        .iter()
+        .any(|table| table == root_table)
         && graphql_snapshot_plan_allows_root_subset_refresh(plan)
 }
 
@@ -3091,8 +3093,8 @@ mod tests {
 
         let initial = subscription.get_result();
         let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
-        let initial_user = js_sys::Reflect::get(&initial_data, &JsValue::from_str("usersByPk"))
-            .unwrap();
+        let initial_user =
+            js_sys::Reflect::get(&initial_data, &JsValue::from_str("usersByPk")).unwrap();
         let initial_profile = js_sys::Array::from(
             &js_sys::Reflect::get(&initial_user, &JsValue::from_str("profile")).unwrap(),
         );
@@ -3114,10 +3116,11 @@ mod tests {
             &js_sys::Reflect::get(&inserted_user, &JsValue::from_str("profile")).unwrap(),
         );
         assert_eq!(inserted_profile.length(), 1);
-        let inserted_bio = js_sys::Reflect::get(&inserted_profile.get(0), &JsValue::from_str("bio"))
-            .unwrap()
-            .as_string()
-            .unwrap();
+        let inserted_bio =
+            js_sys::Reflect::get(&inserted_profile.get(0), &JsValue::from_str("bio"))
+                .unwrap()
+                .as_string()
+                .unwrap();
         assert_eq!(inserted_bio, "First");
 
         db.graphql(
@@ -3181,7 +3184,10 @@ mod tests {
             .unwrap();
 
         let query = "subscription IssueFeed { issues(where: { AND: [{ status: { eq: \"open\" } }, { project: { AND: [{ healthScore: { gte: 45 } }, { counter: { openIssueCount: { gte: 5 } } }, { snapshot: { velocity: { gte: 18 } } }] } }] }) { id title project { id counter(limit: 1) { openIssueCount } snapshot(limit: 1) { velocity } } } }";
-        assert_eq!(compile_subscription_engine(&db, query), LiveEngineKind::Delta);
+        assert_eq!(
+            compile_subscription_engine(&db, query),
+            LiveEngineKind::Delta
+        );
 
         let subscription = db.subscribe_graphql(query, None, None).unwrap();
 
@@ -3261,7 +3267,10 @@ mod tests {
             .unwrap();
 
         let query = "subscription IssueFeedSnapshot { issues(where: { AND: [{ status: { eq: \"open\" } }, { project: { AND: [{ healthScore: { gte: 45 } }, { counter: { openIssueCount: { gte: 5 } } }, { snapshot: { velocity: { gte: 18 } } }] } }] }) { id title project { id counter(orderBy: [{ field: OPENISSUECOUNT, direction: DESC }], limit: 1) { openIssueCount } snapshot(limit: 1) { velocity } } } }";
-        assert_eq!(compile_subscription_engine(&db, query), LiveEngineKind::Snapshot);
+        assert_eq!(
+            compile_subscription_engine(&db, query),
+            LiveEngineKind::Snapshot
+        );
 
         let subscription = db.subscribe_graphql(query, None, None).unwrap();
 

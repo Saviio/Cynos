@@ -1,6 +1,7 @@
 //! Internal late-materialization primitives for trace()/IVM.
 
 use crate::delta::Delta;
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::{OnceCell, RefCell};
@@ -12,158 +13,118 @@ pub struct TraceTupleHandle(Rc<TraceTupleNode>);
 
 #[derive(Debug)]
 struct TraceTupleNode {
-    kind: TraceTupleKind,
-    materialized: RefCell<Option<Rc<Row>>>,
+    layout: TraceTupleLayout,
+    materialized: OnceCell<Rc<Row>>,
 }
 
-#[derive(Clone, Debug)]
-enum TraceTupleKind {
-    Base(Rc<Row>),
-    Concat {
-        left: TraceTupleHandle,
-        right: TraceTupleHandle,
-        left_width: usize,
-    },
-    NullPadLeft {
-        right: TraceTupleHandle,
-        left_width: usize,
-    },
-    NullPadRight {
-        left: TraceTupleHandle,
-        right_width: usize,
-    },
-    Project {
-        input: TraceTupleHandle,
-        columns: Rc<[usize]>,
-    },
-    Owned(Rc<Row>),
+#[derive(Debug)]
+struct TraceTupleLayout {
+    len: usize,
+    row_id: RowId,
+    version: u64,
+    segments: TraceTupleSegments,
+}
+
+#[derive(Debug)]
+struct TraceTupleSegment {
+    output_start: usize,
+    len: usize,
+    kind: TraceTupleSegmentKind,
+}
+
+#[derive(Debug)]
+enum TraceTupleSegmentKind {
+    Values { row: Rc<Row>, row_start: usize },
+    Nulls,
+    Missing,
+}
+
+#[derive(Debug)]
+enum TraceTupleSegments {
+    Empty,
+    One(TraceTupleSegment),
+    Heap(Box<[TraceTupleSegment]>),
+}
+
+impl TraceTupleSegments {
+    fn from_vec(mut segments: Vec<TraceTupleSegment>) -> Self {
+        match segments.len() {
+            0 => Self::Empty,
+            1 => Self::One(segments.pop().expect("single segment")),
+            _ => Self::Heap(segments.into_boxed_slice()),
+        }
+    }
+
+    fn one(segment: TraceTupleSegment) -> Self {
+        if segment.len == 0 {
+            Self::Empty
+        } else {
+            Self::One(segment)
+        }
+    }
+
+    fn as_slice(&self) -> &[TraceTupleSegment] {
+        match self {
+            Self::Empty => &[],
+            Self::One(segment) => core::slice::from_ref(segment),
+            Self::Heap(segments) => segments.as_ref(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn iter(&self) -> core::slice::Iter<'_, TraceTupleSegment> {
+        self.as_slice().iter()
+    }
 }
 
 impl TraceTupleHandle {
-    fn new(kind: TraceTupleKind, materialized: Option<Rc<Row>>) -> Self {
+    fn new(layout: TraceTupleLayout, materialized: Option<Rc<Row>>) -> Self {
+        let materialized_cell = OnceCell::new();
+        if let Some(row) = materialized {
+            let _ = materialized_cell.set(row);
+        }
         Self(Rc::new(TraceTupleNode {
-            kind,
-            materialized: RefCell::new(materialized),
+            layout,
+            materialized: materialized_cell,
         }))
     }
 
     pub fn len(&self) -> usize {
-        match &self.0.kind {
-            TraceTupleKind::Base(row) | TraceTupleKind::Owned(row) => row.len(),
-            TraceTupleKind::Concat {
-                left_width, right, ..
-            } => left_width.saturating_add(right.len()),
-            TraceTupleKind::NullPadLeft { left_width, right } => {
-                left_width.saturating_add(right.len())
-            }
-            TraceTupleKind::NullPadRight { left, right_width } => {
-                left.len().saturating_add(*right_width)
-            }
-            TraceTupleKind::Project { columns, .. } => columns.len(),
-        }
+        self.0.layout.len
     }
 
     pub fn row_id(&self) -> RowId {
-        match &self.0.kind {
-            TraceTupleKind::Base(row) | TraceTupleKind::Owned(row) => row.id(),
-            TraceTupleKind::Concat { left, right, .. } => {
-                join_row_id(left.row_id(), right.row_id())
-            }
-            TraceTupleKind::NullPadLeft { right, .. } => right_join_null_row_id(right.row_id()),
-            TraceTupleKind::NullPadRight { left, .. } => left_join_null_row_id(left.row_id()),
-            TraceTupleKind::Project { input, .. } => input.row_id(),
-        }
+        self.0.layout.row_id
     }
 
     pub fn version(&self) -> u64 {
-        match &self.0.kind {
-            TraceTupleKind::Base(row) | TraceTupleKind::Owned(row) => row.version(),
-            TraceTupleKind::Concat { left, right, .. } => {
-                left.version().wrapping_add(right.version())
-            }
-            TraceTupleKind::NullPadLeft { right, .. } => right.version(),
-            TraceTupleKind::NullPadRight { left, .. } => left.version(),
-            TraceTupleKind::Project { input, .. } => input.version(),
-        }
+        self.0.layout.version
     }
 
     pub fn value_at(&self, index: usize) -> Option<Value> {
-        match &self.0.kind {
-            TraceTupleKind::Base(row) | TraceTupleKind::Owned(row) => row.get(index).cloned(),
-            TraceTupleKind::Concat {
-                left,
-                right,
-                left_width,
-            } => {
-                if index < *left_width {
-                    left.value_at(index)
-                } else {
-                    right.value_at(index.saturating_sub(*left_width))
-                }
+        if index >= self.0.layout.len {
+            return None;
+        }
+        let segment = self.0.layout.segment_at(index)?;
+        let offset = index.saturating_sub(segment.output_start);
+        match &segment.kind {
+            TraceTupleSegmentKind::Values { row, row_start } => {
+                row.get(row_start.saturating_add(offset)).cloned()
             }
-            TraceTupleKind::NullPadLeft { right, left_width } => {
-                if index < *left_width {
-                    Some(Value::Null)
-                } else {
-                    right.value_at(index.saturating_sub(*left_width))
-                }
-            }
-            TraceTupleKind::NullPadRight { left, right_width } => {
-                if index < left.len() {
-                    left.value_at(index)
-                } else if index < left.len().saturating_add(*right_width) {
-                    Some(Value::Null)
-                } else {
-                    None
-                }
-            }
-            TraceTupleKind::Project { input, columns } => columns
-                .get(index)
-                .and_then(|source_index| input.value_at(*source_index)),
+            TraceTupleSegmentKind::Nulls => Some(Value::Null),
+            TraceTupleSegmentKind::Missing => None,
         }
     }
 
     pub fn materialize_rc(&self) -> Rc<Row> {
-        if let Some(row) = self.0.materialized.borrow().as_ref() {
-            return row.clone();
-        }
-
-        let row = match &self.0.kind {
-            TraceTupleKind::Base(row) | TraceTupleKind::Owned(row) => row.clone(),
-            TraceTupleKind::Concat { left, right, .. } => {
-                let left_row = left.materialize_rc();
-                let right_row = right.materialize_rc();
-                let mut values = Vec::with_capacity(left_row.len().saturating_add(right_row.len()));
-                values.extend(left_row.values().iter().cloned());
-                values.extend(right_row.values().iter().cloned());
-                Rc::new(Row::new_with_version(self.row_id(), self.version(), values))
-            }
-            TraceTupleKind::NullPadLeft { right, left_width } => {
-                let right_row = right.materialize_rc();
-                let mut values = Vec::with_capacity(left_width.saturating_add(right_row.len()));
-                values.resize(*left_width, Value::Null);
-                values.extend(right_row.values().iter().cloned());
-                Rc::new(Row::new_with_version(self.row_id(), self.version(), values))
-            }
-            TraceTupleKind::NullPadRight { left, right_width } => {
-                let left_row = left.materialize_rc();
-                let mut values = Vec::with_capacity(left_row.len().saturating_add(*right_width));
-                values.extend(left_row.values().iter().cloned());
-                values.resize(values.len().saturating_add(*right_width), Value::Null);
-                Rc::new(Row::new_with_version(self.row_id(), self.version(), values))
-            }
-            TraceTupleKind::Project { input, columns } => {
-                let input_row = input.materialize_rc();
-                let values = columns
-                    .iter()
-                    .filter_map(|index| input_row.get(*index).cloned())
-                    .collect();
-                Rc::new(Row::new_with_version(self.row_id(), self.version(), values))
-            }
-        };
-
-        *self.0.materialized.borrow_mut() = Some(row.clone());
-        row
+        self.0
+            .materialized
+            .get_or_init(|| self.0.layout.materialize_row())
+            .clone()
     }
 
     pub fn materialize_row(&self) -> Row {
@@ -171,8 +132,247 @@ impl TraceTupleHandle {
     }
 
     pub fn has_materialized_row(&self) -> bool {
-        self.0.materialized.borrow().is_some()
+        self.0.materialized.get().is_some()
     }
+
+    #[cfg(test)]
+    fn segment_count(&self) -> usize {
+        self.0.layout.segments.len()
+    }
+}
+
+impl TraceTupleLayout {
+    fn from_row(row: Rc<Row>) -> Self {
+        let len = row.len();
+        Self {
+            len,
+            row_id: row.id(),
+            version: row.version(),
+            segments: TraceTupleSegments::one(TraceTupleSegment {
+                output_start: 0,
+                len,
+                kind: TraceTupleSegmentKind::Values { row, row_start: 0 },
+            }),
+        }
+    }
+
+    fn concat(left: &TraceTupleHandle, right: &TraceTupleHandle, left_width: usize) -> Self {
+        let mut segments = Vec::new();
+        append_layout_range(&mut segments, &left.0.layout, 0, left_width, 0);
+        append_layout_range(&mut segments, &right.0.layout, 0, right.len(), left_width);
+        Self {
+            len: left_width.saturating_add(right.len()),
+            row_id: join_row_id(left.row_id(), right.row_id()),
+            version: left.version().wrapping_add(right.version()),
+            segments: TraceTupleSegments::from_vec(segments),
+        }
+    }
+
+    fn null_pad_left(right: &TraceTupleHandle, left_width: usize) -> Self {
+        let mut segments = Vec::new();
+        push_segment(
+            &mut segments,
+            TraceTupleSegment {
+                output_start: 0,
+                len: left_width,
+                kind: TraceTupleSegmentKind::Nulls,
+            },
+        );
+        append_layout_range(&mut segments, &right.0.layout, 0, right.len(), left_width);
+        Self {
+            len: left_width.saturating_add(right.len()),
+            row_id: right_join_null_row_id(right.row_id()),
+            version: right.version(),
+            segments: TraceTupleSegments::from_vec(segments),
+        }
+    }
+
+    fn null_pad_right(left: &TraceTupleHandle, right_width: usize) -> Self {
+        let mut segments = Vec::new();
+        append_layout_range(&mut segments, &left.0.layout, 0, left.len(), 0);
+        push_segment(
+            &mut segments,
+            TraceTupleSegment {
+                output_start: left.len(),
+                len: right_width,
+                kind: TraceTupleSegmentKind::Nulls,
+            },
+        );
+        Self {
+            len: left.len().saturating_add(right_width),
+            row_id: left_join_null_row_id(left.row_id()),
+            version: left.version(),
+            segments: TraceTupleSegments::from_vec(segments),
+        }
+    }
+
+    fn project(input: &TraceTupleHandle, columns: Rc<[usize]>) -> Self {
+        let mut segments = Vec::new();
+        for (output_index, source_index) in columns.iter().copied().enumerate() {
+            append_layout_range(
+                &mut segments,
+                &input.0.layout,
+                source_index,
+                1,
+                output_index,
+            );
+        }
+        Self {
+            len: columns.len(),
+            row_id: input.row_id(),
+            version: input.version(),
+            segments: TraceTupleSegments::from_vec(segments),
+        }
+    }
+
+    fn segment_at(&self, index: usize) -> Option<&TraceTupleSegment> {
+        let TraceTupleSegments::Heap(segments) = &self.segments else {
+            let segment = match &self.segments {
+                TraceTupleSegments::One(segment) => segment,
+                TraceTupleSegments::Empty | TraceTupleSegments::Heap(_) => return None,
+            };
+            return (index >= segment.output_start
+                && index < segment.output_start.saturating_add(segment.len))
+            .then_some(segment);
+        };
+
+        let segments = segments.as_ref();
+        let mut low = 0usize;
+        let mut high = segments.len();
+        while low < high {
+            let mid = low + ((high - low) / 2);
+            let segment = &segments[mid];
+            if index < segment.output_start {
+                high = mid;
+            } else if index >= segment.output_start.saturating_add(segment.len) {
+                low = mid + 1;
+            } else {
+                return Some(segment);
+            }
+        }
+        None
+    }
+
+    fn materialize_row(&self) -> Rc<Row> {
+        let mut values = Vec::with_capacity(self.len);
+        for segment in self.segments.iter() {
+            match &segment.kind {
+                TraceTupleSegmentKind::Values { row, row_start } => {
+                    for offset in 0..segment.len {
+                        if let Some(value) = row.get(row_start.saturating_add(offset)).cloned() {
+                            values.push(value);
+                        }
+                    }
+                }
+                TraceTupleSegmentKind::Nulls => {
+                    values.resize(values.len().saturating_add(segment.len), Value::Null);
+                }
+                TraceTupleSegmentKind::Missing => {}
+            }
+        }
+        Rc::new(Row::new_with_version(self.row_id, self.version, values))
+    }
+}
+
+fn append_layout_range(
+    segments: &mut Vec<TraceTupleSegment>,
+    layout: &TraceTupleLayout,
+    source_start: usize,
+    len: usize,
+    output_start: usize,
+) {
+    if len == 0 {
+        return;
+    }
+
+    let source_end = source_start.saturating_add(len).min(layout.len);
+    if source_start >= source_end {
+        push_segment(
+            segments,
+            TraceTupleSegment {
+                output_start,
+                len,
+                kind: TraceTupleSegmentKind::Missing,
+            },
+        );
+        return;
+    }
+
+    for segment in layout.segments.iter() {
+        let segment_start = segment.output_start;
+        let segment_end = segment.output_start.saturating_add(segment.len);
+        let overlap_start = segment_start.max(source_start);
+        let overlap_end = segment_end.min(source_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+
+        let overlap_len = overlap_end - overlap_start;
+        let segment_offset = overlap_start - segment_start;
+        let projected_output_start = output_start + (overlap_start - source_start);
+        let kind = match &segment.kind {
+            TraceTupleSegmentKind::Values { row, row_start } => TraceTupleSegmentKind::Values {
+                row: row.clone(),
+                row_start: row_start.saturating_add(segment_offset),
+            },
+            TraceTupleSegmentKind::Nulls => TraceTupleSegmentKind::Nulls,
+            TraceTupleSegmentKind::Missing => TraceTupleSegmentKind::Missing,
+        };
+        push_segment(
+            segments,
+            TraceTupleSegment {
+                output_start: projected_output_start,
+                len: overlap_len,
+                kind,
+            },
+        );
+    }
+
+    if source_end < source_start.saturating_add(len) {
+        push_segment(
+            segments,
+            TraceTupleSegment {
+                output_start: output_start + (source_end - source_start),
+                len: source_start.saturating_add(len) - source_end,
+                kind: TraceTupleSegmentKind::Missing,
+            },
+        );
+    }
+}
+
+fn push_segment(segments: &mut Vec<TraceTupleSegment>, segment: TraceTupleSegment) {
+    if segment.len == 0 {
+        return;
+    }
+
+    if let Some(previous) = segments.last_mut() {
+        let adjacent_output =
+            previous.output_start.saturating_add(previous.len) == segment.output_start;
+        if adjacent_output {
+            match (&mut previous.kind, &segment.kind) {
+                (TraceTupleSegmentKind::Nulls, TraceTupleSegmentKind::Nulls)
+                | (TraceTupleSegmentKind::Missing, TraceTupleSegmentKind::Missing) => {
+                    previous.len = previous.len.saturating_add(segment.len);
+                    return;
+                }
+                (
+                    TraceTupleSegmentKind::Values {
+                        row: previous_row,
+                        row_start: previous_row_start,
+                    },
+                    TraceTupleSegmentKind::Values { row, row_start },
+                ) if Rc::ptr_eq(previous_row, row)
+                    && previous_row_start.saturating_add(previous.len) == *row_start =>
+                {
+                    previous.len = previous.len.saturating_add(segment.len);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    segments.push(segment);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -180,16 +380,16 @@ pub struct TraceTupleArena;
 
 impl TraceTupleArena {
     pub fn base_rc(&self, row: Rc<Row>) -> TraceTupleHandle {
-        TraceTupleHandle::new(TraceTupleKind::Base(row.clone()), Some(row))
+        TraceTupleHandle::new(TraceTupleLayout::from_row(row.clone()), Some(row))
     }
 
     pub fn owned(&self, row: Row) -> TraceTupleHandle {
         let row = Rc::new(row);
-        TraceTupleHandle::new(TraceTupleKind::Owned(row.clone()), Some(row))
+        TraceTupleHandle::new(TraceTupleLayout::from_row(row.clone()), Some(row))
     }
 
     pub fn owned_rc(&self, row: Rc<Row>) -> TraceTupleHandle {
-        TraceTupleHandle::new(TraceTupleKind::Owned(row.clone()), Some(row))
+        TraceTupleHandle::new(TraceTupleLayout::from_row(row.clone()), Some(row))
     }
 
     pub fn concat(
@@ -198,26 +398,19 @@ impl TraceTupleArena {
         right: TraceTupleHandle,
         left_width: usize,
     ) -> TraceTupleHandle {
-        TraceTupleHandle::new(
-            TraceTupleKind::Concat {
-                left,
-                right,
-                left_width,
-            },
-            None,
-        )
+        TraceTupleHandle::new(TraceTupleLayout::concat(&left, &right, left_width), None)
     }
 
     pub fn null_pad_left(&self, right: TraceTupleHandle, left_width: usize) -> TraceTupleHandle {
-        TraceTupleHandle::new(TraceTupleKind::NullPadLeft { right, left_width }, None)
+        TraceTupleHandle::new(TraceTupleLayout::null_pad_left(&right, left_width), None)
     }
 
     pub fn null_pad_right(&self, left: TraceTupleHandle, right_width: usize) -> TraceTupleHandle {
-        TraceTupleHandle::new(TraceTupleKind::NullPadRight { left, right_width }, None)
+        TraceTupleHandle::new(TraceTupleLayout::null_pad_right(&left, right_width), None)
     }
 
     pub fn project(&self, input: TraceTupleHandle, columns: Rc<[usize]>) -> TraceTupleHandle {
-        TraceTupleHandle::new(TraceTupleKind::Project { input, columns }, None)
+        TraceTupleHandle::new(TraceTupleLayout::project(&input, columns), None)
     }
 
     #[inline]
@@ -758,6 +951,65 @@ mod tests {
     }
 
     #[test]
+    fn trace_tuple_value_at_uses_flat_layout_without_materializing() {
+        let arena = TraceTupleArena;
+        let left = arena.owned(make_row(1, 10));
+        let middle = arena.owned(Row::new(
+            2,
+            vec![Value::Int64(2), Value::String("middle".into())],
+        ));
+        let right = arena.owned(make_row(3, 30));
+
+        let joined = arena.concat(
+            arena.concat(left.clone(), middle.clone(), left.len()),
+            right.clone(),
+            left.len().saturating_add(middle.len()),
+        );
+
+        assert_eq!(joined.segment_count(), 3);
+        assert!(!joined.has_materialized_row());
+        assert_eq!(joined.value_at(0), Some(Value::Int64(1)));
+        assert_eq!(joined.value_at(3), Some(Value::String("middle".into())));
+        assert_eq!(joined.value_at(5), Some(Value::Int64(30)));
+        assert!(!joined.has_materialized_row());
+
+        let row = joined.materialize_rc();
+        assert_eq!(row.len(), 6);
+        assert!(joined.has_materialized_row());
+    }
+
+    #[test]
+    fn trace_tuple_project_and_null_padding_preserve_existing_semantics() {
+        let arena = TraceTupleArena;
+        let left = arena.owned(make_row(1, 10));
+        let right = arena.owned(Row::new(
+            2,
+            vec![Value::Int64(2), Value::String("right".into())],
+        ));
+        let joined = arena.concat(left.clone(), right.clone(), left.len());
+        let projected = arena.project(joined, Rc::from([3usize, 0, 99]));
+        let padded = arena.null_pad_left(projected.clone(), 2);
+
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected.value_at(0), Some(Value::String("right".into())));
+        assert_eq!(projected.value_at(1), Some(Value::Int64(1)));
+        assert_eq!(projected.value_at(2), None);
+        assert!(!projected.has_materialized_row());
+
+        assert_eq!(padded.value_at(0), Some(Value::Null));
+        assert_eq!(padded.value_at(1), Some(Value::Null));
+        assert_eq!(padded.value_at(2), Some(Value::String("right".into())));
+        assert_eq!(padded.value_at(3), Some(Value::Int64(1)));
+        assert_eq!(padded.value_at(4), None);
+
+        let projected_row = projected.materialize_rc();
+        assert_eq!(
+            projected_row.values(),
+            &[Value::String("right".into()), Value::Int64(1)]
+        );
+    }
+
+    #[test]
     fn visible_result_store_keeps_owned_rows_until_rc_view_needed() {
         let store = VisibleResultStore::from_rows(vec![make_row(1, 10), make_row(2, 20)]);
 
@@ -796,7 +1048,9 @@ mod tests {
             .map(|row| {
                 (
                     row.id(),
-                    row.get(1).and_then(|value| value.as_i64()).unwrap_or_default(),
+                    row.get(1)
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or_default(),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -806,7 +1060,14 @@ mod tests {
 
         let refs = store
             .row_refs()
-            .map(|row| (row.id(), row.get(1).and_then(|value| value.as_i64()).unwrap_or_default()))
+            .map(|row| {
+                (
+                    row.id(),
+                    row.get(1)
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or_default(),
+                )
+            })
             .collect::<HashMap<_, _>>();
         assert_eq!(refs.get(&2), Some(&200));
         assert_eq!(refs.get(&3), Some(&30));

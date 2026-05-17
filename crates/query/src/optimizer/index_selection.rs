@@ -4,6 +4,7 @@ use crate::ast::{BinaryOp, Expr};
 use crate::context::{ExecutionContext, IndexInfo, RestrictedAccessMode};
 use crate::optimizer::OptimizerPass;
 use crate::planner::{IndexBounds, LogicalPlan};
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -1195,7 +1196,7 @@ impl IndexSelection {
         if let Some(value) = &info.value {
             if let Some(literal) = Self::literal_to_gin_cost_value(value) {
                 if let Some(cost) =
-                    ctx.gin_key_value_cost(table, &info.index, &info.path, literal.as_str())
+                    ctx.gin_key_value_cost(table, &info.index, &info.path, literal.as_ref())
                 {
                     if cost > 0 {
                         return cost;
@@ -1209,7 +1210,7 @@ impl IndexSelection {
                 .iter()
                 .filter_map(|(key, value)| {
                     let literal = Self::literal_to_gin_cost_value(value)?;
-                    ctx.gin_key_value_cost(table, &info.index, key, literal.as_str())
+                    ctx.gin_key_value_cost(table, &info.index, key, literal.as_ref())
                 })
                 .min()
             {
@@ -1233,13 +1234,13 @@ impl IndexSelection {
         }
     }
 
-    fn literal_to_gin_cost_value(value: &Value) -> Option<String> {
+    fn literal_to_gin_cost_value(value: &Value) -> Option<Cow<'_, str>> {
         match value {
-            Value::String(value) => Some(value.clone()),
-            Value::Int32(value) => Some(value.to_string()),
-            Value::Int64(value) => Some(value.to_string()),
-            Value::Float64(value) => Some(value.to_string()),
-            Value::Boolean(value) => Some(if *value { "true" } else { "false" }.into()),
+            Value::String(value) => Some(Cow::Borrowed(value.as_str())),
+            Value::Int32(value) => Some(Cow::Owned(value.to_string())),
+            Value::Int64(value) => Some(Cow::Owned(value.to_string())),
+            Value::Float64(value) => Some(Cow::Owned(value.to_string())),
+            Value::Boolean(value) => Some(Cow::Borrowed(if *value { "true" } else { "false" })),
             _ => None,
         }
     }

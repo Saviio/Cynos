@@ -342,14 +342,16 @@ impl ObservableQuery {
         }
 
         if self.trace_batch_subscriptions.is_empty() {
-            let (output_deltas, profile) = self.view.on_table_change_profiled(table_id, deltas, now_fn);
+            let (output_deltas, profile) =
+                self.view.on_table_change_profiled(table_id, deltas, now_fn);
 
             if !output_deltas.is_empty() {
                 if !self.raw_delta_subscriptions.is_empty() {
                     self.raw_delta_subscriptions.notify_all(&output_deltas);
                 }
                 if !self.subscriptions.is_empty() {
-                    self.change_set_scratch.replace_from_deltas_only(&output_deltas);
+                    self.change_set_scratch
+                        .replace_from_deltas_only(&output_deltas);
                     self.subscriptions.notify_all(&self.change_set_scratch);
                 }
             }
@@ -380,7 +382,8 @@ impl ObservableQuery {
             }
             if !self.subscriptions.is_empty() {
                 if let Some(ref output_deltas) = materialized {
-                    self.change_set_scratch.replace_from_deltas_only(output_deltas);
+                    self.change_set_scratch
+                        .replace_from_deltas_only(output_deltas);
                     self.subscriptions.notify_all(&self.change_set_scratch);
                 }
             }

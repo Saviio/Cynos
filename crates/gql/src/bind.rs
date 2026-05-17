@@ -178,10 +178,7 @@ pub fn is_delta_capable_root_field(field: &BoundRootField) -> bool {
             query.order_by.is_empty()
                 && query.limit.is_none()
                 && query.offset == 0
-                && query
-                    .filter
-                    .as_ref()
-                    .map_or(true, is_delta_capable_filter)
+                && query.filter.as_ref().map_or(true, is_delta_capable_filter)
                 && is_delta_capable_selection(selection)
         }
         BoundRootFieldKind::ByPk { selection, .. } => is_delta_capable_selection(selection),
@@ -202,9 +199,13 @@ fn is_delta_capable_field(field: &BoundField) -> bool {
         BoundField::ForwardRelation { selection, .. } => is_delta_capable_selection(selection),
         BoundField::ReverseRelation {
             relation,
-            query, selection, ..
-        } => reverse_relation_query_is_delta_capable(relation, query)
-            && is_delta_capable_selection(selection),
+            query,
+            selection,
+            ..
+        } => {
+            reverse_relation_query_is_delta_capable(relation, query)
+                && is_delta_capable_selection(selection)
+        }
     }
 }
 
@@ -224,10 +225,7 @@ fn reverse_relation_query_is_delta_capable(
 ) -> bool {
     query.order_by.is_empty()
         && query.offset == 0
-        && query
-            .filter
-            .as_ref()
-            .map_or(true, is_delta_capable_filter)
+        && query.filter.as_ref().map_or(true, is_delta_capable_filter)
         && match query.limit {
             None => true,
             Some(1) => relation.child_column_unique,
@@ -311,10 +309,7 @@ fn collect_selection_dependency_tables(
     }
 }
 
-fn collect_filter_dependency_tables(
-    filter: &BoundFilter,
-    tables: &mut hashbrown::HashSet<String>,
-) {
+fn collect_filter_dependency_tables(filter: &BoundFilter, tables: &mut hashbrown::HashSet<String>) {
     match filter {
         BoundFilter::And(filters) | BoundFilter::Or(filters) => {
             for filter in filters {
@@ -915,12 +910,13 @@ fn bind_where(
                         )?));
                     }
                     TableFieldMeta::ForwardRelation(relation) => {
-                        let target_table = catalog.table(&relation.parent_table).ok_or_else(|| {
-                            GqlError::new(
-                                GqlErrorKind::Binding,
-                                format!("table `{}` is not available", relation.parent_table),
-                            )
-                        })?;
+                        let target_table =
+                            catalog.table(&relation.parent_table).ok_or_else(|| {
+                                GqlError::new(
+                                    GqlErrorKind::Binding,
+                                    format!("table `{}` is not available", relation.parent_table),
+                                )
+                            })?;
                         predicates.push(bind_single_relation_predicate(
                             relation,
                             target_table,
@@ -939,12 +935,13 @@ fn bind_where(
                                 ),
                             ));
                         }
-                        let target_table = catalog.table(&relation.child_table).ok_or_else(|| {
-                            GqlError::new(
-                                GqlErrorKind::Binding,
-                                format!("table `{}` is not available", relation.child_table),
-                            )
-                        })?;
+                        let target_table =
+                            catalog.table(&relation.child_table).ok_or_else(|| {
+                                GqlError::new(
+                                    GqlErrorKind::Binding,
+                                    format!("table `{}` is not available", relation.child_table),
+                                )
+                            })?;
                         predicates.push(bind_single_relation_predicate(
                             relation,
                             target_table,
