@@ -20,7 +20,7 @@ use cynos_incremental::{
     TraceTupleHandle,
 };
 use cynos_index::KeyRange;
-use cynos_jsonb::path::{decode_json_string_literal, trim_json_bytes, SimpleJsonPath};
+use cynos_jsonb::path::{raw_json_contains_value, raw_json_eq_value, SimpleJsonPath};
 use cynos_jsonb::{JsonPath, JsonbObject, JsonbValue};
 use cynos_query::ast::JoinType as QueryJoinType;
 use cynos_query::ast::{AggregateFunc, BinaryOp, Expr, UnaryOp};
@@ -653,19 +653,16 @@ fn compile_node(
 
 /// Compiles an Expr predicate into a closure for DataflowNode::Filter.
 fn compile_predicate(expr: &Expr) -> Box<dyn Fn(&Row) -> bool + Send + Sync> {
-    let expr = expr.clone();
-    Box::new(move |row: &Row| {
-        let mut value_at = |index: usize| row.get(index).cloned();
-        matches!(eval_expr_with(&expr, &mut value_at), Value::Boolean(true))
-    })
+    let predicate = CompiledDataflowPredicate::compile(expr);
+    Box::new(move |row: &Row| predicate.eval_row(row))
 }
 
 fn compile_trace_predicate(
     expr: &Expr,
 ) -> Box<dyn Fn(&TraceTupleArena, &TraceTupleHandle) -> bool + Send + Sync> {
-    let predicate = CompiledTracePredicate::compile(expr);
+    let predicate = CompiledDataflowPredicate::compile(expr);
     Box::new(move |arena: &TraceTupleArena, handle: &TraceTupleHandle| {
-        predicate.eval(arena, handle)
+        predicate.eval_trace(arena, handle)
     })
 }
 
@@ -686,8 +683,13 @@ fn compile_trace_mapper(
 }
 
 #[derive(Clone)]
-enum CompiledTracePredicate {
+enum CompiledDataflowPredicate {
     JsonPathEq {
+        column_index: usize,
+        path: SimpleJsonPath,
+        expected: Value,
+    },
+    JsonPathContains {
         column_index: usize,
         path: SimpleJsonPath,
         expected: Value,
@@ -696,13 +698,19 @@ enum CompiledTracePredicate {
         column_index: usize,
         path: SimpleJsonPath,
     },
-    And(Box<CompiledTracePredicate>, Box<CompiledTracePredicate>),
-    Or(Box<CompiledTracePredicate>, Box<CompiledTracePredicate>),
-    Not(Box<CompiledTracePredicate>),
+    And(
+        Box<CompiledDataflowPredicate>,
+        Box<CompiledDataflowPredicate>,
+    ),
+    Or(
+        Box<CompiledDataflowPredicate>,
+        Box<CompiledDataflowPredicate>,
+    ),
+    Not(Box<CompiledDataflowPredicate>),
     Generic(Expr),
 }
 
-impl CompiledTracePredicate {
+impl CompiledDataflowPredicate {
     fn compile(expr: &Expr) -> Self {
         match expr {
             Expr::Function { name, args } => Self::compile_json_function(name, args)
@@ -757,6 +765,22 @@ impl CompiledTracePredicate {
                     expected: expected.clone(),
                 })
             }
+            "JSONB_CONTAINS" if args.len() >= 3 => {
+                let Expr::Column(column) = &args[0] else {
+                    return None;
+                };
+                let Expr::Literal(Value::String(path)) = &args[1] else {
+                    return None;
+                };
+                let Expr::Literal(expected) = &args[2] else {
+                    return None;
+                };
+                Some(Self::JsonPathContains {
+                    column_index: column.index,
+                    path: SimpleJsonPath::parse(path)?,
+                    expected: expected.clone(),
+                })
+            }
             "JSONB_EXISTS" if args.len() >= 2 => {
                 let Expr::Column(column) = &args[0] else {
                     return None;
@@ -776,6 +800,7 @@ impl CompiledTracePredicate {
     fn is_boolean_output(&self) -> bool {
         match self {
             Self::JsonPathEq { .. }
+            | Self::JsonPathContains { .. }
             | Self::JsonPathExists { .. }
             | Self::And(_, _)
             | Self::Or(_, _)
@@ -784,7 +809,42 @@ impl CompiledTracePredicate {
         }
     }
 
-    fn eval(&self, arena: &TraceTupleArena, handle: &TraceTupleHandle) -> bool {
+    fn eval_row(&self, row: &Row) -> bool {
+        match self {
+            Self::JsonPathEq {
+                column_index,
+                path,
+                expected,
+            } => match row.get(*column_index) {
+                Some(Value::Jsonb(jsonb)) => path
+                    .extract(&jsonb.0)
+                    .map(|actual| raw_json_eq_value(actual, expected))
+                    .unwrap_or(false),
+                _ => false,
+            },
+            Self::JsonPathContains {
+                column_index,
+                path,
+                expected,
+            } => match row.get(*column_index) {
+                Some(Value::Jsonb(jsonb)) => path
+                    .extract(&jsonb.0)
+                    .map(|actual| raw_json_contains_value(actual, expected))
+                    .unwrap_or(false),
+                _ => false,
+            },
+            Self::JsonPathExists { column_index, path } => match row.get(*column_index) {
+                Some(Value::Jsonb(jsonb)) => path.extract(&jsonb.0).is_some(),
+                _ => false,
+            },
+            Self::And(left, right) => left.eval_row(row) && right.eval_row(row),
+            Self::Or(left, right) => left.eval_row(row) || right.eval_row(row),
+            Self::Not(inner) => !inner.eval_row(row),
+            Self::Generic(expr) => matches!(eval_expr(expr, row), Value::Boolean(true)),
+        }
+    }
+
+    fn eval_trace(&self, arena: &TraceTupleArena, handle: &TraceTupleHandle) -> bool {
         match self {
             Self::JsonPathEq {
                 column_index,
@@ -795,7 +855,19 @@ impl CompiledTracePredicate {
                     return false;
                 };
                 path.extract(&jsonb.0)
-                    .map(|actual| trace_json_raw_eq_value(actual, expected))
+                    .map(|actual| raw_json_eq_value(actual, expected))
+                    .unwrap_or(false)
+            }
+            Self::JsonPathContains {
+                column_index,
+                path,
+                expected,
+            } => {
+                let Some(Value::Jsonb(jsonb)) = arena.value_at(handle, *column_index) else {
+                    return false;
+                };
+                path.extract(&jsonb.0)
+                    .map(|actual| raw_json_contains_value(actual, expected))
                     .unwrap_or(false)
             }
             Self::JsonPathExists { column_index, path } => {
@@ -804,45 +876,19 @@ impl CompiledTracePredicate {
                 };
                 path.extract(&jsonb.0).is_some()
             }
-            Self::And(left, right) => left.eval(arena, handle) && right.eval(arena, handle),
-            Self::Or(left, right) => left.eval(arena, handle) || right.eval(arena, handle),
-            Self::Not(inner) => !inner.eval(arena, handle),
+            Self::And(left, right) => {
+                left.eval_trace(arena, handle) && right.eval_trace(arena, handle)
+            }
+            Self::Or(left, right) => {
+                left.eval_trace(arena, handle) || right.eval_trace(arena, handle)
+            }
+            Self::Not(inner) => !inner.eval_trace(arena, handle),
             Self::Generic(expr) => {
                 let mut value_at = |index: usize| arena.value_at(handle, index);
                 matches!(eval_expr_with(expr, &mut value_at), Value::Boolean(true))
             }
         }
     }
-}
-
-fn trace_json_raw_eq_value(raw: &[u8], expected: &Value) -> bool {
-    let raw = trim_json_bytes(raw);
-    match expected {
-        Value::Null => raw == b"null",
-        Value::Boolean(value) => {
-            let expected = if *value {
-                b"true".as_slice()
-            } else {
-                b"false".as_slice()
-            };
-            raw == expected
-        }
-        Value::Int32(value) => trace_json_raw_number_eq(raw, *value as f64),
-        Value::Int64(value) => trace_json_raw_number_eq(raw, *value as f64),
-        Value::Float64(value) => trace_json_raw_number_eq(raw, *value),
-        Value::String(value) => decode_json_string_literal(raw)
-            .map(|actual| actual == *value)
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn trace_json_raw_number_eq(raw: &[u8], expected: f64) -> bool {
-    core::str::from_utf8(raw)
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .map(|actual| (actual - expected).abs() < f64::EPSILON)
-        .unwrap_or(false)
 }
 
 /// Evaluates an expression against a row.
@@ -1008,6 +1054,14 @@ fn eval_function(name: &str, args: &[Value]) -> Value {
 }
 
 fn jsonb_path_eq(jsonb: &cynos_core::JsonbValue, path: &str, expected: &Value) -> Value {
+    if let Some(path) = SimpleJsonPath::parse(path) {
+        return Value::Boolean(
+            path.extract(&jsonb.0)
+                .map(|actual| raw_json_eq_value(actual, expected))
+                .unwrap_or(false),
+        );
+    }
+
     let json_value = match parse_json_bytes(&jsonb.0) {
         Some(value) => value,
         None => return Value::Boolean(false),
@@ -1025,6 +1079,10 @@ fn jsonb_path_eq(jsonb: &cynos_core::JsonbValue, path: &str, expected: &Value) -
 }
 
 fn jsonb_path_exists(jsonb: &cynos_core::JsonbValue, path: &str) -> Value {
+    if let Some(path) = SimpleJsonPath::parse(path) {
+        return Value::Boolean(path.extract(&jsonb.0).is_some());
+    }
+
     let json_value = match parse_json_bytes(&jsonb.0) {
         Some(value) => value,
         None => return Value::Boolean(false),
@@ -1039,6 +1097,14 @@ fn jsonb_path_exists(jsonb: &cynos_core::JsonbValue, path: &str) -> Value {
 }
 
 fn jsonb_contains(jsonb: &cynos_core::JsonbValue, path: &str, expected: &Value) -> Value {
+    if let Some(path) = SimpleJsonPath::parse(path) {
+        return Value::Boolean(
+            path.extract(&jsonb.0)
+                .map(|actual| raw_json_contains_value(actual, expected))
+                .unwrap_or(false),
+        );
+    }
+
     let json_value = match parse_json_bytes(&jsonb.0) {
         Some(value) => value,
         None => return Value::Boolean(false),
@@ -2100,7 +2166,7 @@ mod tests {
                 Value::String("high".into()),
             ),
         );
-        let compiled = CompiledTracePredicate::compile(&expr);
+        let compiled = CompiledDataflowPredicate::compile(&expr);
         let arena = TraceTupleArena::default();
 
         let matching = arena.owned(Row::new(
@@ -2128,9 +2194,9 @@ mod tests {
             ],
         ));
 
-        assert!(compiled.eval(&arena, &matching));
-        assert!(!compiled.eval(&arena, &low_score));
-        assert!(!compiled.eval(&arena, &different_bucket));
+        assert!(compiled.eval_trace(&arena, &matching));
+        assert!(!compiled.eval_trace(&arena, &low_score));
+        assert!(!compiled.eval_trace(&arena, &different_bucket));
     }
 
     #[test]
@@ -2142,7 +2208,7 @@ mod tests {
                 Expr::literal("$.risk.history[1]"),
             ],
         };
-        let compiled = CompiledTracePredicate::compile(&expr);
+        let compiled = CompiledDataflowPredicate::compile(&expr);
         let arena = TraceTupleArena::default();
 
         let matching = arena.owned(Row::new(
@@ -2154,8 +2220,32 @@ mod tests {
             vec![jsonb_value(r#"{"risk":{"history":["low"]}}"#)],
         ));
 
-        assert!(compiled.eval(&arena, &matching));
-        assert!(!compiled.eval(&arena, &missing));
+        assert!(compiled.eval_trace(&arena, &matching));
+        assert!(!compiled.eval_trace(&arena, &missing));
+    }
+
+    #[test]
+    fn test_compiled_json_contains_is_shared_by_row_and_trace_predicates() {
+        let expr = Expr::jsonb_contains(
+            Expr::column("projects", "metadata", 0),
+            "$.risk.label",
+            Value::String("priority".into()),
+        );
+        let compiled = CompiledDataflowPredicate::compile(&expr);
+        let arena = TraceTupleArena::default();
+
+        let matching_row = Row::new(
+            1,
+            vec![jsonb_value(r#"{"risk":{"label":"high-priority"}}"#)],
+        );
+        let different_row = Row::new(2, vec![jsonb_value(r#"{"risk":{"label":"normal"}}"#)]);
+        let matching = arena.owned(matching_row.clone());
+        let different = arena.owned(different_row.clone());
+
+        assert!(compiled.eval_row(&matching_row));
+        assert!(!compiled.eval_row(&different_row));
+        assert!(compiled.eval_trace(&arena, &matching));
+        assert!(!compiled.eval_trace(&arena, &different));
     }
 
     #[test]
@@ -2165,7 +2255,7 @@ mod tests {
             "$.risk.label",
             Value::String("hi\nthere".into()),
         );
-        let compiled = CompiledTracePredicate::compile(&expr);
+        let compiled = CompiledDataflowPredicate::compile(&expr);
         let arena = TraceTupleArena::default();
 
         let matching = arena.owned(Row::new(
@@ -2177,8 +2267,8 @@ mod tests {
             vec![jsonb_value(r#"{"risk":{"label":"hi there"}}"#)],
         ));
 
-        assert!(compiled.eval(&arena, &matching));
-        assert!(!compiled.eval(&arena, &different));
+        assert!(compiled.eval_trace(&arena, &matching));
+        assert!(!compiled.eval_trace(&arena, &different));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use cynos_core::{join_row_id, left_join_null_row_id, right_join_null_row_id, Row, Value};
 use cynos_index::KeyRange;
+use cynos_jsonb::path::{raw_json_contains_value, raw_json_eq_value, SimpleJsonPath};
 use cynos_jsonb::{JsonPath, JsonbObject, JsonbValue};
 
 // ========== TopN Heap Entry ==========
@@ -865,7 +866,7 @@ enum CompiledRowPredicate {
 #[derive(Clone, Debug, PartialEq)]
 struct CompiledJsonPredicate {
     column_index: usize,
-    path: CompiledJsonPath,
+    path: SimpleJsonPath,
     kind: CompiledJsonPredicateKind,
 }
 
@@ -874,17 +875,6 @@ enum CompiledJsonPredicateKind {
     Eq(Value),
     Contains(Value),
     Exists,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct CompiledJsonPath {
-    segments: Vec<CompiledJsonPathSegment>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum CompiledJsonPathSegment {
-    Field(String),
-    Index(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -4515,40 +4505,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         }
     }
 
-    fn compile_json_path(path: &str) -> Option<CompiledJsonPath> {
-        let parsed = JsonPath::parse(path).ok()?;
-        let mut segments = Vec::new();
-        if !Self::collect_compiled_json_path_segments(&parsed, &mut segments) {
-            return None;
-        }
-        Some(CompiledJsonPath { segments })
-    }
-
-    fn collect_compiled_json_path_segments(
-        path: &JsonPath,
-        segments: &mut Vec<CompiledJsonPathSegment>,
-    ) -> bool {
-        match path {
-            JsonPath::Root => true,
-            JsonPath::Field(parent, field) => {
-                if !Self::collect_compiled_json_path_segments(parent, segments) {
-                    return false;
-                }
-                segments.push(CompiledJsonPathSegment::Field(field.clone()));
-                true
-            }
-            JsonPath::Index(parent, index) => {
-                if !Self::collect_compiled_json_path_segments(parent, segments) {
-                    return false;
-                }
-                segments.push(CompiledJsonPathSegment::Index(*index));
-                true
-            }
-            JsonPath::Slice(_, _, _)
-            | JsonPath::RecursiveField(_, _)
-            | JsonPath::Wildcard(_)
-            | JsonPath::Filter(_, _) => false,
-        }
+    fn compile_json_path(path: &str) -> Option<SimpleJsonPath> {
+        SimpleJsonPath::parse(path)
     }
 
     fn push_compiled_logical_terms(
@@ -5060,9 +5018,9 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         };
 
         let matched = match &predicate.kind {
-            CompiledJsonPredicateKind::Eq(expected) => self.json_raw_eq_value(actual, expected),
+            CompiledJsonPredicateKind::Eq(expected) => raw_json_eq_value(actual, expected),
             CompiledJsonPredicateKind::Contains(expected) => {
-                self.json_raw_contains_value(actual, expected)
+                raw_json_contains_value(actual, expected)
             }
             CompiledJsonPredicateKind::Exists => true,
         };
@@ -5072,273 +5030,9 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
 
     fn json_extract_path_bytes<'json>(
         jsonb: &'json cynos_core::JsonbValue,
-        path: &CompiledJsonPath,
+        path: &SimpleJsonPath,
     ) -> Option<&'json [u8]> {
-        Self::json_extract_path_raw(&jsonb.0, path)
-    }
-
-    fn json_extract_path_raw<'json>(
-        input: &'json [u8],
-        path: &CompiledJsonPath,
-    ) -> Option<&'json [u8]> {
-        let mut current = Self::trim_json_bytes(input);
-        for segment in &path.segments {
-            current = match segment {
-                CompiledJsonPathSegment::Field(field) => Self::json_extract_field(current, field)?,
-                CompiledJsonPathSegment::Index(index) => Self::json_extract_index(current, *index)?,
-            };
-        }
-        Some(Self::trim_json_bytes(current))
-    }
-
-    fn json_extract_field<'json>(object: &'json [u8], field: &str) -> Option<&'json [u8]> {
-        let bytes = Self::trim_json_bytes(object);
-        if bytes.first() != Some(&b'{') || bytes.last() != Some(&b'}') {
-            return None;
-        }
-
-        let mut pos = 1usize;
-        loop {
-            pos = Self::skip_json_ws(bytes, pos);
-            match bytes.get(pos) {
-                Some(b'}') => return None,
-                Some(b'"') => {}
-                _ => return None,
-            }
-
-            let key_end = Self::scan_json_string_end(bytes, pos)?;
-            let key = Self::decode_json_string(&bytes[pos..key_end])?;
-
-            pos = Self::skip_json_ws(bytes, key_end);
-            if bytes.get(pos) != Some(&b':') {
-                return None;
-            }
-
-            pos = Self::skip_json_ws(bytes, pos + 1);
-            let value_start = pos;
-            let value_end = Self::scan_json_value_end(bytes, value_start)?;
-            if key == field {
-                return Some(Self::trim_json_bytes(&bytes[value_start..value_end]));
-            }
-
-            pos = Self::skip_json_ws(bytes, value_end);
-            match bytes.get(pos) {
-                Some(b',') => pos += 1,
-                Some(b'}') => return None,
-                _ => return None,
-            }
-        }
-    }
-
-    fn json_extract_index<'json>(array: &'json [u8], target_index: usize) -> Option<&'json [u8]> {
-        let bytes = Self::trim_json_bytes(array);
-        if bytes.first() != Some(&b'[') || bytes.last() != Some(&b']') {
-            return None;
-        }
-
-        let mut pos = 1usize;
-        let mut current_index = 0usize;
-        loop {
-            pos = Self::skip_json_ws(bytes, pos);
-            match bytes.get(pos) {
-                Some(b']') => return None,
-                Some(_) => {}
-                None => return None,
-            }
-
-            let value_start = pos;
-            let value_end = Self::scan_json_value_end(bytes, value_start)?;
-            if current_index == target_index {
-                return Some(Self::trim_json_bytes(&bytes[value_start..value_end]));
-            }
-
-            current_index += 1;
-            pos = Self::skip_json_ws(bytes, value_end);
-            match bytes.get(pos) {
-                Some(b',') => pos += 1,
-                Some(b']') => return None,
-                _ => return None,
-            }
-        }
-    }
-
-    #[inline]
-    fn trim_json_bytes(bytes: &[u8]) -> &[u8] {
-        let mut start = 0usize;
-        let mut end = bytes.len();
-        while start < end && bytes[start].is_ascii_whitespace() {
-            start += 1;
-        }
-        while end > start && bytes[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-        &bytes[start..end]
-    }
-
-    #[inline]
-    fn skip_json_ws(bytes: &[u8], mut pos: usize) -> usize {
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        pos
-    }
-
-    fn scan_json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
-        if bytes.get(start) != Some(&b'"') {
-            return None;
-        }
-
-        let mut pos = start + 1;
-        let mut escaped = false;
-        while pos < bytes.len() {
-            let byte = bytes[pos];
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                return Some(pos + 1);
-            }
-            pos += 1;
-        }
-
-        None
-    }
-
-    fn scan_json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
-        let start = Self::skip_json_ws(bytes, start);
-        match bytes.get(start) {
-            Some(b'"') => Self::scan_json_string_end(bytes, start),
-            Some(b'{') | Some(b'[') => Self::scan_json_composite_end(bytes, start),
-            Some(_) => {
-                let mut pos = start;
-                while pos < bytes.len() {
-                    match bytes[pos] {
-                        b',' | b']' | b'}' => break,
-                        _ => pos += 1,
-                    }
-                }
-                Some(pos)
-            }
-            None => None,
-        }
-    }
-
-    fn scan_json_composite_end(bytes: &[u8], start: usize) -> Option<usize> {
-        let mut depth = 0usize;
-        let mut in_string = false;
-        let mut escaped = false;
-
-        for (offset, byte) in bytes[start..].iter().copied().enumerate() {
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'"' {
-                    in_string = false;
-                }
-                continue;
-            }
-
-            match byte {
-                b'"' => in_string = true,
-                b'{' | b'[' => depth += 1,
-                b'}' | b']' => {
-                    if depth == 0 {
-                        return None;
-                    }
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(start + offset + 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        None
-    }
-
-    fn decode_json_string(bytes: &[u8]) -> Option<String> {
-        let bytes = Self::trim_json_bytes(bytes);
-        if bytes.len() < 2 || bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') {
-            return None;
-        }
-
-        let inner = core::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()?;
-        let mut result = String::new();
-        let mut chars = inner.chars();
-        while let Some(ch) = chars.next() {
-            if ch != '\\' {
-                result.push(ch);
-                continue;
-            }
-
-            match chars.next()? {
-                '"' => result.push('"'),
-                '\\' => result.push('\\'),
-                '/' => result.push('/'),
-                'n' => result.push('\n'),
-                'r' => result.push('\r'),
-                't' => result.push('\t'),
-                _ => return None,
-            }
-        }
-
-        Some(result)
-    }
-
-    fn json_raw_eq_value(&self, raw: &[u8], expected: &Value) -> bool {
-        let raw = Self::trim_json_bytes(raw);
-        match expected {
-            Value::Null => raw == b"null",
-            Value::Boolean(value) => {
-                let expected = if *value {
-                    b"true".as_slice()
-                } else {
-                    b"false".as_slice()
-                };
-                raw == expected
-            }
-            Value::Int32(value) => core::str::from_utf8(raw)
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(|actual| (actual - *value as f64).abs() < f64::EPSILON)
-                .unwrap_or(false),
-            Value::Int64(value) => core::str::from_utf8(raw)
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(|actual| (actual - *value as f64).abs() < f64::EPSILON)
-                .unwrap_or(false),
-            Value::Float64(value) => core::str::from_utf8(raw)
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(|actual| (actual - *value).abs() < f64::EPSILON)
-                .unwrap_or(false),
-            Value::String(value) => Self::decode_json_string(raw)
-                .map(|actual| actual == *value)
-                .unwrap_or(false),
-            _ => false,
-        }
-    }
-
-    fn json_raw_contains_value(&self, raw: &[u8], expected: &Value) -> bool {
-        match expected {
-            Value::String(needle) => {
-                let raw = Self::trim_json_bytes(raw);
-                if raw.first() == Some(&b'"') {
-                    return Self::decode_json_string(raw)
-                        .map(|actual| actual.contains(needle.as_str()))
-                        .unwrap_or(false);
-                }
-
-                core::str::from_utf8(raw)
-                    .map(|actual| actual.contains(needle.as_str()))
-                    .unwrap_or(false)
-            }
-            _ => self.json_raw_eq_value(raw, expected),
-        }
+        path.extract(&jsonb.0)
     }
 
     #[inline]
@@ -7468,6 +7162,14 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
 
     /// Evaluates a JSONB path equality expression.
     fn jsonb_path_eq(&self, jsonb: &cynos_core::JsonbValue, path: &str, expected: &Value) -> Value {
+        if let Some(path) = SimpleJsonPath::parse(path) {
+            return Value::Boolean(
+                path.extract(&jsonb.0)
+                    .map(|actual| raw_json_eq_value(actual, expected))
+                    .unwrap_or(false),
+            );
+        }
+
         // Parse the JSON string bytes to JsonbValue
         let json_value = match self.parse_json_bytes(&jsonb.0) {
             Some(v) => v,
@@ -7493,6 +7195,10 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
 
     /// Checks if a JSONB path exists.
     fn jsonb_path_exists(&self, jsonb: &cynos_core::JsonbValue, path: &str) -> Value {
+        if let Some(path) = SimpleJsonPath::parse(path) {
+            return Value::Boolean(path.extract(&jsonb.0).is_some());
+        }
+
         // Parse the JSON string bytes to JsonbValue
         let json_value = match self.parse_json_bytes(&jsonb.0) {
             Some(v) => v,
@@ -7517,6 +7223,14 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         path: &str,
         expected: &Value,
     ) -> Value {
+        if let Some(path) = SimpleJsonPath::parse(path) {
+            return Value::Boolean(
+                path.extract(&jsonb.0)
+                    .map(|actual| raw_json_contains_value(actual, expected))
+                    .unwrap_or(false),
+            );
+        }
+
         let json_value = match self.parse_json_bytes(&jsonb.0) {
             Some(v) => v,
             None => return Value::Boolean(false),
@@ -8749,11 +8463,12 @@ mod tests {
                 assert_eq!(column_index, 2);
                 assert_eq!(expected, "portable");
                 assert_eq!(
-                    path.segments,
+                    path.segments(),
                     alloc::vec![
-                        CompiledJsonPathSegment::Field("tags".into()),
-                        CompiledJsonPathSegment::Index(0),
+                        cynos_jsonb::path::SimpleJsonPathSegment::Field("tags".into()),
+                        cynos_jsonb::path::SimpleJsonPathSegment::Index(0),
                     ]
+                    .as_slice()
                 );
             }
             other => panic!("expected compiled JSON kernel, got {other:?}"),

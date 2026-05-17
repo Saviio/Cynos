@@ -8,6 +8,7 @@
 use crate::path::parser::JsonPath;
 use alloc::string::String;
 use alloc::vec::Vec;
+use cynos_core::Value;
 
 /// A JSONPath subset that can be evaluated by scanning JSON text directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +45,64 @@ impl SimpleJsonPath {
     pub fn extract<'json>(&self, json: &'json [u8]) -> Option<&'json [u8]> {
         extract_simple_json_path(json, self)
     }
+}
+
+/// Compares a raw JSON value slice with a scalar Cynos value.
+///
+/// This helper is deliberately limited to scalar equality. Composite JSON
+/// values should keep using the full JSONB evaluator so object/array semantics
+/// remain centralized in the normal JSONB layer.
+pub fn raw_json_eq_value(raw: &[u8], expected: &Value) -> bool {
+    let raw = trim_json_bytes(raw);
+    match expected {
+        Value::Null => raw == b"null",
+        Value::Boolean(value) => {
+            let expected = if *value {
+                b"true".as_slice()
+            } else {
+                b"false".as_slice()
+            };
+            raw == expected
+        }
+        Value::Int32(value) => raw_json_number_eq(raw, *value as f64),
+        Value::Int64(value) => raw_json_number_eq(raw, *value as f64),
+        Value::Float64(value) => raw_json_number_eq(raw, *value),
+        Value::String(value) => decode_json_string_literal(raw)
+            .map(|actual| actual == *value)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Evaluates the scalar subset of JSONB contains on a raw JSON value slice.
+///
+/// For string needles this preserves the existing query semantics: string JSON
+/// values are decoded before substring matching, while non-string JSON slices
+/// fall back to textual containment.
+pub fn raw_json_contains_value(raw: &[u8], expected: &Value) -> bool {
+    match expected {
+        Value::String(needle) => {
+            let raw = trim_json_bytes(raw);
+            if raw.first() == Some(&b'"') {
+                return decode_json_string_literal(raw)
+                    .map(|actual| actual.contains(needle.as_str()))
+                    .unwrap_or(false);
+            }
+
+            core::str::from_utf8(raw)
+                .map(|actual| actual.contains(needle.as_str()))
+                .unwrap_or(false)
+        }
+        _ => raw_json_eq_value(raw, expected),
+    }
+}
+
+fn raw_json_number_eq(raw: &[u8], expected: f64) -> bool {
+    core::str::from_utf8(raw)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|actual| (actual - expected).abs() < f64::EPSILON)
+        .unwrap_or(false)
 }
 
 fn collect_simple_json_path_segments(
@@ -351,5 +410,19 @@ mod tests {
         assert!(SimpleJsonPath::parse("$..name").is_none());
         assert!(SimpleJsonPath::parse("$.items[*]").is_none());
         assert!(SimpleJsonPath::parse("$.items[0:2]").is_none());
+    }
+
+    #[test]
+    fn compares_raw_scalar_values_without_full_parse() {
+        assert!(raw_json_eq_value(
+            br#" "enterprise" "#,
+            &Value::String("enterprise".into())
+        ));
+        assert!(raw_json_eq_value(b"42", &Value::Int64(42)));
+        assert!(raw_json_eq_value(b"true", &Value::Boolean(true)));
+        assert!(raw_json_contains_value(
+            br#""high-priority""#,
+            &Value::String("priority".into())
+        ));
     }
 }
