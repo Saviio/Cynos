@@ -14,7 +14,7 @@
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
 use crate::convert::{
     gql_response_to_js_with_cache, gql_response_to_js_with_root_list_patch, prune_jsonb_js_cache,
-    value_to_js, GraphqlJsEncodeCache, GraphqlRootListJsCache, JsonbJsCachePolicy,
+    value_to_js, GraphqlJsCachePolicy, GraphqlJsEncodeCache, GraphqlRootListJsCache,
 };
 use crate::live_runtime::{
     RowsSnapshotDependencyGraph, RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey,
@@ -2976,6 +2976,7 @@ impl JsSnapshotRowsMaterializer {
         }
 
         cache.rows.retain(|_, entry| entry.epoch == epoch);
+        cache.prune_rows_if_needed();
         arr.into()
     }
 
@@ -3046,6 +3047,7 @@ impl JsSnapshotRowsCache {
                 value: value.clone(),
             },
         );
+        self.prune_rows_if_needed();
         value
     }
 
@@ -3074,8 +3076,50 @@ impl JsSnapshotRowsCache {
         prune_jsonb_js_cache(
             &mut self.jsonb_cache,
             &mut self.jsonb_cache_bytes,
-            JsonbJsCachePolicy::DEFAULT,
+            GraphqlJsCachePolicy::DEFAULT.jsonb(),
         );
+    }
+
+    fn prune_rows_if_needed(&mut self) {
+        let (max_entries, target_entries) = GraphqlJsCachePolicy::DEFAULT.snapshot_row_limits();
+        self.prune_rows_with_limits(max_entries, target_entries);
+    }
+
+    fn prune_rows_with_limits(&mut self, max_entries: usize, target_entries: usize) {
+        if self.rows.len() <= max_entries {
+            return;
+        }
+
+        let target_entries = target_entries.min(max_entries);
+        let current_epoch = self.epoch;
+        let mut projected_len = self.rows.len();
+        let mut keys_to_remove = Vec::new();
+
+        for (&row_id, entry) in self.rows.iter() {
+            if projected_len <= target_entries {
+                break;
+            }
+            if entry.epoch == current_epoch {
+                continue;
+            }
+            projected_len = projected_len.saturating_sub(1);
+            keys_to_remove.push(row_id);
+        }
+
+        for (&row_id, entry) in self.rows.iter() {
+            if projected_len <= target_entries {
+                break;
+            }
+            if entry.epoch != current_epoch {
+                continue;
+            }
+            projected_len = projected_len.saturating_sub(1);
+            keys_to_remove.push(row_id);
+        }
+
+        for row_id in keys_to_remove {
+            self.rows.remove(&row_id);
+        }
     }
 }
 
@@ -3678,7 +3722,7 @@ mod tests {
     #[test]
     fn test_snapshot_rows_cache_prunes_jsonb_entries_incrementally() {
         let mut cache = JsSnapshotRowsCache::default();
-        let policy = JsonbJsCachePolicy::DEFAULT;
+        let policy = crate::convert::JsonbJsCachePolicy::DEFAULT;
         for index in 0..policy.target_entries() + 2_112 {
             let mut key = alloc::vec![(index % 251) as u8; 1024];
             key.extend_from_slice(&(index as u64).to_le_bytes());
@@ -3690,6 +3734,29 @@ mod tests {
 
         assert!(cache.jsonb_cache.len() <= policy.target_entries());
         assert!(cache.jsonb_cache_bytes <= policy.target_bytes());
+    }
+
+    #[test]
+    fn test_snapshot_rows_cache_prunes_stale_rows_before_current_epoch() {
+        let mut cache = JsSnapshotRowsCache {
+            epoch: 7,
+            ..JsSnapshotRowsCache::default()
+        };
+        for row_id in 0..4u64 {
+            cache.rows.insert(
+                row_id,
+                CachedSnapshotRowJs {
+                    version: 1,
+                    epoch: if row_id == 0 { 7 } else { 6 },
+                    value: JsValue::NULL,
+                },
+            );
+        }
+
+        cache.prune_rows_with_limits(3, 2);
+
+        assert!(cache.rows.len() <= 2);
+        assert!(cache.rows.contains_key(&0));
     }
 
     #[test]

@@ -81,22 +81,53 @@ pub(crate) fn prune_jsonb_js_cache(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GraphqlJsEncodeCachePolicy {
+pub(crate) struct GraphqlJsCachePolicy {
     shared_max_entries: usize,
     shared_target_entries: usize,
     field_key_max_entries: usize,
     field_key_target_entries: usize,
+    snapshot_row_max_entries: usize,
+    snapshot_row_target_entries: usize,
     jsonb: JsonbJsCachePolicy,
 }
 
-impl GraphqlJsEncodeCachePolicy {
-    const DEFAULT: Self = Self {
+impl GraphqlJsCachePolicy {
+    pub(crate) const DEFAULT: Self = Self {
         shared_max_entries: 65_536,
         shared_target_entries: 49_152,
         field_key_max_entries: 4_096,
         field_key_target_entries: 3_072,
+        snapshot_row_max_entries: 65_536,
+        snapshot_row_target_entries: 49_152,
         jsonb: JsonbJsCachePolicy::DEFAULT,
     };
+
+    pub(crate) fn shared_entry_limits(self) -> (usize, usize) {
+        (
+            self.shared_max_entries,
+            self.shared_target_entries.min(self.shared_max_entries),
+        )
+    }
+
+    pub(crate) fn field_key_limits(self) -> (usize, usize) {
+        (
+            self.field_key_max_entries,
+            self.field_key_target_entries
+                .min(self.field_key_max_entries),
+        )
+    }
+
+    pub(crate) fn snapshot_row_limits(self) -> (usize, usize) {
+        (
+            self.snapshot_row_max_entries,
+            self.snapshot_row_target_entries
+                .min(self.snapshot_row_max_entries),
+        )
+    }
+
+    pub(crate) fn jsonb(self) -> JsonbJsCachePolicy {
+        self.jsonb
+    }
 }
 
 struct GraphqlSharedJsCacheEntry<T> {
@@ -121,19 +152,15 @@ pub(crate) struct GraphqlRootListJsCache {
 
 impl GraphqlJsEncodeCache {
     fn maybe_prune(&mut self) {
-        self.maybe_prune_with_policy(GraphqlJsEncodeCachePolicy::DEFAULT);
+        self.maybe_prune_with_policy(GraphqlJsCachePolicy::DEFAULT);
     }
 
-    fn maybe_prune_with_policy(&mut self, policy: GraphqlJsEncodeCachePolicy) {
-        self.maybe_prune_shared_with_limits(
-            policy.shared_max_entries,
-            policy.shared_target_entries,
-        );
-        self.maybe_prune_field_keys_with_limits(
-            policy.field_key_max_entries,
-            policy.field_key_target_entries,
-        );
-        self.maybe_prune_jsonb_with_policy(policy.jsonb);
+    fn maybe_prune_with_policy(&mut self, policy: GraphqlJsCachePolicy) {
+        let (shared_max, shared_target) = policy.shared_entry_limits();
+        self.maybe_prune_shared_with_limits(shared_max, shared_target);
+        let (field_key_max, field_key_target) = policy.field_key_limits();
+        self.maybe_prune_field_keys_with_limits(field_key_max, field_key_target);
+        self.maybe_prune_jsonb_with_policy(policy.jsonb());
     }
 
     fn maybe_prune_shared_with_limits(&mut self, max_entries: usize, target_entries: usize) {
@@ -185,7 +212,12 @@ impl GraphqlJsEncodeCache {
     }
 
     fn evict_object_entries(&mut self, count: usize) {
-        let keys: Vec<_> = self.object_cache.keys().take(count.max(1)).copied().collect();
+        let keys: Vec<_> = self
+            .object_cache
+            .keys()
+            .take(count.max(1))
+            .copied()
+            .collect();
         for key in keys {
             self.object_cache.remove(&key);
         }
@@ -602,7 +634,11 @@ pub(crate) fn gql_response_to_js_with_root_list_patch(
         return gql_response_to_js_with_cache(response, cache);
     };
 
-    let array = match (root_list_cache.list_len, root_list_cache.array.as_ref(), patch) {
+    let array = match (
+        root_list_cache.list_len,
+        root_list_cache.array.as_ref(),
+        patch,
+    ) {
         (
             Some(previous_len),
             Some(previous_array),

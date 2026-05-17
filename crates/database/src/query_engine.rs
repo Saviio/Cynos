@@ -1703,9 +1703,7 @@ pub fn execute_compiled_physical_plan_with_summary_on_table_subset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot_refresh_policy::{
-        AccessPathLocality, RootSubsetDecisionReason, SnapshotRefreshCostHints,
-    };
+    use crate::snapshot_refresh_policy::{RootSubsetDecisionReason, SnapshotRefreshCostHints};
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Row, Value};
     use cynos_query::ast::Expr as AstExpr;
@@ -1973,20 +1971,26 @@ mod tests {
     fn test_choose_root_subset_plan_variant_uses_shared_thresholds() {
         let cost_model = SnapshotRefreshCostModel::DEFAULT;
         assert_eq!(
-            cost_model.decide_root_subset_refresh(64, 10_000).variant,
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(64, 10_000))
+                .variant,
             RootSubsetPlanVariant::Small
         );
         assert_eq!(
-            cost_model.decide_root_subset_refresh(2_500, 10_000).variant,
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(2_500, 10_000))
+                .variant,
             RootSubsetPlanVariant::Small
         );
         assert_eq!(
-            cost_model.decide_root_subset_refresh(8_193, 10_000).variant,
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(8_193, 10_000))
+                .variant,
             RootSubsetPlanVariant::Large
         );
         assert_eq!(
             cost_model
-                .decide_root_subset_refresh(10_000, 30_000)
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(10_000, 30_000))
                 .variant,
             RootSubsetPlanVariant::Large
         );
@@ -1996,25 +2000,37 @@ mod tests {
     fn test_snapshot_refresh_cost_policies_preserve_cutoffs() {
         let cost_model = SnapshotRefreshCostModel::DEFAULT;
         assert_eq!(
-            cost_model.decide_root_subset_refresh(8_192, 10_000).variant,
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(8_192, 10_000))
+                .variant,
             RootSubsetPlanVariant::Small
         );
         assert_eq!(
-            cost_model.decide_root_subset_refresh(8_193, 10_000).variant,
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(8_193, 10_000))
+                .variant,
             RootSubsetPlanVariant::Large
         );
         assert_eq!(
-            cost_model.decide_root_subset_refresh(9_000, 40_000).reason,
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(9_000, 40_000))
+                .reason,
             RootSubsetDecisionReason::WithinSubsetFractionCeiling
         );
         assert_eq!(
             cost_model
-                .root_subset_planning_decision(RootSubsetPlanVariant::Small, 4_096)
+                .root_subset_planning_decision_for(RootSubsetPlanningCostInput::new(
+                    RootSubsetPlanVariant::Small,
+                    4_096
+                ))
                 .map(|decision| decision.effective_subset_rows),
             Some(1_024)
         );
         assert_eq!(
-            cost_model.root_subset_planning_decision(RootSubsetPlanVariant::Large, 0),
+            cost_model.root_subset_planning_decision_for(RootSubsetPlanningCostInput::new(
+                RootSubsetPlanVariant::Large,
+                0
+            )),
             None
         );
 
@@ -2032,26 +2048,24 @@ mod tests {
     #[test]
     fn test_snapshot_refresh_cost_inputs_preserve_current_behavior() {
         let cost_model = SnapshotRefreshCostModel::DEFAULT;
-        let _locality_variants = [
-            AccessPathLocality::Sequential,
-            AccessPathLocality::Clustered,
-            AccessPathLocality::Scattered,
-        ];
         let future_hints = SnapshotRefreshCostHints {
             estimated_row_width_bytes: Some(512),
             estimated_join_fanout: Some(3.5),
             estimated_index_selectivity: Some(0.08),
-            access_path_locality: Some(AccessPathLocality::Clustered),
+            estimated_access_path_locality: Some(0.75),
         };
 
-        let refresh_input = RootSubsetRefreshCostInput::new(8_193, 10_000).with_hints(future_hints);
+        let refresh_input = RootSubsetRefreshCostInput {
+            hints: future_hints,
+            ..RootSubsetRefreshCostInput::new(8_193, 10_000)
+        };
         let refresh_decision = cost_model.decide_root_subset_refresh_for(refresh_input);
         assert_eq!(
             refresh_decision,
-            cost_model.decide_root_subset_refresh(
+            cost_model.decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(
                 refresh_input.affected_row_count,
                 refresh_input.table_row_count
-            )
+            ))
         );
         assert_eq!(refresh_decision.variant, RootSubsetPlanVariant::Large);
         assert_eq!(
@@ -2059,8 +2073,10 @@ mod tests {
             RootSubsetDecisionReason::PreferIndexDrivenIntersect
         );
 
-        let planning_input = RootSubsetPlanningCostInput::new(RootSubsetPlanVariant::Small, 4_096)
-            .with_hints(future_hints);
+        let planning_input = RootSubsetPlanningCostInput {
+            hints: future_hints,
+            ..RootSubsetPlanningCostInput::new(RootSubsetPlanVariant::Small, 4_096)
+        };
         let planning_decision = cost_model
             .root_subset_planning_decision_for(planning_input)
             .expect("small root-subset planning decision");
@@ -2068,10 +2084,10 @@ mod tests {
         assert_eq!(
             planning_decision,
             cost_model
-                .root_subset_planning_decision(
+                .root_subset_planning_decision_for(RootSubsetPlanningCostInput::new(
                     planning_input.variant,
                     planning_input.table_row_count
-                )
+                ))
                 .expect("legacy planning decision")
         );
     }
