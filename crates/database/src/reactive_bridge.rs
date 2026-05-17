@@ -857,18 +857,28 @@ fn field_has_relations(field: &cynos_gql::bind::BoundField) -> bool {
 }
 
 fn build_snapshot_batch_invalidation(
+    plan: &cynos_gql::GraphqlBatchPlan,
     table_names: &HashMap<TableId, String>,
     changes: &HashMap<TableId, HashSet<u64>>,
+    delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
     root_changed: bool,
     dirty_root_rows: &HashSet<u64>,
 ) -> Result<cynos_gql::GraphqlInvalidation, ()> {
     let mut changed_tables = Vec::with_capacity(changes.len());
     let mut dirty_table_rows = HashMap::new();
+    let mut dirty_edge_keys = HashMap::new();
     for table_id in changes.keys() {
         let Some(table_name) = table_names.get(table_id) else {
             return Err(());
         };
-        changed_tables.push(table_name.clone());
+        let table_deltas = delta_changes.and_then(|changes| changes.get(table_id));
+        if let Some(deltas) = table_deltas.filter(|deltas| !deltas.is_empty()) {
+            collect_dirty_edge_keys_for_table_deltas(plan, table_name, deltas, &mut dirty_edge_keys);
+        } else {
+            // Without row deltas we cannot know which relation keys moved, so
+            // keep the coarse table-level invalidation as the safe fallback.
+            changed_tables.push(table_name.clone());
+        }
         if let Some(changed_ids) = changes.get(table_id) {
             dirty_table_rows.insert(table_name.clone(), changed_ids.clone());
         }
@@ -879,9 +889,46 @@ fn build_snapshot_batch_invalidation(
         dirty_root_rows: dirty_root_rows.clone(),
         stable_root_positions: false,
         changed_tables,
-        dirty_edge_keys: HashMap::new(),
+        dirty_edge_keys,
         dirty_table_rows,
     })
+}
+
+fn collect_dirty_edge_keys_for_table_deltas(
+    plan: &cynos_gql::GraphqlBatchPlan,
+    table_name: &str,
+    deltas: &[Delta<Row>],
+    dirty_edge_keys: &mut HashMap<cynos_gql::render_plan::EdgeId, HashSet<Value>>,
+) {
+    for edge_id in plan.edges_for_table(table_name) {
+        let edge = plan.edge(*edge_id);
+        let key_column_index = batch_edge_delta_key_column_index(edge);
+
+        let mut dirty_keys = HashSet::<Value>::new();
+        for delta in deltas {
+            let Some(value) = delta.data.get(key_column_index).cloned() else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            dirty_keys.insert(value);
+        }
+
+        if !dirty_keys.is_empty() {
+            dirty_edge_keys
+                .entry(*edge_id)
+                .or_insert_with(HashSet::new)
+                .extend(dirty_keys);
+        }
+    }
+}
+
+fn batch_edge_delta_key_column_index(edge: &cynos_gql::render_plan::RelationEdgePlan) -> usize {
+    match edge.kind {
+        cynos_gql::render_plan::RelationEdgeKind::Forward => edge.relation.parent_column_index,
+        cynos_gql::render_plan::RelationEdgeKind::Reverse => edge.relation.child_column_index,
+    }
 }
 
 fn build_delta_batch_invalidation(
@@ -905,28 +952,12 @@ fn build_delta_batch_invalidation(
         dirty_table_rows: HashMap::from([(table_name.clone(), dirty_row_ids)]),
     };
 
-    for edge_id in plan.edges_for_table(table_name) {
-        let edge = plan.edge(*edge_id);
-        let key_column_index = match edge.kind {
-            cynos_gql::render_plan::RelationEdgeKind::Forward => edge.relation.parent_column_index,
-            cynos_gql::render_plan::RelationEdgeKind::Reverse => edge.relation.child_column_index,
-        };
-
-        let mut dirty_keys = HashSet::<Value>::new();
-        for delta in deltas {
-            let Some(value) = delta.data.get(key_column_index).cloned() else {
-                continue;
-            };
-            if value.is_null() {
-                continue;
-            }
-            dirty_keys.insert(value);
-        }
-
-        if !dirty_keys.is_empty() {
-            invalidation.dirty_edge_keys.insert(*edge_id, dirty_keys);
-        }
-    }
+    collect_dirty_edge_keys_for_table_deltas(
+        plan,
+        table_name,
+        deltas,
+        &mut invalidation.dirty_edge_keys,
+    );
 
     Ok(invalidation)
 }
@@ -1728,8 +1759,10 @@ impl GraphqlSubscriptionObservable {
             #[cfg(feature = "benchmark")]
             let invalidation_started_at = now_ms();
             match build_snapshot_batch_invalidation(
+                plan,
                 &self.dependency_table_names,
                 changes,
+                delta_changes,
                 root_changed,
                 &dirty_root_rows,
             ) {
@@ -3233,6 +3266,8 @@ mod tests {
     use crate::query_engine::{compile_cached_plan, execute_compiled_physical_plan_with_summary};
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Value};
+    use cynos_gql::render_plan::compile_batch_plan;
+    use cynos_gql::{GraphqlCatalog, PreparedQuery};
     use cynos_query::ast::{Expr, SortOrder};
     use cynos_query::executor::{InMemoryDataSource, PhysicalPlanRunner};
     use cynos_query::planner::{LogicalPlan, PhysicalPlan};
@@ -3371,6 +3406,55 @@ mod tests {
                 ),
             ]),
         }
+    }
+
+    fn graphql_users_posts_batch_plan() -> (
+        cynos_gql::GraphqlBatchPlan,
+        HashMap<TableId, String>,
+    ) {
+        let mut cache = TableCache::new();
+        let users = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let posts = TableBuilder::new("posts")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("author_id", DataType::Int64)
+            .unwrap()
+            .add_column("title", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_foreign_key_with_graphql_names(
+                "fk_posts_author",
+                "author_id",
+                "users",
+                "id",
+                Some("author"),
+                Some("posts"),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        cache.create_table(users).unwrap();
+        cache.create_table(posts).unwrap();
+
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let prepared =
+            PreparedQuery::parse("subscription { users { id posts { id title } } }").unwrap();
+        let bound = prepared.bind(&catalog, None).unwrap();
+        let field = bound.fields.into_iter().next().unwrap();
+        let plan = compile_batch_plan(&catalog, &field).unwrap();
+        let table_names = HashMap::from([(1, "users".into()), (2, "posts".into())]);
+        (plan, table_names)
     }
 
     fn patch_test_observable() -> ReQueryObservable {
@@ -3847,6 +3931,56 @@ mod tests {
         assert_eq!(
             GraphqlPayloadChange::from_root_list_patch(Some(&splice_changed)).changed_hint(),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn test_snapshot_batch_invalidation_uses_delta_relation_keys() {
+        let (plan, table_names) = graphql_users_posts_batch_plan();
+        let old_post = Row::new(
+            10,
+            alloc::vec![
+                Value::Int64(10),
+                Value::Int64(1),
+                Value::String("old".into()),
+            ],
+        );
+        let new_post = Row::new(
+            10,
+            alloc::vec![
+                Value::Int64(10),
+                Value::Int64(2),
+                Value::String("new".into()),
+            ],
+        );
+        let changes = HashMap::from([(2, HashSet::from([10]))]);
+        let deltas = HashMap::from([(
+            2,
+            alloc::vec![Delta::delete(old_post), Delta::insert(new_post)],
+        )]);
+
+        let invalidation = build_snapshot_batch_invalidation(
+            &plan,
+            &table_names,
+            &changes,
+            Some(&deltas),
+            false,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let edge_id = *plan.edges_for_table("posts").first().unwrap();
+        assert!(
+            invalidation.changed_tables.is_empty(),
+            "delta-backed snapshot invalidation should not fall back to coarse edge clearing"
+        );
+        assert_eq!(
+            invalidation.dirty_edge_keys.get(&edge_id),
+            Some(&HashSet::from([Value::Int64(1), Value::Int64(2)]))
+        );
+        assert_eq!(
+            invalidation.dirty_table_rows.get("posts"),
+            Some(&HashSet::from([10]))
         );
     }
 
