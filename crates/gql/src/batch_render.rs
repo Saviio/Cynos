@@ -1147,6 +1147,9 @@ fn planner_batch_fetch(
     if let Some(buckets) = try_ordered_reverse_window_fetch(cache, edge, keys)? {
         return Ok(buckets);
     }
+    if let Some(buckets) = try_indexed_reverse_bounded_fetch(cache, edge, keys)? {
+        return Ok(buckets);
+    }
     let query = build_batch_query(table, edge, keys)?;
     let plan = build_table_query_plan(catalog, table_name, table, &query)?;
     let rows = execute_logical_plan(cache, table_name, plan)?;
@@ -1197,6 +1200,32 @@ fn try_ordered_reverse_window_fetch(
         );
     }
     Ok(Some(buckets))
+}
+
+fn try_indexed_reverse_bounded_fetch(
+    cache: &TableCache,
+    edge: &RelationEdgePlan,
+    keys: &HashSet<Value>,
+) -> GqlResult<Option<HashMap<Value, Vec<Rc<Row>>>>> {
+    if edge.kind != RelationEdgeKind::Reverse {
+        return Ok(None);
+    }
+
+    let Some(query) = edge.query.as_ref() else {
+        return Ok(None);
+    };
+    if query.limit.is_none() || query.order_by.is_empty() {
+        return Ok(None);
+    }
+    if query.filter.as_ref().is_some_and(filter_uses_relations) {
+        return Ok(None);
+    }
+
+    match indexed_probe_fetch(cache, edge, keys) {
+        Ok(buckets) => Ok(Some(buckets)),
+        Err(error) if edge_query_uses_relations(edge) => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 fn fetch_ordered_reverse_window_rows(
@@ -1993,6 +2022,50 @@ mod tests {
             .collect();
 
         assert_eq!(user_1_ids, alloc::vec![11]);
+        assert_eq!(user_2_ids, alloc::vec![12]);
+    }
+
+    #[test]
+    fn ordered_reverse_relation_without_prefix_index_uses_bounded_indexed_probe() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query = "{ users(orderBy: [{ field: ID, direction: ASC }]) { id posts(orderBy: [{ field: TITLE, direction: ASC }], limit: 1) { id title } } }";
+
+        let expected = execute_query(&cache, &catalog, query, None, None).unwrap();
+        let actual = execute_with_batch(&cache, &catalog, query);
+        assert_eq!(actual, expected);
+
+        let prepared = PreparedQuery::parse(query).unwrap();
+        let bound = prepared.bind(&catalog, None).unwrap();
+        let field = bound.fields.into_iter().next().unwrap();
+        let plan = crate::compile_batch_plan(&catalog, &field).unwrap();
+        let posts_edge = plan
+            .edges()
+            .iter()
+            .find(|edge| edge.direct_table == "posts")
+            .expect("posts edge");
+        let keys = HashSet::from([Value::Int64(1), Value::Int64(2)]);
+
+        assert!(
+            try_ordered_reverse_window_fetch(&cache, posts_edge, &keys)
+                .unwrap()
+                .is_none(),
+            "title order has no composite reverse-prefix index"
+        );
+        let buckets = try_indexed_reverse_bounded_fetch(&cache, posts_edge, &keys)
+            .unwrap()
+            .expect("ordered bounded reverse relation should use indexed FK probe");
+
+        let user_1_ids: Vec<_> = buckets[&Value::Int64(1)]
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        let user_2_ids: Vec<_> = buckets[&Value::Int64(2)]
+            .iter()
+            .map(|row| row.id())
+            .collect();
+
+        assert_eq!(user_1_ids, alloc::vec![10]);
         assert_eq!(user_2_ids, alloc::vec![12]);
     }
 
