@@ -51,6 +51,7 @@ const runtime = {
   queryMode: 'changes',
   scenarioVariant: 'default',
   outputMode: 'object',
+  traceCallbackMode: 'snapshot-materialize',
 }
 
 function usesAlignedFilters(scenarioVariant) {
@@ -415,6 +416,7 @@ async function initRuntime(message = {}) {
       queryMode: runtime.queryMode,
       scenarioVariant: runtime.scenarioVariant,
       outputMode: runtime.outputMode,
+      traceCallbackMode: runtime.traceCallbackMode,
       dataset: summarizeDataset(runtime.server.tables),
     }
   }
@@ -435,6 +437,10 @@ async function initRuntime(message = {}) {
     runtime.queryMode === 'changes' && message.outputMode === 'binary'
       ? 'binary'
       : 'object'
+  runtime.traceCallbackMode =
+    runtime.queryMode === 'trace' && message.traceCallbackMode === 'delta-minimal'
+      ? 'delta-minimal'
+      : 'snapshot-materialize'
   const wasmReadStartedAt = performance.now()
   const wasmBytes = await fs.readFile(WASM_PATH)
   initProfile.wasmFileReadMs = performance.now() - wasmReadStartedAt
@@ -470,6 +476,7 @@ async function initRuntime(message = {}) {
     queryMode: runtime.queryMode,
     scenarioVariant: runtime.scenarioVariant,
     outputMode: runtime.outputMode,
+    traceCallbackMode: runtime.traceCallbackMode,
     dataset: summarizeDataset(runtime.server.tables),
   }
 }
@@ -505,6 +512,27 @@ function createSnapshotMessage(
     changeCount,
     phaseProfile,
     rows: active.includeRows ? rows : undefined,
+  }
+}
+
+function createCountSnapshotMessage(
+  active,
+  phase,
+  rowCount,
+  changeCount = 1,
+  phaseProfile = undefined,
+) {
+  return {
+    type: 'snapshot',
+    scenarioId: active.scenarioId,
+    phase,
+    queryMode: active.queryMode,
+    payloadKind: 'object',
+    workerLatencyMs: performance.now() - active.pending.startedAt,
+    rowCount,
+    changeCount,
+    phaseProfile,
+    rows: undefined,
   }
 }
 
@@ -681,6 +709,52 @@ function buildBinarySnapshotPayload(
   }
 }
 
+function projectNameToggle(current, suffix) {
+  return current.name.endsWith(suffix)
+    ? current.name.slice(0, -suffix.length)
+    : `${current.name}${suffix}`
+}
+
+function projectPatchTransform(current, mutationMode, phase) {
+  if (mutationMode === 'projection-stable') {
+    const suffix = phase === 'socket' ? ' [socket]' : ' [api]'
+    return {
+      ...current,
+      name: projectNameToggle(current, suffix),
+    }
+  }
+
+  if (phase === 'socket') {
+    const healthScore = current.healthScore >= 45 ? 24 : 82
+    return {
+      ...current,
+      state: current.state === 'active' ? 'at_risk' : 'active',
+      healthScore,
+      updatedAt: current.updatedAt + 60_000,
+    }
+  }
+
+  const nextRisk = current.healthScore >= 45 ? 18 : 76
+  const nextHealth = current.healthScore >= 45 ? 28 : 88
+  return {
+    ...current,
+    healthScore: nextHealth,
+    updatedAt: current.updatedAt + 120_000,
+    metadata: {
+      ...current.metadata,
+      risk: {
+        ...current.metadata.risk,
+        score: nextRisk,
+        bucket: nextRisk >= 70 ? 'critical' : nextRisk >= 45 ? 'high' : 'medium',
+      },
+      flags: {
+        ...current.metadata.flags,
+        strategic: !current.metadata.flags.strategic,
+      },
+    },
+  }
+}
+
 function subscribeScenario(message) {
   ensureInitialized()
   unsubscribeActive()
@@ -690,9 +764,15 @@ function subscribeScenario(message) {
     includeRows: message.includeRows !== false,
     queryMode: runtime.queryMode,
     outputMode: runtime.outputMode,
+    traceCallbackMode:
+      runtime.queryMode === 'trace' &&
+      (message.traceCallbackMode ?? runtime.traceCallbackMode) === 'delta-minimal'
+        ? 'delta-minimal'
+        : 'snapshot-materialize',
     stream: null,
     layoutSnapshot: null,
     currentRows: [],
+    currentRowCount: 0,
     rawRowsByKey: null,
     lastProjectIds: [],
     pending: {
@@ -721,19 +801,29 @@ function subscribeScenario(message) {
     const getResultStartedAt = performance.now()
     const initialRawRows = active.stream.getResult()
     const getResultMs = performance.now() - getResultStartedAt
-    for (const rawRow of initialRawRows) {
-      const key = scenarioRowKey(active.scenarioId, rawRow)
-      if (key == null) continue
-      active.rawRowsByKey.set(String(key), rawRow)
-    }
+    let initialRows
+    let materializeRowsMs = 0
+    if (active.traceCallbackMode === 'snapshot-materialize') {
+      for (const rawRow of initialRawRows) {
+        const key = scenarioRowKey(active.scenarioId, rawRow)
+        if (key == null) continue
+        active.rawRowsByKey.set(String(key), rawRow)
+      }
 
-    const materializeStartedAt = performance.now()
-    const initialRows = snapshotRowsForScenario(
-      active.scenarioId,
-      Array.from(active.rawRowsByKey.values()),
-    )
-    const materializeRowsMs = performance.now() - materializeStartedAt
-    active.currentRows = initialRows
+      const materializeStartedAt = performance.now()
+      initialRows = snapshotRowsForScenario(
+        active.scenarioId,
+        Array.from(active.rawRowsByKey.values()),
+      )
+      materializeRowsMs = performance.now() - materializeStartedAt
+      active.currentRows = initialRows
+    } else {
+      const materializeStartedAt = performance.now()
+      initialRows = snapshotRowsForScenario(active.scenarioId, initialRawRows)
+      materializeRowsMs = performance.now() - materializeStartedAt
+      active.currentRows = active.includeRows ? initialRows : []
+    }
+    active.currentRowCount = initialRows.length
 
     const trackedIdsStartedAt = performance.now()
     updateTrackedProjectIds(
@@ -766,50 +856,73 @@ function subscribeScenario(message) {
       const removed = delta?.removed ?? []
       const added = delta?.added ?? []
       const callbackStartedAt = performance.now()
-      const mergeStartedAt = callbackStartedAt
+      if (active.traceCallbackMode === 'snapshot-materialize') {
+        const mergeStartedAt = callbackStartedAt
 
-      for (const rawRow of removed) {
-        const key = scenarioRowKey(active.scenarioId, rawRow)
-        if (key == null) continue
-        active.rawRowsByKey.delete(String(key))
+        for (const rawRow of removed) {
+          const key = scenarioRowKey(active.scenarioId, rawRow)
+          if (key == null) continue
+          active.rawRowsByKey.delete(String(key))
+        }
+
+        for (const rawRow of added) {
+          const key = scenarioRowKey(active.scenarioId, rawRow)
+          if (key == null) continue
+          active.rawRowsByKey.set(String(key), rawRow)
+        }
+        const mergeDeltaMs = performance.now() - mergeStartedAt
+
+        const materializeStartedAt = performance.now()
+        const rows = snapshotRowsForScenario(
+          active.scenarioId,
+          Array.from(active.rawRowsByKey.values()),
+        )
+        const materializeRowsMs = performance.now() - materializeStartedAt
+        active.currentRows = rows
+        active.currentRowCount = rows.length
+
+        const trackedIdsStartedAt = performance.now()
+        updateTrackedProjectIds(
+          active,
+          extractProjectIds(rows, MAX_TRACKED_PROJECT_IDS),
+        )
+        const trackedProjectIdsMs = performance.now() - trackedIdsStartedAt
+        const callbackTotalMs = performance.now() - callbackStartedAt
+
+        if (!pending) return
+        post(
+          createSnapshotMessage(
+            active,
+            pending.phase,
+            rows,
+            added.length + removed.length,
+            {
+              deltaAddedCount: added.length,
+              deltaRemovedCount: removed.length,
+              mergeDeltaMs,
+              materializeRowsMs,
+              trackedProjectIdsMs,
+              callbackTotalMs,
+            },
+          ),
+        )
+        active.pending = null
+        return
       }
 
-      for (const rawRow of added) {
-        const key = scenarioRowKey(active.scenarioId, rawRow)
-        if (key == null) continue
-        active.rawRowsByKey.set(String(key), rawRow)
-      }
-      const mergeDeltaMs = performance.now() - mergeStartedAt
-
-      const materializeStartedAt = performance.now()
-      const rows = snapshotRowsForScenario(
-        active.scenarioId,
-        Array.from(active.rawRowsByKey.values()),
-      )
-      const materializeRowsMs = performance.now() - materializeStartedAt
-      active.currentRows = rows
-
-      const trackedIdsStartedAt = performance.now()
-      updateTrackedProjectIds(
-        active,
-        extractProjectIds(rows, MAX_TRACKED_PROJECT_IDS),
-      )
-      const trackedProjectIdsMs = performance.now() - trackedIdsStartedAt
+      active.currentRowCount += added.length - removed.length
       const callbackTotalMs = performance.now() - callbackStartedAt
 
       if (!pending) return
       post(
-        createSnapshotMessage(
+        createCountSnapshotMessage(
           active,
           pending.phase,
-          rows,
+          active.currentRowCount,
           added.length + removed.length,
           {
             deltaAddedCount: added.length,
             deltaRemovedCount: removed.length,
-            mergeDeltaMs,
-            materializeRowsMs,
-            trackedProjectIdsMs,
             callbackTotalMs,
           },
         ),
@@ -967,31 +1080,39 @@ function runSocketPatchBurst(message) {
     startedAt: performance.now(),
   }
   runtime.active.pending = pending
+  const mutationMode =
+    message.mutationMode === 'projection-stable'
+      ? 'projection-stable'
+      : 'default'
   const projectIds = collectActiveProjectIds(message.patchCount)
   const projectIdsCollectedAt = performance.now()
 
   const tx = runtime.db.transaction()
   const patchLoopStartedAt = performance.now()
   for (const projectId of projectIds) {
-    const next = applyProjectPatch(projectId, (current) => {
-      const healthScore = current.healthScore >= 45 ? 24 : 82
-      return {
-        ...current,
-        state: current.state === 'active' ? 'at_risk' : 'active',
-        healthScore,
-        updatedAt: current.updatedAt + 60_000,
-      }
-    })
-    if (!next) continue
-    tx.update(
-      'projects',
-      {
-        state: next.state,
-        healthScore: next.healthScore,
-        updatedAt: next.updatedAt,
-      },
-      col('id').eq(next.id),
+    const next = applyProjectPatch(projectId, (current) =>
+      projectPatchTransform(current, mutationMode, 'socket'),
     )
+    if (!next) continue
+    if (mutationMode === 'projection-stable') {
+      tx.update(
+        'projects',
+        {
+          name: next.name,
+        },
+        col('id').eq(next.id),
+      )
+    } else {
+      tx.update(
+        'projects',
+        {
+          state: next.state,
+          healthScore: next.healthScore,
+          updatedAt: next.updatedAt,
+        },
+        col('id').eq(next.id),
+      )
+    }
   }
   const patchLoopCompletedAt = performance.now()
   const commitStartedAt = performance.now()
@@ -1018,43 +1139,39 @@ function runApiRefresh(message) {
     startedAt: performance.now(),
   }
   runtime.active.pending = pending
+  const mutationMode =
+    message.mutationMode === 'projection-stable'
+      ? 'projection-stable'
+      : 'default'
   const projectIds = collectActiveProjectIds(message.patchCount)
   const projectIdsCollectedAt = performance.now()
 
   const tx = runtime.db.transaction()
   const patchLoopStartedAt = performance.now()
   for (const projectId of projectIds) {
-    const next = applyProjectPatch(projectId, (current) => {
-      const nextRisk = current.healthScore >= 45 ? 18 : 76
-      const nextHealth = current.healthScore >= 45 ? 28 : 88
-      return {
-        ...current,
-        healthScore: nextHealth,
-        updatedAt: current.updatedAt + 120_000,
-        metadata: {
-          ...current.metadata,
-          risk: {
-            ...current.metadata.risk,
-            score: nextRisk,
-            bucket: nextRisk >= 70 ? 'critical' : nextRisk >= 45 ? 'high' : 'medium',
-          },
-          flags: {
-            ...current.metadata.flags,
-            strategic: !current.metadata.flags.strategic,
-          },
-        },
-      }
-    })
-    if (!next) continue
-    tx.update(
-      'projects',
-      {
-        healthScore: next.healthScore,
-        updatedAt: next.updatedAt,
-        metadata: next.metadata,
-      },
-      col('id').eq(next.id),
+    const next = applyProjectPatch(projectId, (current) =>
+      projectPatchTransform(current, mutationMode, 'api'),
     )
+    if (!next) continue
+    if (mutationMode === 'projection-stable') {
+      tx.update(
+        'projects',
+        {
+          name: next.name,
+        },
+        col('id').eq(next.id),
+      )
+    } else {
+      tx.update(
+        'projects',
+        {
+          healthScore: next.healthScore,
+          updatedAt: next.updatedAt,
+          metadata: next.metadata,
+        },
+        col('id').eq(next.id),
+      )
+    }
   }
   const patchLoopCompletedAt = performance.now()
   const commitStartedAt = performance.now()

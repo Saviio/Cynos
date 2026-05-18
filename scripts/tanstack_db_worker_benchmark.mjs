@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import {
   API_REFRESH_COUNT,
   DATASET_CONFIG,
+  DATASET_SCALE,
   JSON_REPORT_PATH,
   MEASURED_ROUNDS,
   MESSAGE_TIMEOUT_MS,
@@ -213,6 +214,7 @@ function buildMarkdownReport({ readyMessage, scenarioResults }) {
   lines.push(
     `- Dataset: ${formatCount(DATASET_CONFIG.issueCount)} issues, ${formatCount(DATASET_CONFIG.projectCount)} projects, ${formatCount(DATASET_CONFIG.userCount)} users, ${formatCount(DATASET_CONFIG.teamCount)} teams, ${formatCount(DATASET_CONFIG.organizationCount)} orgs, ${formatCount(DATASET_CONFIG.milestoneCount)} milestones`,
   )
+  lines.push(`- Dataset scale: ${DATASET_SCALE}x`)
   lines.push(`- Warmup rounds: ${WARMUP_ROUNDS}`)
   lines.push(`- Measured rounds: ${MEASURED_ROUNDS}`)
   lines.push(`- Socket patch count per round: ${SOCKET_PATCH_COUNT}`)
@@ -321,6 +323,7 @@ async function main() {
         {
           generatedAt: nowIso(),
           datasetConfig: DATASET_CONFIG,
+          datasetScale: DATASET_SCALE,
           readyMessage,
           scenarioResults,
         },

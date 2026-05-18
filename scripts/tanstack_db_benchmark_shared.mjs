@@ -15,13 +15,33 @@ function readNonNegativeIntEnv(name, fallback) {
   return Number.isFinite(value) && value >= 0 ? value : fallback
 }
 
+function readPositiveFloatEnv(names, fallback) {
+  for (const name of names) {
+    const value = Number.parseFloat(process.env[name] ?? '')
+    if (Number.isFinite(value) && value > 0) {
+      return value
+    }
+  }
+  return fallback
+}
+
+function scaleCount(name, fallback, scale) {
+  const base = readIntEnv(name, fallback)
+  return Math.max(1, Math.round(base * scale))
+}
+
+export const DATASET_SCALE = readPositiveFloatEnv(
+  ['LIVE_QUERY_BENCH_SCALE', 'TANSTACK_BENCH_SCALE'],
+  1,
+)
+
 export const DATASET_CONFIG = {
-  organizationCount: readIntEnv('TANSTACK_BENCH_ORGS', 200),
-  teamCount: readIntEnv('TANSTACK_BENCH_TEAMS', 1_000),
-  userCount: readIntEnv('TANSTACK_BENCH_USERS', 12_000),
-  projectCount: readIntEnv('TANSTACK_BENCH_PROJECTS', 3_000),
-  milestoneCount: readIntEnv('TANSTACK_BENCH_MILESTONES', 9_000),
-  issueCount: readIntEnv('TANSTACK_BENCH_ISSUES', 50_000),
+  organizationCount: scaleCount('TANSTACK_BENCH_ORGS', 200, DATASET_SCALE),
+  teamCount: scaleCount('TANSTACK_BENCH_TEAMS', 1_000, DATASET_SCALE),
+  userCount: scaleCount('TANSTACK_BENCH_USERS', 12_000, DATASET_SCALE),
+  projectCount: scaleCount('TANSTACK_BENCH_PROJECTS', 3_000, DATASET_SCALE),
+  milestoneCount: scaleCount('TANSTACK_BENCH_MILESTONES', 9_000, DATASET_SCALE),
+  issueCount: scaleCount('TANSTACK_BENCH_ISSUES', 50_000, DATASET_SCALE),
   seed: readIntEnv('TANSTACK_BENCH_SEED', 20260327),
 }
 
