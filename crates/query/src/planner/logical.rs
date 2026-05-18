@@ -55,14 +55,16 @@ pub enum LogicalPlan {
     },
 
     /// GIN index scan for multiple JSONB predicates (AND combination).
-    /// More efficient than multiple single GIN scans followed by intersection.
+    /// More efficient than multiple single GIN scans followed by set operations.
     GinIndexScanMulti {
         table: String,
         index: String,
         /// The JSONB column being queried.
         column: String,
-        /// Multiple (path, value) pairs to match (all must match - AND semantics).
+        /// Multiple (path, value) pairs to match.
         pairs: Vec<(String, Value)>,
+        /// `true` for AND semantics, `false` for OR semantics.
+        match_all: bool,
         /// Optional recheck predicate preserved for later physical rewrites.
         recheck: Option<Expr>,
     },

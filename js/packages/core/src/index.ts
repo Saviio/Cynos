@@ -35,8 +35,13 @@ import init, {
   BinaryResult,
 } from './wasm.js';
 
-// Import ResultSet
-import { ResultSet } from './result-set.js';
+// Import ResultSet helpers
+import { ResultSet, snapshotSchemaLayout } from './result-set.js';
+export type {
+  ResultSetBufferInput,
+  ResultSetLayoutInput,
+  ResultSetLayoutSnapshot,
+} from './result-set.js';
 
 export type {
   JsTableBuilder,
@@ -58,7 +63,7 @@ export type {
   BinaryResult,
 };
 
-export { JsDataType, JsSortOrder, ColumnOptions, ForeignKeyOptions, col, ResultSet };
+export { JsDataType, JsSortOrder, ColumnOptions, ForeignKeyOptions, col, ResultSet, snapshotSchemaLayout };
 
 export type { DataType, SortOrder, ChangeSet, Row, SubscriptionCallback, Unsubscribe } from './types.js';
 

@@ -72,6 +72,10 @@ pub struct IndexDef {
     unique: bool,
     /// Index type.
     index_type: IndexType,
+    /// Optional normalized JSON paths covered by a GIN index.
+    ///
+    /// `None` means the index covers the full JSON tree.
+    gin_paths: Option<Vec<String>>,
 }
 
 impl IndexDef {
@@ -87,6 +91,7 @@ impl IndexDef {
             columns,
             unique: false,
             index_type: IndexType::BTree,
+            gin_paths: None,
         }
     }
 
@@ -99,6 +104,12 @@ impl IndexDef {
     /// Sets the index type.
     pub fn index_type(mut self, index_type: IndexType) -> Self {
         self.index_type = index_type;
+        self
+    }
+
+    /// Restricts a GIN index to a set of normalized JSON paths.
+    pub fn with_gin_paths(mut self, paths: Vec<String>) -> Self {
+        self.gin_paths = if paths.is_empty() { None } else { Some(paths) };
         self
     }
 
@@ -137,6 +148,24 @@ impl IndexDef {
         self.index_type
     }
 
+    /// Returns the normalized JSON paths covered by this GIN index.
+    #[inline]
+    pub fn gin_paths(&self) -> Option<&[String]> {
+        self.gin_paths.as_deref()
+    }
+
+    /// Returns whether this GIN index can answer lookups for the given path.
+    #[inline]
+    pub fn supports_gin_path(&self, path: &str) -> bool {
+        if self.index_type != IndexType::Gin {
+            return false;
+        }
+
+        self.gin_paths.as_ref().map_or(true, |paths| {
+            paths.iter().any(|candidate| candidate == path)
+        })
+    }
+
     /// Returns whether this is a single-column index.
     #[inline]
     pub fn is_single_column(&self) -> bool {
@@ -158,6 +187,7 @@ impl PartialEq for IndexDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use alloc::vec;
 
     #[test]
@@ -198,5 +228,19 @@ mod tests {
 
         assert!(!idx.is_single_column());
         assert_eq!(idx.columns().len(), 2);
+    }
+
+    #[test]
+    fn test_gin_index_paths() {
+        let idx = IndexDef::new("idx_profile", "users", vec![IndexedColumn::new("profile")])
+            .index_type(IndexType::Gin)
+            .with_gin_paths(vec!["customer.tier".into(), "risk.bucket".into()]);
+
+        assert!(idx.supports_gin_path("customer.tier"));
+        assert!(!idx.supports_gin_path("flags.strategic"));
+        assert_eq!(
+            idx.gin_paths().unwrap(),
+            ["customer.tier".to_string(), "risk.bucket".to_string()]
+        );
     }
 }

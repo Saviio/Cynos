@@ -228,6 +228,19 @@ pub trait Index<K> {
     /// For unique indexes, this will fail if the key already exists.
     fn add(&mut self, key: K, value: RowId) -> Result<(), IndexError>;
 
+    /// Adds multiple key-value pairs to the index in batch.
+    ///
+    /// Implementations may override this to provide a more efficient merge path.
+    fn add_batch(&mut self, entries: &[(K, RowId)]) -> Result<(), IndexError>
+    where
+        K: Clone,
+    {
+        for (key, row_id) in entries {
+            self.add(key.clone(), *row_id)?;
+        }
+        Ok(())
+    }
+
     /// Sets a key-value pair, replacing any existing values for the key.
     fn set(&mut self, key: K, value: RowId);
 

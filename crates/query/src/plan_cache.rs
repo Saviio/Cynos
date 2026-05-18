@@ -112,6 +112,7 @@ fn hash_logical_plan<H: Hasher>(plan: &LogicalPlan, hasher: &mut H) {
             index,
             column,
             pairs,
+            match_all,
             recheck,
         } => {
             hasher.write(b"gin_index_scan_multi");
@@ -122,6 +123,7 @@ fn hash_logical_plan<H: Hasher>(plan: &LogicalPlan, hasher: &mut H) {
                 hasher.write(path.as_bytes());
                 hash_value(value, hasher);
             }
+            hasher.write(&[*match_all as u8]);
             if let Some(expr) = recheck {
                 hash_expr(expr, hasher);
             }

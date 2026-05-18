@@ -6,7 +6,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use cynos_core::{Row, Value};
+use cynos_core::{aggregate_group_row_id, Row, Value};
 use libm::{exp, log, sqrt};
 
 /// Aggregate executor - computes aggregate functions.
@@ -113,7 +113,11 @@ impl AggregateExecutor {
             }
             let values = self.finalize_states(states);
             let entry = RelationEntry::new_combined(
-                Rc::new(Row::dummy_with_version(version_sum, values)),
+                Rc::new(Row::new_with_version(
+                    aggregate_group_row_id(&[]),
+                    version_sum,
+                    values,
+                )),
                 shared_tables,
             );
             return Relation {
@@ -140,11 +144,16 @@ impl AggregateExecutor {
         let entries: Vec<RelationEntry> = groups
             .into_iter()
             .map(|(_, group_state)| {
+                let row_id = aggregate_group_row_id(&group_state.group_values);
                 let mut values = group_state.group_values;
                 values.extend(self.finalize_states(group_state.aggregate_states));
 
                 RelationEntry::new_combined(
-                    Rc::new(Row::dummy_with_version(group_state.version_sum, values)),
+                    Rc::new(Row::new_with_version(
+                        row_id,
+                        group_state.version_sum,
+                        values,
+                    )),
                     shared_tables.clone(),
                 )
             })

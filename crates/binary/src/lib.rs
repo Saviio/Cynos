@@ -132,6 +132,15 @@ impl BinaryResult {
         js_sys::Uint8Array::from(&self.buffer[..])
     }
 
+    /// Copy the buffer into a standalone Uint8Array suitable for `postMessage`
+    /// transfer lists and other ownership-taking APIs.
+    ///
+    /// Unlike `asView()`, the returned bytes are no longer tied to WASM memory.
+    #[wasm_bindgen(js_name = intoTransferable)]
+    pub fn into_transferable(self) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(&self.buffer[..])
+    }
+
     /// Get a zero-copy Uint8Array view into WASM memory.
     /// WARNING: This view becomes invalid if WASM memory grows or if this BinaryResult is freed.
     /// The caller must ensure the BinaryResult outlives any use of the returned view.

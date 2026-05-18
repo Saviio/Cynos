@@ -19,6 +19,13 @@ export class BinaryResult {
      */
     free(): void;
     /**
+     * Copy the buffer into a standalone Uint8Array suitable for `postMessage`
+     * transfer lists and other ownership-taking APIs.
+     *
+     * Unlike `asView()`, the returned bytes are no longer tied to WASM memory.
+     */
+    intoTransferable(): Uint8Array;
+    /**
      * Check if buffer is empty
      */
     isEmpty(): boolean;
@@ -241,6 +248,11 @@ export class Database {
      * Returns all table names.
      */
     tableNames(): Array<any>;
+    takeLastCommitProfile(): any;
+    takeLastDeltaFlushProfile(): any;
+    takeLastIvmBridgeProfile(): any;
+    takeLastSnapshotFlushProfile(): any;
+    takeLastTraceInitProfile(): any;
     /**
      * Returns the total row count across all tables.
      */
@@ -359,6 +371,16 @@ export class JsChangesStream {
      * Returns an unsubscribe function.
      */
     subscribe(callback: Function): Function;
+    /**
+     * Subscribes to the changes stream using binary snapshots.
+     *
+     * The callback receives a `BinaryResult` for the full current result set.
+     * It is called immediately with the initial data, and again whenever data changes.
+     * Use `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+     *
+     * Returns an unsubscribe function.
+     */
+    subscribeBinary(callback: Function): Function;
 }
 
 /**
@@ -478,6 +500,17 @@ export class JsObservableQuery {
      */
     subscribe(callback: Function): Function;
     /**
+     * Subscribes to query changes using binary snapshots.
+     *
+     * The callback receives a `BinaryResult` for the complete current result set.
+     * This avoids per-update JS object materialization inside the WASM bridge.
+     * Call `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+     *
+     * It is called whenever data changes (not immediately - use getResultBinary for initial data).
+     * Returns an unsubscribe function.
+     */
+    subscribeBinary(callback: Function): Function;
+    /**
      * Returns the number of active subscriptions.
      */
     subscriptionCount(): number;
@@ -557,7 +590,7 @@ export class JsTableBuilder {
     /**
      * Adds a JSONB index for specific paths.
      */
-    jsonbIndex(column: string, _paths: any): JsTableBuilder;
+    jsonbIndex(column: string, paths: any): JsTableBuilder;
     /**
      * Creates a new table builder.
      */
@@ -882,197 +915,205 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
-    readonly __wbg_database_free: (a: number, b: number) => void;
-    readonly __wbg_preparedgraphqlquery_free: (a: number, b: number) => void;
-    readonly database_new: (a: number, b: number) => number;
-    readonly database_create: (a: number, b: number) => number;
-    readonly database_name: (a: number, b: number) => void;
-    readonly database_createTable: (a: number, b: number, c: number) => number;
-    readonly database_registerTable: (a: number, b: number, c: number) => void;
-    readonly database_table: (a: number, b: number, c: number) => number;
-    readonly database_dropTable: (a: number, b: number, c: number, d: number) => void;
-    readonly database_tableNames: (a: number) => number;
-    readonly database_tableCount: (a: number) => number;
-    readonly database_select: (a: number, b: number) => number;
-    readonly database_insert: (a: number, b: number, c: number) => number;
-    readonly database_update: (a: number, b: number, c: number) => number;
-    readonly database_delete: (a: number, b: number, c: number) => number;
-    readonly database_transaction: (a: number) => number;
-    readonly database_clear: (a: number) => void;
-    readonly database_clearTable: (a: number, b: number, c: number, d: number) => void;
-    readonly database_totalRowCount: (a: number) => number;
-    readonly database_hasTable: (a: number, b: number, c: number) => number;
-    readonly database_graphqlSchema: (a: number, b: number) => void;
-    readonly database_graphql: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
-    readonly database_subscribeGraphql: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
-    readonly database_prepareGraphql: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly preparedgraphqlquery_exec: (a: number, b: number, c: number) => void;
-    readonly preparedgraphqlquery_subscribe: (a: number, b: number, c: number) => void;
     readonly __wbg_column_free: (a: number, b: number) => void;
-    readonly column_new: (a: number, b: number, c: number, d: number) => number;
-    readonly column_with_index: (a: number, b: number) => number;
-    readonly column_name: (a: number, b: number) => void;
-    readonly column_tableName: (a: number, b: number) => void;
+    readonly __wbg_columnoptions_free: (a: number, b: number) => void;
+    readonly __wbg_database_free: (a: number, b: number) => void;
+    readonly __wbg_deletebuilder_free: (a: number, b: number) => void;
+    readonly __wbg_expr_free: (a: number, b: number) => void;
+    readonly __wbg_foreignkeyoptions_free: (a: number, b: number) => void;
+    readonly __wbg_get_columnoptions_auto_increment: (a: number) => number;
+    readonly __wbg_get_columnoptions_nullable: (a: number) => number;
+    readonly __wbg_get_columnoptions_primary_key: (a: number) => number;
+    readonly __wbg_get_columnoptions_unique: (a: number) => number;
+    readonly __wbg_insertbuilder_free: (a: number, b: number) => void;
+    readonly __wbg_jschangesstream_free: (a: number, b: number) => void;
+    readonly __wbg_jsgraphqlsubscription_free: (a: number, b: number) => void;
+    readonly __wbg_jsivmobservablequery_free: (a: number, b: number) => void;
+    readonly __wbg_jsobservablequery_free: (a: number, b: number) => void;
+    readonly __wbg_jsonbcolumn_free: (a: number, b: number) => void;
+    readonly __wbg_jstable_free: (a: number, b: number) => void;
+    readonly __wbg_jstablebuilder_free: (a: number, b: number) => void;
+    readonly __wbg_jstransaction_free: (a: number, b: number) => void;
+    readonly __wbg_preparedgraphqlquery_free: (a: number, b: number) => void;
+    readonly __wbg_preparedselectquery_free: (a: number, b: number) => void;
+    readonly __wbg_selectbuilder_free: (a: number, b: number) => void;
+    readonly __wbg_set_columnoptions_auto_increment: (a: number, b: number) => void;
+    readonly __wbg_set_columnoptions_nullable: (a: number, b: number) => void;
+    readonly __wbg_set_columnoptions_primary_key: (a: number, b: number) => void;
+    readonly __wbg_set_columnoptions_unique: (a: number, b: number) => void;
+    readonly __wbg_updatebuilder_free: (a: number, b: number) => void;
+    readonly col: (a: number, b: number) => number;
+    readonly column_between: (a: number, b: number, c: number) => number;
     readonly column_eq: (a: number, b: number) => number;
-    readonly column_ne: (a: number, b: number) => number;
+    readonly column_get: (a: number, b: number, c: number) => number;
     readonly column_gt: (a: number, b: number) => number;
     readonly column_gte: (a: number, b: number) => number;
+    readonly column_in: (a: number, b: number) => number;
+    readonly column_isNotNull: (a: number) => number;
+    readonly column_isNull: (a: number) => number;
+    readonly column_like: (a: number, b: number, c: number) => number;
     readonly column_lt: (a: number, b: number) => number;
     readonly column_lte: (a: number, b: number) => number;
-    readonly column_between: (a: number, b: number, c: number) => number;
-    readonly column_notBetween: (a: number, b: number, c: number) => number;
-    readonly column_in: (a: number, b: number) => number;
-    readonly column_notIn: (a: number, b: number) => number;
-    readonly column_like: (a: number, b: number, c: number) => number;
-    readonly column_notLike: (a: number, b: number, c: number) => number;
     readonly column_match: (a: number, b: number, c: number) => number;
+    readonly column_name: (a: number, b: number) => void;
+    readonly column_ne: (a: number, b: number) => number;
+    readonly column_new: (a: number, b: number, c: number, d: number) => number;
+    readonly column_notBetween: (a: number, b: number, c: number) => number;
+    readonly column_notIn: (a: number, b: number) => number;
+    readonly column_notLike: (a: number, b: number, c: number) => number;
     readonly column_notMatch: (a: number, b: number, c: number) => number;
-    readonly column_isNull: (a: number) => number;
-    readonly column_isNotNull: (a: number) => number;
-    readonly column_get: (a: number, b: number, c: number) => number;
-    readonly __wbg_jsonbcolumn_free: (a: number, b: number) => void;
-    readonly jsonbcolumn_eq: (a: number, b: number) => number;
-    readonly jsonbcolumn_contains: (a: number, b: number) => number;
-    readonly jsonbcolumn_exists: (a: number) => number;
-    readonly __wbg_expr_free: (a: number, b: number) => void;
-    readonly expr_and: (a: number, b: number) => number;
-    readonly expr_or: (a: number, b: number) => number;
-    readonly expr_not: (a: number) => number;
-    readonly __wbg_selectbuilder_free: (a: number, b: number) => void;
-    readonly __wbg_preparedselectquery_free: (a: number, b: number) => void;
-    readonly selectbuilder_from: (a: number, b: number, c: number) => number;
-    readonly selectbuilder_where: (a: number, b: number) => number;
-    readonly selectbuilder_orderBy: (a: number, b: number, c: number, d: number) => number;
-    readonly selectbuilder_limit: (a: number, b: number) => number;
-    readonly selectbuilder_offset: (a: number, b: number) => number;
-    readonly selectbuilder_union: (a: number, b: number, c: number) => void;
-    readonly selectbuilder_unionAll: (a: number, b: number, c: number) => void;
-    readonly selectbuilder_innerJoin: (a: number, b: number, c: number, d: number) => number;
-    readonly selectbuilder_leftJoin: (a: number, b: number, c: number, d: number) => number;
-    readonly selectbuilder_groupBy: (a: number, b: number) => number;
-    readonly selectbuilder_count: (a: number) => number;
-    readonly selectbuilder_countCol: (a: number, b: number, c: number) => number;
-    readonly selectbuilder_sum: (a: number, b: number, c: number) => number;
-    readonly selectbuilder_avg: (a: number, b: number, c: number) => number;
-    readonly selectbuilder_min: (a: number, b: number, c: number) => number;
-    readonly selectbuilder_max: (a: number, b: number, c: number) => number;
-    readonly selectbuilder_stddev: (a: number, b: number, c: number) => number;
-    readonly selectbuilder_geomean: (a: number, b: number, c: number) => number;
-    readonly selectbuilder_distinct: (a: number, b: number, c: number) => number;
-    readonly selectbuilder_exec: (a: number) => number;
-    readonly selectbuilder_prepare: (a: number, b: number) => void;
-    readonly selectbuilder_explain: (a: number, b: number) => void;
-    readonly selectbuilder_observe: (a: number, b: number) => void;
-    readonly selectbuilder_changes: (a: number, b: number) => void;
-    readonly selectbuilder_trace: (a: number, b: number) => void;
-    readonly selectbuilder_getSchemaLayout: (a: number, b: number) => void;
-    readonly selectbuilder_execBinary: (a: number) => number;
-    readonly preparedselectquery_exec: (a: number) => number;
-    readonly preparedselectquery_execBinary: (a: number) => number;
-    readonly preparedselectquery_getSchemaLayout: (a: number) => number;
-    readonly __wbg_insertbuilder_free: (a: number, b: number) => void;
-    readonly insertbuilder_values: (a: number, b: number) => number;
-    readonly insertbuilder_exec: (a: number) => number;
-    readonly __wbg_updatebuilder_free: (a: number, b: number) => void;
-    readonly updatebuilder_set: (a: number, b: number, c: number) => number;
-    readonly updatebuilder_where: (a: number, b: number) => number;
-    readonly updatebuilder_exec: (a: number) => number;
-    readonly __wbg_deletebuilder_free: (a: number, b: number) => void;
-    readonly deletebuilder_where: (a: number, b: number) => number;
+    readonly column_tableName: (a: number, b: number) => void;
+    readonly column_with_index: (a: number, b: number) => number;
+    readonly columnoptions_new: () => number;
+    readonly columnoptions_primaryKey: (a: number, b: number) => number;
+    readonly columnoptions_setAutoIncrement: (a: number, b: number) => number;
+    readonly columnoptions_setNullable: (a: number, b: number) => number;
+    readonly columnoptions_setUnique: (a: number, b: number) => number;
+    readonly database_clear: (a: number) => void;
+    readonly database_clearTable: (a: number, b: number, c: number, d: number) => void;
+    readonly database_create: (a: number, b: number) => number;
+    readonly database_createTable: (a: number, b: number, c: number) => number;
+    readonly database_delete: (a: number, b: number, c: number) => number;
+    readonly database_dropTable: (a: number, b: number, c: number, d: number) => void;
+    readonly database_graphql: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly database_graphqlSchema: (a: number, b: number) => void;
+    readonly database_hasTable: (a: number, b: number, c: number) => number;
+    readonly database_insert: (a: number, b: number, c: number) => number;
+    readonly database_name: (a: number, b: number) => void;
+    readonly database_new: (a: number, b: number) => number;
+    readonly database_prepareGraphql: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly database_registerTable: (a: number, b: number, c: number) => void;
+    readonly database_select: (a: number, b: number) => number;
+    readonly database_subscribeGraphql: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly database_table: (a: number, b: number, c: number) => number;
+    readonly database_tableCount: (a: number) => number;
+    readonly database_tableNames: (a: number) => number;
+    readonly database_takeLastCommitProfile: (a: number) => number;
+    readonly database_takeLastDeltaFlushProfile: (a: number) => number;
+    readonly database_takeLastIvmBridgeProfile: (a: number) => number;
+    readonly database_takeLastSnapshotFlushProfile: (a: number) => number;
+    readonly database_takeLastTraceInitProfile: (a: number) => number;
+    readonly database_totalRowCount: (a: number) => number;
+    readonly database_transaction: (a: number) => number;
+    readonly database_update: (a: number, b: number, c: number) => number;
     readonly deletebuilder_exec: (a: number) => number;
-    readonly __wbg_jsobservablequery_free: (a: number, b: number) => void;
-    readonly jsobservablequery_subscribe: (a: number, b: number) => number;
-    readonly jsobservablequery_getResult: (a: number) => number;
-    readonly jsobservablequery_getResultBinary: (a: number) => number;
-    readonly jsobservablequery_getSchemaLayout: (a: number) => number;
-    readonly jsobservablequery_length: (a: number) => number;
-    readonly jsobservablequery_isEmpty: (a: number) => number;
-    readonly jsobservablequery_subscriptionCount: (a: number) => number;
-    readonly __wbg_jsivmobservablequery_free: (a: number, b: number) => void;
-    readonly jsivmobservablequery_subscribe: (a: number, b: number) => number;
-    readonly jsivmobservablequery_getResult: (a: number) => number;
-    readonly jsivmobservablequery_getResultBinary: (a: number) => number;
-    readonly jsivmobservablequery_getSchemaLayout: (a: number) => number;
-    readonly jsivmobservablequery_length: (a: number) => number;
-    readonly jsivmobservablequery_isEmpty: (a: number) => number;
-    readonly jsivmobservablequery_subscriptionCount: (a: number) => number;
-    readonly __wbg_jsgraphqlsubscription_free: (a: number, b: number) => void;
-    readonly jsgraphqlsubscription_getResult: (a: number) => number;
-    readonly jsgraphqlsubscription_subscribe: (a: number, b: number) => number;
-    readonly jsgraphqlsubscription_subscriptionCount: (a: number) => number;
-    readonly __wbg_jschangesstream_free: (a: number, b: number) => void;
-    readonly jschangesstream_subscribe: (a: number, b: number) => number;
+    readonly deletebuilder_where: (a: number, b: number) => number;
+    readonly expr_and: (a: number, b: number) => number;
+    readonly expr_not: (a: number) => number;
+    readonly expr_or: (a: number, b: number) => number;
+    readonly foreignkeyoptions_fieldName: (a: number, b: number, c: number) => number;
+    readonly foreignkeyoptions_new: () => number;
+    readonly foreignkeyoptions_reverseFieldName: (a: number, b: number, c: number) => number;
+    readonly init: () => void;
+    readonly insertbuilder_exec: (a: number) => number;
+    readonly insertbuilder_values: (a: number, b: number) => number;
     readonly jschangesstream_getResult: (a: number) => number;
     readonly jschangesstream_getResultBinary: (a: number) => number;
     readonly jschangesstream_getSchemaLayout: (a: number) => number;
-    readonly __wbg_columnoptions_free: (a: number, b: number) => void;
-    readonly __wbg_get_columnoptions_primary_key: (a: number) => number;
-    readonly __wbg_set_columnoptions_primary_key: (a: number, b: number) => void;
-    readonly __wbg_get_columnoptions_nullable: (a: number) => number;
-    readonly __wbg_set_columnoptions_nullable: (a: number, b: number) => void;
-    readonly __wbg_get_columnoptions_unique: (a: number) => number;
-    readonly __wbg_set_columnoptions_unique: (a: number, b: number) => void;
-    readonly __wbg_get_columnoptions_auto_increment: (a: number) => number;
-    readonly __wbg_set_columnoptions_auto_increment: (a: number, b: number) => void;
-    readonly __wbg_foreignkeyoptions_free: (a: number, b: number) => void;
-    readonly columnoptions_new: () => number;
-    readonly columnoptions_primaryKey: (a: number, b: number) => number;
-    readonly columnoptions_setNullable: (a: number, b: number) => number;
-    readonly columnoptions_setUnique: (a: number, b: number) => number;
-    readonly columnoptions_setAutoIncrement: (a: number, b: number) => number;
-    readonly foreignkeyoptions_new: () => number;
-    readonly foreignkeyoptions_fieldName: (a: number, b: number, c: number) => number;
-    readonly foreignkeyoptions_reverseFieldName: (a: number, b: number, c: number) => number;
-    readonly __wbg_jstablebuilder_free: (a: number, b: number) => void;
-    readonly jstablebuilder_new: (a: number, b: number) => number;
-    readonly jstablebuilder_build: (a: number, b: number) => void;
-    readonly jstablebuilder_column: (a: number, b: number, c: number, d: number, e: number) => number;
-    readonly jstablebuilder_primaryKey: (a: number, b: number) => number;
-    readonly jstablebuilder_index: (a: number, b: number, c: number, d: number) => number;
-    readonly jstablebuilder_uniqueIndex: (a: number, b: number, c: number, d: number) => number;
-    readonly jstablebuilder_jsonbIndex: (a: number, b: number, c: number, d: number) => number;
-    readonly jstablebuilder_foreignKey: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => number;
-    readonly jstablebuilder_name: (a: number, b: number) => void;
-    readonly __wbg_jstable_free: (a: number, b: number) => void;
-    readonly jstable_name: (a: number, b: number) => void;
+    readonly jschangesstream_subscribe: (a: number, b: number) => number;
+    readonly jschangesstream_subscribeBinary: (a: number, b: number) => number;
+    readonly jsgraphqlsubscription_getResult: (a: number) => number;
+    readonly jsgraphqlsubscription_subscribe: (a: number, b: number) => number;
+    readonly jsgraphqlsubscription_subscriptionCount: (a: number) => number;
+    readonly jsivmobservablequery_getResult: (a: number) => number;
+    readonly jsivmobservablequery_getResultBinary: (a: number) => number;
+    readonly jsivmobservablequery_getSchemaLayout: (a: number) => number;
+    readonly jsivmobservablequery_isEmpty: (a: number) => number;
+    readonly jsivmobservablequery_length: (a: number) => number;
+    readonly jsivmobservablequery_subscribe: (a: number, b: number) => number;
+    readonly jsivmobservablequery_subscriptionCount: (a: number) => number;
+    readonly jsobservablequery_getResult: (a: number) => number;
+    readonly jsobservablequery_getResultBinary: (a: number) => number;
+    readonly jsobservablequery_getSchemaLayout: (a: number) => number;
+    readonly jsobservablequery_isEmpty: (a: number) => number;
+    readonly jsobservablequery_length: (a: number) => number;
+    readonly jsobservablequery_subscribe: (a: number, b: number) => number;
+    readonly jsobservablequery_subscribeBinary: (a: number, b: number) => number;
+    readonly jsobservablequery_subscriptionCount: (a: number) => number;
+    readonly jsonbcolumn_contains: (a: number, b: number) => number;
+    readonly jsonbcolumn_eq: (a: number, b: number) => number;
+    readonly jsonbcolumn_exists: (a: number) => number;
     readonly jstable_col: (a: number, b: number, c: number) => number;
-    readonly jstable_columnNames: (a: number) => number;
     readonly jstable_columnCount: (a: number) => number;
+    readonly jstable_columnNames: (a: number) => number;
     readonly jstable_getColumnType: (a: number, b: number, c: number) => number;
     readonly jstable_isColumnNullable: (a: number, b: number, c: number) => number;
+    readonly jstable_name: (a: number, b: number) => void;
     readonly jstable_primaryKeyColumns: (a: number) => number;
-    readonly __wbg_jstransaction_free: (a: number, b: number) => void;
-    readonly jstransaction_insert: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly jstransaction_update: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly jstransaction_delete: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly jstransaction_commit: (a: number, b: number) => void;
-    readonly jstransaction_rollback: (a: number, b: number) => void;
+    readonly jstablebuilder_build: (a: number, b: number) => void;
+    readonly jstablebuilder_column: (a: number, b: number, c: number, d: number, e: number) => number;
+    readonly jstablebuilder_foreignKey: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => number;
+    readonly jstablebuilder_index: (a: number, b: number, c: number, d: number) => number;
+    readonly jstablebuilder_jsonbIndex: (a: number, b: number, c: number, d: number) => number;
+    readonly jstablebuilder_name: (a: number, b: number) => void;
+    readonly jstablebuilder_new: (a: number, b: number) => number;
+    readonly jstablebuilder_primaryKey: (a: number, b: number) => number;
+    readonly jstablebuilder_uniqueIndex: (a: number, b: number, c: number, d: number) => number;
     readonly jstransaction_active: (a: number) => number;
+    readonly jstransaction_commit: (a: number, b: number) => void;
+    readonly jstransaction_delete: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly jstransaction_insert: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly jstransaction_rollback: (a: number, b: number) => void;
     readonly jstransaction_state: (a: number, b: number) => void;
-    readonly init: () => void;
-    readonly col: (a: number, b: number) => number;
+    readonly jstransaction_update: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly preparedgraphqlquery_exec: (a: number, b: number, c: number) => void;
+    readonly preparedgraphqlquery_subscribe: (a: number, b: number, c: number) => void;
+    readonly preparedselectquery_exec: (a: number) => number;
+    readonly preparedselectquery_execBinary: (a: number) => number;
+    readonly preparedselectquery_getSchemaLayout: (a: number) => number;
+    readonly selectbuilder_avg: (a: number, b: number, c: number) => number;
+    readonly selectbuilder_changes: (a: number, b: number) => void;
+    readonly selectbuilder_count: (a: number) => number;
+    readonly selectbuilder_countCol: (a: number, b: number, c: number) => number;
+    readonly selectbuilder_distinct: (a: number, b: number, c: number) => number;
+    readonly selectbuilder_exec: (a: number) => number;
+    readonly selectbuilder_execBinary: (a: number) => number;
+    readonly selectbuilder_explain: (a: number, b: number) => void;
+    readonly selectbuilder_from: (a: number, b: number, c: number) => number;
+    readonly selectbuilder_geomean: (a: number, b: number, c: number) => number;
+    readonly selectbuilder_getSchemaLayout: (a: number, b: number) => void;
+    readonly selectbuilder_groupBy: (a: number, b: number) => number;
+    readonly selectbuilder_innerJoin: (a: number, b: number, c: number, d: number) => number;
+    readonly selectbuilder_leftJoin: (a: number, b: number, c: number, d: number) => number;
+    readonly selectbuilder_limit: (a: number, b: number) => number;
+    readonly selectbuilder_max: (a: number, b: number, c: number) => number;
+    readonly selectbuilder_min: (a: number, b: number, c: number) => number;
+    readonly selectbuilder_observe: (a: number, b: number) => void;
+    readonly selectbuilder_offset: (a: number, b: number) => number;
+    readonly selectbuilder_orderBy: (a: number, b: number, c: number, d: number) => number;
+    readonly selectbuilder_prepare: (a: number, b: number) => void;
+    readonly selectbuilder_stddev: (a: number, b: number, c: number) => number;
+    readonly selectbuilder_sum: (a: number, b: number, c: number) => number;
+    readonly selectbuilder_trace: (a: number, b: number) => void;
+    readonly selectbuilder_union: (a: number, b: number, c: number) => void;
+    readonly selectbuilder_unionAll: (a: number, b: number, c: number) => void;
+    readonly selectbuilder_where: (a: number, b: number) => number;
+    readonly updatebuilder_exec: (a: number) => number;
+    readonly updatebuilder_set: (a: number, b: number, c: number) => number;
+    readonly updatebuilder_where: (a: number, b: number) => number;
     readonly column_new_simple: (a: number, b: number) => number;
-    readonly __wbg_schemalayout_free: (a: number, b: number) => void;
-    readonly schemalayout_columnCount: (a: number) => number;
-    readonly schemalayout_columnName: (a: number, b: number, c: number) => void;
-    readonly schemalayout_columnType: (a: number, b: number) => number;
-    readonly schemalayout_columnOffset: (a: number, b: number) => number;
-    readonly schemalayout_columnFixedSize: (a: number, b: number) => number;
-    readonly schemalayout_columnNullable: (a: number, b: number) => number;
-    readonly schemalayout_rowStride: (a: number) => number;
-    readonly schemalayout_nullMaskSize: (a: number) => number;
     readonly __wbg_binaryresult_free: (a: number, b: number) => void;
-    readonly binaryresult_ptr: (a: number) => number;
-    readonly binaryresult_len: (a: number) => number;
-    readonly binaryresult_isEmpty: (a: number) => number;
-    readonly binaryresult_toUint8Array: (a: number) => number;
+    readonly __wbg_schemalayout_free: (a: number, b: number) => void;
     readonly binaryresult_asView: (a: number) => number;
     readonly binaryresult_free: (a: number) => void;
-    readonly __wasm_bindgen_func_elem_67: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2513: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_6953: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_2520: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_1049: (a: number, b: number) => void;
+    readonly binaryresult_intoTransferable: (a: number) => number;
+    readonly binaryresult_isEmpty: (a: number) => number;
+    readonly binaryresult_len: (a: number) => number;
+    readonly binaryresult_ptr: (a: number) => number;
+    readonly binaryresult_toUint8Array: (a: number) => number;
+    readonly schemalayout_columnCount: (a: number) => number;
+    readonly schemalayout_columnFixedSize: (a: number, b: number) => number;
+    readonly schemalayout_columnName: (a: number, b: number, c: number) => void;
+    readonly schemalayout_columnNullable: (a: number, b: number) => number;
+    readonly schemalayout_columnOffset: (a: number, b: number) => number;
+    readonly schemalayout_columnType: (a: number, b: number) => number;
+    readonly schemalayout_nullMaskSize: (a: number) => number;
+    readonly schemalayout_rowStride: (a: number) => number;
+    readonly __wasm_bindgen_func_elem_90: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_3723: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_9185: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_3730: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1563: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

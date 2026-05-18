@@ -17,7 +17,7 @@ pub mod response;
 pub mod schema;
 
 pub use ast::{Document, InputValue, OperationDefinition, OperationType, SelectionSet};
-pub use batch_render::{GraphqlBatchState, GraphqlInvalidation};
+pub use batch_render::{GraphqlBatchState, GraphqlInvalidation, GraphqlRootListPatch};
 pub use bind::{BoundOperation, VariableValues};
 pub use cache::SchemaCache;
 pub use catalog::GraphqlCatalog;

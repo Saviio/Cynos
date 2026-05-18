@@ -246,6 +246,7 @@ pub struct RelationMeta {
     pub child_table: String,
     pub child_column: String,
     pub child_column_index: usize,
+    pub child_column_unique: bool,
     pub parent_table: String,
     pub parent_column: String,
     pub parent_column_index: usize,
@@ -334,6 +335,7 @@ fn build_table_meta(
             child_table: fk.child_table.clone(),
             child_column: fk.child_column.clone(),
             child_column_index,
+            child_column_unique: is_single_column_unique_key(table, &fk.child_column),
             parent_table: fk.parent_table.clone(),
             parent_column: fk.parent_column.clone(),
             parent_column_index,
@@ -363,6 +365,7 @@ fn build_table_meta(
                 child_table: fk.child_table.clone(),
                 child_column: fk.child_column.clone(),
                 child_column_index,
+                child_column_unique: is_single_column_unique_key(child_table, &fk.child_column),
                 parent_table: fk.parent_table.clone(),
                 parent_column: fk.parent_column.clone(),
                 parent_column_index,
@@ -395,6 +398,14 @@ fn build_table_meta(
         field_lookup,
         primary_key,
     }
+}
+
+fn is_single_column_unique_key(table: &Table, column_name: &str) -> bool {
+    table.indices().iter().any(|index| {
+        index.is_unique() && index.columns().len() == 1 && index.columns()[0].name == column_name
+    }) || table.primary_key().is_some_and(|primary_key| {
+        primary_key.columns().len() == 1 && primary_key.columns()[0].name == column_name
+    })
 }
 
 fn build_reverse_relations(tables: &[Table]) -> BTreeMap<String, Vec<ForeignKey>> {

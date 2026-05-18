@@ -47,6 +47,8 @@ pub mod cache;
 pub mod constraint;
 pub mod journal;
 pub mod lock;
+#[cfg(feature = "benchmark")]
+pub mod profiling;
 pub mod row_store;
 pub mod transaction;
 
@@ -54,5 +56,7 @@ pub use cache::TableCache;
 pub use constraint::ConstraintChecker;
 pub use journal::{Journal, JournalEntry, TableDiff};
 pub use lock::{LockManager, LockType};
+#[cfg(feature = "benchmark")]
+pub use profiling::{StorageGinInsertProfile, StorageInsertProfile};
 pub use row_store::{BTreeIndexStore, HashIndexStore, IndexStore, RowStore};
 pub use transaction::{Transaction, TransactionId, TransactionState};

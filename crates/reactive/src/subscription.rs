@@ -6,6 +6,8 @@
 use crate::change_set::ChangeSet;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use cynos_core::Row;
+use cynos_incremental::{Delta, TraceDeltaBatch};
 use hashbrown::HashMap;
 
 /// Unique identifier for a subscription.
@@ -13,6 +15,12 @@ pub type SubscriptionId = u64;
 
 /// Callback type for change notifications.
 pub type ChangeCallback = Box<dyn Fn(&ChangeSet)>;
+
+/// Callback type for raw delta notifications.
+pub type RawDeltaCallback = Box<dyn Fn(&[Delta<Row>])>;
+
+/// Callback type for late-materialized trace batches.
+pub type TraceBatchCallback = Box<dyn Fn(&TraceDeltaBatch)>;
 
 /// A subscription to query changes.
 pub struct Subscription {
@@ -69,6 +77,179 @@ pub struct SubscriptionManager {
     subscriptions: HashMap<SubscriptionId, Subscription>,
     /// Next subscription ID to assign
     next_id: SubscriptionId,
+}
+
+/// A raw-delta subscription that receives `Delta<Row>` slices directly.
+pub struct RawDeltaSubscription {
+    id: SubscriptionId,
+    callback: RawDeltaCallback,
+    active: bool,
+}
+
+impl RawDeltaSubscription {
+    pub fn new<F>(id: SubscriptionId, callback: F) -> Self
+    where
+        F: Fn(&[Delta<Row>]) + 'static,
+    {
+        Self {
+            id,
+            callback: Box::new(callback),
+            active: true,
+        }
+    }
+
+    #[inline]
+    pub fn id(&self) -> SubscriptionId {
+        self.id
+    }
+
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    #[inline]
+    pub fn deactivate(&mut self) {
+        self.active = false;
+    }
+
+    pub fn notify(&self, deltas: &[Delta<Row>]) {
+        if self.active {
+            (self.callback)(deltas);
+        }
+    }
+}
+
+/// Manages raw-delta subscriptions for an observable query.
+pub struct RawDeltaSubscriptionManager {
+    subscriptions: HashMap<SubscriptionId, RawDeltaSubscription>,
+    next_id: SubscriptionId,
+}
+
+/// A trace-batch subscription that receives `TraceDeltaBatch` values directly.
+pub struct TraceBatchSubscription {
+    _id: SubscriptionId,
+    callback: TraceBatchCallback,
+    active: bool,
+}
+
+impl TraceBatchSubscription {
+    pub fn new<F>(id: SubscriptionId, callback: F) -> Self
+    where
+        F: Fn(&TraceDeltaBatch) + 'static,
+    {
+        Self {
+            _id: id,
+            callback: Box::new(callback),
+            active: true,
+        }
+    }
+
+    pub fn notify(&self, batch: &TraceDeltaBatch) {
+        if self.active {
+            (self.callback)(batch);
+        }
+    }
+}
+
+/// Manages trace-batch subscriptions for an observable query.
+pub struct TraceBatchSubscriptionManager {
+    subscriptions: HashMap<SubscriptionId, TraceBatchSubscription>,
+    next_id: SubscriptionId,
+}
+
+impl Default for RawDeltaSubscriptionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for TraceBatchSubscriptionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RawDeltaSubscriptionManager {
+    pub fn new() -> Self {
+        Self {
+            subscriptions: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    pub fn subscribe<F>(&mut self, callback: F) -> SubscriptionId
+    where
+        F: Fn(&[Delta<Row>]) + 'static,
+    {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let subscription = RawDeltaSubscription::new(id, callback);
+        self.subscriptions.insert(id, subscription);
+        id
+    }
+
+    pub fn unsubscribe(&mut self, id: SubscriptionId) -> bool {
+        self.subscriptions.remove(&id).is_some()
+    }
+
+    pub fn notify_all(&self, deltas: &[Delta<Row>]) {
+        for subscription in self.subscriptions.values() {
+            subscription.notify(deltas);
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.subscriptions.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.subscriptions.is_empty()
+    }
+}
+
+impl TraceBatchSubscriptionManager {
+    pub fn new() -> Self {
+        Self {
+            subscriptions: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    pub fn subscribe<F>(&mut self, callback: F) -> SubscriptionId
+    where
+        F: Fn(&TraceDeltaBatch) + 'static,
+    {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let subscription = TraceBatchSubscription::new(id, callback);
+        self.subscriptions.insert(id, subscription);
+        id
+    }
+
+    pub fn unsubscribe(&mut self, id: SubscriptionId) -> bool {
+        self.subscriptions.remove(&id).is_some()
+    }
+
+    pub fn notify_all(&self, batch: &TraceDeltaBatch) {
+        for subscription in self.subscriptions.values() {
+            subscription.notify(batch);
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.subscriptions.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.subscriptions.is_empty()
+    }
 }
 
 impl Default for SubscriptionManager {

@@ -55,14 +55,27 @@ impl ChangeSet {
     /// Consumers that only need added/removed should use this.
     pub fn from_deltas_only(deltas: &[Delta<Row>]) -> Self {
         let mut changes = Self::new();
+        changes.replace_from_deltas_only(deltas);
+        changes
+    }
+
+    /// Replaces this change set with additions/removals derived from deltas.
+    ///
+    /// This preserves vector capacity across notifications so callers can reuse
+    /// a single `ChangeSet` scratch buffer on hot subscription paths.
+    pub fn replace_from_deltas_only(&mut self, deltas: &[Delta<Row>]) {
+        self.added.clear();
+        self.removed.clear();
+        self.modified.clear();
+        self.current_result.clear();
+
         for delta in deltas {
             if delta.is_insert() {
-                changes.added.push(delta.data.clone());
+                self.added.push(delta.data.clone());
             } else if delta.is_delete() {
-                changes.removed.push(delta.data.clone());
+                self.removed.push(delta.data.clone());
             }
         }
-        changes
     }
 
     /// Creates a change set representing an initial result set.
@@ -215,5 +228,21 @@ mod tests {
         assert!(!cs.is_empty());
         cs.clear();
         assert!(cs.is_empty());
+    }
+
+    #[test]
+    fn test_change_set_replace_from_deltas_only_resets_previous_contents() {
+        let mut cs = ChangeSet::initial(vec![make_row(1, 10), make_row(2, 20)]);
+        cs.modify(make_row(3, 30), make_row(3, 31));
+
+        cs.replace_from_deltas_only(&[
+            Delta::insert(make_row(4, 40)),
+            Delta::delete(make_row(5, 50)),
+        ]);
+
+        assert_eq!(cs.added.len(), 1);
+        assert_eq!(cs.removed.len(), 1);
+        assert!(cs.modified.is_empty());
+        assert!(cs.current_result.is_empty());
     }
 }

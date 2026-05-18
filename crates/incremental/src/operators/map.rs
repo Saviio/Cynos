@@ -41,7 +41,10 @@ pub fn project_incremental(input: &[Delta<Row>], columns: &[usize]) -> Vec<Delta
                 .iter()
                 .filter_map(|&col| d.data.get(col).cloned())
                 .collect();
-            Delta::new(Row::dummy(projected_values), d.diff)
+            Delta::new(
+                Row::new_with_version(d.data.id(), d.data.version(), projected_values),
+                d.diff,
+            )
         })
         .collect()
 }
@@ -92,5 +95,7 @@ mod tests {
         assert_eq!(projected[0].data.len(), 2);
         assert_eq!(projected[0].data.get(0), Some(&Value::Int64(1)));
         assert_eq!(projected[0].data.get(1), Some(&Value::Int32(25)));
+        assert_eq!(projected[0].data.id(), 1);
+        assert_eq!(projected[0].data.version(), 1);
     }
 }

@@ -62,7 +62,7 @@ fn main() -> cynos_core::Result<()> {
 
 - Use `SchemaLayout::from_projection()` for projected queries.
 - Use `SchemaLayout::from_schemas()` when encoding joined rows.
-- Enable the `wasm` feature if you want `wasm-bindgen` exports such as `BinaryResult::asView()`.
+- Enable the `wasm` feature if you want `wasm-bindgen` exports such as `BinaryResult::asView()` and `BinaryResult::intoTransferable()`.
 
 ## License
 

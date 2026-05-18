@@ -46,7 +46,7 @@ harness = false
 default = ["jsonb", "incremental"]
 jsonb = []
 incremental = []
-benchmark = []
+benchmark = ["cynos-storage/benchmark"]
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false

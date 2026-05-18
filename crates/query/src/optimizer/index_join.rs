@@ -20,6 +20,7 @@ use crate::context::{ExecutionContext, IndexInfo};
 use crate::planner::PhysicalPlan;
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 const INDEX_JOIN_ALWAYS_OUTER_ROWS: usize = 64;
 const INDEX_JOIN_MAX_OUTER_ROWS: usize = 4096;
@@ -56,8 +57,7 @@ impl<'a> IndexJoinPass<'a> {
                 let left = self.traverse(*left, None);
                 let right = self.traverse(*right, None);
 
-                // Only optimize inner equi-joins
-                if join_type != JoinType::Inner || !condition.is_equi_join() {
+                if !condition.is_equi_join() {
                     return PhysicalPlan::HashJoin {
                         left: Box::new(left),
                         right: Box::new(right),
@@ -69,7 +69,7 @@ impl<'a> IndexJoinPass<'a> {
 
                 // Try to find an index on either side
                 if let Some((outer, inner_table, inner_index, outer_is_left)) =
-                    self.find_index_join_candidate(&left, &right, &condition, row_goal)
+                    self.find_index_join_candidate(&left, &right, &condition, join_type, row_goal)
                 {
                     return PhysicalPlan::IndexNestedLoopJoin {
                         outer: Box::new(outer),
@@ -102,8 +102,7 @@ impl<'a> IndexJoinPass<'a> {
                 let left = self.traverse(*left, None);
                 let right = self.traverse(*right, None);
 
-                // Only optimize inner equi-joins
-                if join_type != JoinType::Inner || !condition.is_equi_join() {
+                if !condition.is_equi_join() {
                     return PhysicalPlan::NestedLoopJoin {
                         left: Box::new(left),
                         right: Box::new(right),
@@ -115,7 +114,7 @@ impl<'a> IndexJoinPass<'a> {
 
                 // Try to find an index on either side
                 if let Some((outer, inner_table, inner_index, outer_is_left)) =
-                    self.find_index_join_candidate(&left, &right, &condition, row_goal)
+                    self.find_index_join_candidate(&left, &right, &condition, join_type, row_goal)
                 {
                     return PhysicalPlan::IndexNestedLoopJoin {
                         outer: Box::new(outer),
@@ -239,6 +238,7 @@ impl<'a> IndexJoinPass<'a> {
         left: &PhysicalPlan,
         right: &PhysicalPlan,
         condition: &Expr,
+        join_type: JoinType,
         row_goal: Option<usize>,
     ) -> Option<(PhysicalPlan, String, String, bool)> {
         // Extract join columns from the condition
@@ -246,18 +246,39 @@ impl<'a> IndexJoinPass<'a> {
         let (left_col, right_col) =
             self.align_join_columns(left, right, cond_left_col, cond_right_col)?;
 
-        // Check if right side is a table scan with an index on the join column
-        if let Some((table, index)) = self.get_indexed_table_scan(right, right_col) {
-            if self.should_use_index_join(left, &table, &index, row_goal) {
-                return Some((left.clone(), table, index.name.clone(), true));
-            }
-        }
+        match join_type {
+            JoinType::Inner => {
+                // Check if right side is a table scan with an index on the join column
+                if let Some((table, index)) = self.get_indexed_table_scan(right, right_col) {
+                    if self.should_use_index_join(left, &table, &index, row_goal) {
+                        return Some((left.clone(), table, index.name.clone(), true));
+                    }
+                }
 
-        // Check if left side is a table scan with an index on the join column
-        if let Some((table, index)) = self.get_indexed_table_scan(left, left_col) {
-            if self.should_use_index_join(right, &table, &index, row_goal) {
-                return Some((right.clone(), table, index.name.clone(), false));
+                // Check if left side is a table scan with an index on the join column
+                if let Some((table, index)) = self.get_indexed_table_scan(left, left_col) {
+                    if self.should_use_index_join(right, &table, &index, row_goal) {
+                        return Some((right.clone(), table, index.name.clone(), false));
+                    }
+                }
             }
+            JoinType::LeftOuter => {
+                // Preserve LEFT JOIN semantics by probing the nullable right side.
+                if let Some((table, index)) = self.get_indexed_table_scan(right, right_col) {
+                    if self.should_use_index_join(left, &table, &index, row_goal) {
+                        return Some((left.clone(), table, index.name.clone(), true));
+                    }
+                }
+            }
+            JoinType::RightOuter => {
+                // Preserve RIGHT JOIN semantics by probing the nullable left side.
+                if let Some((table, index)) = self.get_indexed_table_scan(left, left_col) {
+                    if self.should_use_index_join(right, &table, &index, row_goal) {
+                        return Some((right.clone(), table, index.name.clone(), false));
+                    }
+                }
+            }
+            JoinType::FullOuter | JoinType::Cross => {}
         }
 
         None
@@ -329,7 +350,7 @@ impl<'a> IndexJoinPass<'a> {
                 }
                 // Check if there's an index on this column
                 let index = self.ctx.find_index(table, &[column.column.as_str()])?;
-                if index.is_gin() {
+                if !index.supports_point_lookup() {
                     return None;
                 }
                 Some((table.clone(), index.clone()))
@@ -345,17 +366,14 @@ impl<'a> IndexJoinPass<'a> {
         inner_index: &IndexInfo,
         row_goal: Option<usize>,
     ) -> bool {
-        if outer.collect_tables().len() != 1 {
-            return false;
-        }
-
         let outer_rows = self.estimate_rows(outer);
         let effective_outer_rows = row_goal.map_or(outer_rows, |goal| outer_rows.min(goal));
-        let inner_rows = self
-            .ctx
-            .get_stats(inner_table)
-            .map(|stats| stats.row_count)
-            .unwrap_or(1000);
+        let inner_rows = self.ctx.row_count(inner_table);
+        let point_lookup_rows = self.ctx.estimate_point_lookup_rows(
+            inner_table,
+            &inner_index.name,
+            inner_index.is_unique,
+        );
 
         if effective_outer_rows == 0 || inner_rows == 0 {
             return false;
@@ -367,6 +385,14 @@ impl<'a> IndexJoinPass<'a> {
 
         if inner_index.is_unique {
             return effective_outer_rows <= INDEX_JOIN_MAX_UNIQUE_EFFECTIVE_OUTER_ROWS;
+        }
+
+        if point_lookup_rows > 0 {
+            let hash_join_cost = inner_rows.saturating_add(effective_outer_rows);
+            let index_join_cost = effective_outer_rows.saturating_mul(point_lookup_rows);
+            if index_join_cost <= hash_join_cost {
+                return true;
+            }
         }
 
         if row_goal.is_some()
@@ -386,24 +412,84 @@ impl<'a> IndexJoinPass<'a> {
 
     fn estimate_rows(&self, plan: &PhysicalPlan) -> usize {
         match plan {
-            PhysicalPlan::TableScan { table } => self
-                .ctx
-                .get_stats(table)
-                .map(|stats| stats.row_count)
-                .unwrap_or(1000),
+            PhysicalPlan::TableScan { table } => {
+                let count = self.ctx.row_count(table);
+                if count > 0 {
+                    count
+                } else {
+                    1000
+                }
+            }
             PhysicalPlan::IndexGet { .. } => 1,
             PhysicalPlan::IndexInGet { keys, .. } => keys.len(),
-            PhysicalPlan::IndexScan { table, .. } | PhysicalPlan::GinIndexScan { table, .. } => {
-                self.ctx
-                    .get_stats(table)
-                    .map(|stats| core::cmp::max(stats.row_count / 10, 1))
-                    .unwrap_or(100)
+            PhysicalPlan::IndexScan { table, .. } => {
+                let row_count = self.ctx.row_count(table);
+                if row_count == 0 {
+                    100
+                } else {
+                    core::cmp::max(row_count / 10, 1)
+                }
             }
-            PhysicalPlan::GinIndexScanMulti { table, .. } => self
-                .ctx
-                .get_stats(table)
-                .map(|stats| core::cmp::max(stats.row_count / 20, 1))
-                .unwrap_or(50),
+            PhysicalPlan::GinIndexScan {
+                table,
+                index,
+                key,
+                value,
+                ..
+            } => {
+                if let Some(value) = value {
+                    self.ctx
+                        .gin_key_value_cost(table, index, key, value)
+                        .filter(|cost| *cost > 0)
+                        .unwrap_or_else(|| {
+                            let row_count = self.ctx.row_count(table);
+                            if row_count == 0 {
+                                100
+                            } else {
+                                core::cmp::max(row_count / 10, 1)
+                            }
+                        })
+                } else {
+                    self.ctx
+                        .gin_key_cost(table, index, key)
+                        .filter(|cost| *cost > 0)
+                        .unwrap_or_else(|| {
+                            let row_count = self.ctx.row_count(table);
+                            if row_count == 0 {
+                                100
+                            } else {
+                                core::cmp::max(row_count / 10, 1)
+                            }
+                        })
+                }
+            }
+            PhysicalPlan::GinIndexScanMulti {
+                table,
+                index,
+                pairs,
+                match_all,
+                ..
+            } => {
+                let costs: Vec<usize> = pairs
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        self.ctx.gin_key_value_cost(table, index, key, value)
+                    })
+                    .collect();
+                let estimated = if *match_all {
+                    costs.iter().copied().min()
+                } else {
+                    Some(costs.iter().copied().sum())
+                };
+                estimated.filter(|cost| *cost > 0).unwrap_or_else(|| {
+                    let row_count = self.ctx.row_count(table);
+                    if row_count == 0 {
+                        50
+                    } else {
+                        core::cmp::max(row_count / 20, 1)
+                    }
+                })
+            }
             PhysicalPlan::Filter { input, .. } => core::cmp::max(self.estimate_rows(input) / 10, 1),
             PhysicalPlan::Project { input, .. }
             | PhysicalPlan::Sort { input, .. }
@@ -428,13 +514,30 @@ impl<'a> IndexJoinPass<'a> {
                     core::cmp::max(self.estimate_rows(input) / 10, 1)
                 }
             }
-            PhysicalPlan::HashJoin { left, right, .. }
-            | PhysicalPlan::SortMergeJoin { left, right, .. }
-            | PhysicalPlan::NestedLoopJoin { left, right, .. }
-            | PhysicalPlan::CrossProduct { left, right } => core::cmp::max(
+            PhysicalPlan::HashJoin {
+                left,
+                right,
+                condition,
+                join_type,
+                ..
+            }
+            | PhysicalPlan::SortMergeJoin {
+                left,
+                right,
+                condition,
+                join_type,
+                ..
+            }
+            | PhysicalPlan::NestedLoopJoin {
+                left,
+                right,
+                condition,
+                join_type,
+                ..
+            } => self.estimate_join_rows(left, right, condition, *join_type),
+            PhysicalPlan::CrossProduct { left, right } => core::cmp::max(
                 self.estimate_rows(left)
-                    .saturating_mul(self.estimate_rows(right))
-                    / 10,
+                    .saturating_mul(self.estimate_rows(right)),
                 1,
             ),
             PhysicalPlan::Union { left, right, .. } => self
@@ -443,6 +546,68 @@ impl<'a> IndexJoinPass<'a> {
             PhysicalPlan::IndexNestedLoopJoin { outer, .. } => self.estimate_rows(outer),
             PhysicalPlan::Empty => 0,
         }
+    }
+
+    fn estimate_join_rows(
+        &self,
+        left: &PhysicalPlan,
+        right: &PhysicalPlan,
+        condition: &Expr,
+        join_type: JoinType,
+    ) -> usize {
+        let left_rows = self.estimate_rows(left);
+        let right_rows = self.estimate_rows(right);
+
+        if let Some((left_col, right_col)) = self.join_columns_for_sides(left, right, condition) {
+            let left_unique = self.relation_has_unique_lookup(left, left_col);
+            let right_unique = self.relation_has_unique_lookup(right, right_col);
+
+            match join_type {
+                JoinType::LeftOuter if right_unique => return left_rows.max(1),
+                JoinType::RightOuter if left_unique => return right_rows.max(1),
+                JoinType::Inner => {
+                    if right_unique {
+                        return left_rows.max(1);
+                    }
+                    if left_unique {
+                        return right_rows.max(1);
+                    }
+                }
+                JoinType::FullOuter | JoinType::Cross => {}
+                JoinType::LeftOuter => return left_rows.max(1),
+                JoinType::RightOuter => return right_rows.max(1),
+            }
+        }
+
+        match join_type {
+            JoinType::LeftOuter => left_rows.max(1),
+            JoinType::RightOuter => right_rows.max(1),
+            JoinType::FullOuter => left_rows.saturating_add(right_rows).max(1),
+            JoinType::Cross => left_rows.saturating_mul(right_rows).max(1),
+            JoinType::Inner => core::cmp::max(left_rows.saturating_mul(right_rows) / 10, 1),
+        }
+    }
+
+    fn join_columns_for_sides<'b>(
+        &self,
+        left: &PhysicalPlan,
+        right: &PhysicalPlan,
+        condition: &'b Expr,
+    ) -> Option<(&'b ColumnRef, &'b ColumnRef)> {
+        let (first, second) = self.extract_join_columns(condition)?;
+        self.align_join_columns(left, right, first, second)
+    }
+
+    fn relation_has_unique_lookup(&self, plan: &PhysicalPlan, column: &ColumnRef) -> bool {
+        let tables = plan.collect_tables();
+        if tables.len() != 1 || !tables.iter().any(|table| table == &column.table) {
+            return false;
+        }
+
+        self.ctx
+            .find_index(&column.table, &[column.column.as_str()])
+            .map(|index| index.is_unique && index.supports_point_lookup())
+            .unwrap_or(false)
     }
 }
 
@@ -579,11 +744,10 @@ mod tests {
     }
 
     #[test]
-    fn test_outer_join_not_optimized() {
+    fn test_left_outer_join_can_use_index_join() {
         let ctx = create_test_context();
         let pass = IndexJoinPass::new(&ctx);
 
-        // Left outer join should not be converted to index join
         let plan = PhysicalPlan::hash_join(
             PhysicalPlan::table_scan("a"),
             PhysicalPlan::table_scan("b"),
@@ -592,9 +756,154 @@ mod tests {
         );
 
         let result = pass.optimize(plan);
+        if let PhysicalPlan::IndexNestedLoopJoin {
+            inner_table,
+            outer_is_left,
+            join_type,
+            ..
+        } = result
+        {
+            assert_eq!(inner_table, "b");
+            assert!(outer_is_left);
+            assert_eq!(join_type, JoinType::LeftOuter);
+        } else {
+            panic!("expected left outer index nested loop join");
+        }
+    }
 
-        // Should remain as HashJoin
+    #[test]
+    fn test_right_outer_join_can_use_index_join() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "a",
+            TableStats {
+                row_count: 100,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new("idx_id", alloc::vec!["id".into()], true,)],
+            },
+        );
+        ctx.register_table(
+            "b",
+            TableStats {
+                row_count: 2,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        let pass = IndexJoinPass::new(&ctx);
+
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("a"),
+            PhysicalPlan::table_scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+            JoinType::RightOuter,
+        );
+
+        let result = pass.optimize(plan);
+        if let PhysicalPlan::IndexNestedLoopJoin {
+            inner_table,
+            outer_is_left,
+            join_type,
+            ..
+        } = result
+        {
+            assert_eq!(inner_table, "a");
+            assert!(!outer_is_left);
+            assert_eq!(join_type, JoinType::RightOuter);
+        } else {
+            panic!("expected right outer index nested loop join");
+        }
+    }
+
+    #[test]
+    fn test_full_outer_join_remains_hash_join() {
+        let ctx = create_test_context();
+        let pass = IndexJoinPass::new(&ctx);
+
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("a"),
+            PhysicalPlan::table_scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+            JoinType::FullOuter,
+        );
+
+        let result = pass.optimize(plan);
         assert!(matches!(result, PhysicalPlan::HashJoin { .. }));
+    }
+
+    #[test]
+    fn test_multi_table_inner_join_can_still_use_index_join() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "issues",
+            TableStats {
+                row_count: 1_000,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        ctx.register_table(
+            "projects",
+            TableStats {
+                row_count: 100,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "pk_projects_id",
+                    alloc::vec!["id".into()],
+                    true,
+                )],
+            },
+        );
+        ctx.register_table(
+            "project_counters",
+            TableStats {
+                row_count: 100,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "pk_project_counters_project_id",
+                    alloc::vec!["project_id".into()],
+                    true,
+                )],
+            },
+        );
+
+        let pass = IndexJoinPass::new(&ctx);
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::hash_join(
+                PhysicalPlan::table_scan("issues"),
+                PhysicalPlan::table_scan("projects"),
+                Expr::eq(
+                    Expr::column("issues", "project_id", 1),
+                    Expr::column("projects", "id", 0),
+                ),
+                JoinType::Inner,
+            ),
+            PhysicalPlan::table_scan("project_counters"),
+            Expr::eq(
+                Expr::column("projects", "id", 0),
+                Expr::column("project_counters", "project_id", 0),
+            ),
+            JoinType::Inner,
+        );
+
+        let result = pass.optimize(plan);
+
+        match result {
+            PhysicalPlan::IndexNestedLoopJoin {
+                inner_table,
+                join_type,
+                outer,
+                ..
+            } => {
+                assert_eq!(inner_table, "project_counters");
+                assert_eq!(join_type, JoinType::Inner);
+                assert!(matches!(*outer, PhysicalPlan::IndexNestedLoopJoin { .. }));
+            }
+            other => panic!(
+                "expected nested index joins for multi-table inner join, got {:?}",
+                other
+            ),
+        }
     }
 
     #[test]

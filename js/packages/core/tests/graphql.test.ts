@@ -39,6 +39,80 @@ function createGraphqlDb(): Database {
   return db;
 }
 
+function createGraphqlUniqueProfileDb(): Database {
+  const db = createGraphqlDb();
+
+  const profiles = db
+    .createTable('profiles')
+    .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+    .column('user_id', JsDataType.Int64, new ColumnOptions().setUnique(true))
+    .column('bio', JsDataType.String, null)
+    .foreignKey(
+      'fk_profiles_user',
+      'user_id',
+      'users',
+      'id',
+      new ForeignKeyOptions().fieldName('user').reverseFieldName('profile')
+    );
+  db.registerTable(profiles);
+
+  return db;
+}
+
+function createGraphqlIssueFilterDb(): Database {
+  dbCounter += 1;
+
+  const db = new Database(`graphql_issue_filter_${dbCounter}`);
+  const projects = db
+    .createTable('projects')
+    .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+    .column('healthScore', JsDataType.Int32, null);
+  db.registerTable(projects);
+
+  const projectCounters = db
+    .createTable('projectCounters')
+    .column('projectId', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+    .column('openIssueCount', JsDataType.Int32, null)
+    .foreignKey(
+      'fk_project_counters_project',
+      'projectId',
+      'projects',
+      'id',
+      new ForeignKeyOptions().fieldName('project').reverseFieldName('counter')
+    );
+  db.registerTable(projectCounters);
+
+  const projectSnapshots = db
+    .createTable('projectSnapshots')
+    .column('projectId', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+    .column('velocity', JsDataType.Int32, null)
+    .foreignKey(
+      'fk_project_snapshots_project',
+      'projectId',
+      'projects',
+      'id',
+      new ForeignKeyOptions().fieldName('project').reverseFieldName('snapshot')
+    );
+  db.registerTable(projectSnapshots);
+
+  const issues = db
+    .createTable('issues')
+    .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+    .column('projectId', JsDataType.Int64, null)
+    .column('title', JsDataType.String, null)
+    .column('status', JsDataType.String, null)
+    .foreignKey(
+      'fk_issues_project',
+      'projectId',
+      'projects',
+      'id',
+      new ForeignKeyOptions().fieldName('project').reverseFieldName('issues')
+    );
+  db.registerTable(issues);
+
+  return db;
+}
+
 async function flushGraphqlReactivity(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
@@ -287,6 +361,151 @@ describe('GraphQL', () => {
     ]);
 
     unsubscribe();
+  });
+
+  it('keeps unique reverse relation limit(1) subscriptions live without snapshot fallback semantics', async () => {
+    const db = createGraphqlUniqueProfileDb();
+
+    await db.insert('users').values([
+      { id: 1, name: 'Alice' },
+    ]).exec();
+
+    const subscription = db.subscribeGraphql(`
+      subscription UserCard {
+        usersByPk(pk: { id: 1 }) {
+          id
+          name
+          profile(limit: 1) {
+            id
+            bio
+          }
+        }
+      }
+    `);
+
+    expect(dataOf(subscription.getResult())).toEqual({
+      usersByPk: {
+        id: 1,
+        name: 'Alice',
+        profile: [],
+      },
+    });
+
+    db.graphql(`
+      mutation {
+        insertProfiles(input: [{ id: 10, user_id: 1, bio: "First" }]) {
+          id
+          bio
+        }
+      }
+    `);
+
+    await flushGraphqlReactivity();
+    expect(dataOf(subscription.getResult())).toEqual({
+      usersByPk: {
+        id: 1,
+        name: 'Alice',
+        profile: [{ id: 10, bio: 'First' }],
+      },
+    });
+
+    db.graphql(`
+      mutation {
+        updateProfiles(where: { id: { eq: 10 } }, set: { bio: "Updated" }) {
+          id
+          bio
+        }
+      }
+    `);
+
+    await flushGraphqlReactivity();
+    expect(dataOf(subscription.getResult())).toEqual({
+      usersByPk: {
+        id: 1,
+        name: 'Alice',
+        profile: [{ id: 10, bio: 'Updated' }],
+      },
+    });
+  });
+
+  it('tracks root membership through single-valued relation filters', async () => {
+    const db = createGraphqlIssueFilterDb();
+
+    await db.insert('projects').values([{ id: 1, healthScore: 30 }]).exec();
+    await db.insert('projectCounters').values([{ projectId: 1, openIssueCount: 6 }]).exec();
+    await db.insert('projectSnapshots').values([{ projectId: 1, velocity: 20 }]).exec();
+    await db.insert('issues').values([
+      { id: 100, projectId: 1, title: 'Issue', status: 'open' },
+    ]).exec();
+
+    const subscription = db.subscribeGraphql(`
+      subscription IssueFeed {
+        issues(
+          where: {
+            AND: [
+              { status: { eq: "open" } }
+              {
+                project: {
+                  AND: [
+                    { healthScore: { gte: 45 } }
+                    { counter: { openIssueCount: { gte: 5 } } }
+                    { snapshot: { velocity: { gte: 18 } } }
+                  ]
+                }
+              }
+            ]
+          }
+        ) {
+          id
+          title
+          project {
+            id
+            counter(limit: 1) {
+              openIssueCount
+            }
+            snapshot(limit: 1) {
+              velocity
+            }
+          }
+        }
+      }
+    `);
+
+    expect(dataOf(subscription.getResult())).toEqual({ issues: [] });
+
+    db.graphql(`
+      mutation {
+        updateProjects(where: { id: { eq: 1 } }, set: { healthScore: 50 }) {
+          id
+        }
+      }
+    `);
+
+    await flushGraphqlReactivity();
+    expect(dataOf(subscription.getResult())).toEqual({
+      issues: [
+        {
+          id: 100,
+          title: 'Issue',
+          project: {
+            id: 1,
+            counter: [{ openIssueCount: 6 }],
+            snapshot: [{ velocity: 20 }],
+          },
+        },
+      ],
+    });
+
+    db.graphql(`
+      mutation {
+        updateProjectSnapshots(where: { projectId: { eq: 1 } }, set: { velocity: 5 }) {
+          projectId
+        }
+      }
+    `);
+
+    await flushGraphqlReactivity();
+    expect(dataOf(subscription.getResult())).toEqual({ issues: [] });
   });
 
   it('pushes nested relation updates for GraphQL subscriptions', async () => {

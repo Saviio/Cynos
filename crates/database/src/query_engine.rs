@@ -6,14 +6,26 @@
 #[allow(unused_imports)]
 use alloc::boxed::Box;
 use alloc::rc::Rc;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use cynos_core::{Row, Value, DUMMY_ROW_ID};
-use cynos_index::KeyRange;
-use cynos_query::context::{ExecutionContext, IndexInfo, QueryIndexType, TableStats};
+use cynos_index::{contains_trigram_pairs, KeyRange};
+use cynos_jsonb::JsonPath;
+use cynos_query::ast::{BinaryOp, Expr as AstExpr};
+use cynos_query::context::{
+    ExecutionContext, IndexInfo, PlannerFeatureFlags, PlanningIntent, PlanningMode, QueryIndexType,
+    TableStats,
+};
 use cynos_query::executor::{DataSource, ExecutionError, ExecutionResult, PhysicalPlanRunner};
 pub use cynos_query::plan_cache::CompiledPhysicalPlan;
-use cynos_query::planner::{LogicalPlan, PhysicalPlan, QueryPlanner};
+use cynos_query::planner::{LogicalPlan, PhysicalPlan, PlannerProfile, QueryPlanner};
 use cynos_storage::TableCache;
+use hashbrown::HashSet;
+
+pub(crate) use crate::snapshot_refresh_policy::{
+    PartialRefreshWindowCostInput, RootSubsetPlanVariant, RootSubsetPlanningCostInput,
+    RootSubsetRefreshCostInput, RootSubsetRefreshDecision, SnapshotRefreshCostModel,
+};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -30,6 +42,44 @@ extern "C" {
 /// This allows the query engine to access table data and indexes.
 pub struct TableCacheDataSource<'a> {
     cache: &'a TableCache,
+}
+
+struct TableSubsetDataSource<'a> {
+    cache: &'a TableCache,
+    subset_table: &'a str,
+    sorted_allowed_row_ids: Vec<u64>,
+    subset_decision: RootSubsetRefreshDecision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompilePlanProfile {
+    Default,
+    RootSubset(RootSubsetPlanningProfile),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootSubsetPlanningProfile {
+    pub variant: RootSubsetPlanVariant,
+}
+
+impl RootSubsetPlanningProfile {
+    pub(crate) fn small() -> Self {
+        Self {
+            variant: RootSubsetPlanVariant::Small,
+        }
+    }
+
+    pub(crate) fn large() -> Self {
+        Self {
+            variant: RootSubsetPlanVariant::Large,
+        }
+    }
+}
+
+pub(crate) fn partial_refresh_overscan_for_limit(limit: usize) -> usize {
+    SnapshotRefreshCostModel::DEFAULT
+        .decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(limit))
+        .overscan
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +188,64 @@ impl<'a> TableCacheDataSource<'a> {
     /// Creates a new data source from a TableCache reference.
     pub fn new(cache: &'a TableCache) -> Self {
         Self { cache }
+    }
+}
+
+impl<'a> TableSubsetDataSource<'a> {
+    fn try_new(
+        cache: &'a TableCache,
+        subset_table: &'a str,
+        allowed_row_ids: &'a HashSet<u64>,
+    ) -> ExecutionResult<Self> {
+        let store = cache
+            .get_table(subset_table)
+            .ok_or_else(|| ExecutionError::TableNotFound(subset_table.into()))?;
+        let mut sorted_allowed_row_ids: Vec<u64> = allowed_row_ids.iter().copied().collect();
+        sorted_allowed_row_ids.sort_unstable();
+        let subset_cost = RootSubsetRefreshCostInput::new(allowed_row_ids.len(), store.len());
+        let subset_decision =
+            SnapshotRefreshCostModel::DEFAULT.decide_root_subset_refresh_for(subset_cost);
+
+        Ok(Self {
+            cache,
+            subset_table,
+            sorted_allowed_row_ids,
+            subset_decision,
+        })
+    }
+
+    #[inline]
+    fn is_subset_table(&self, table: &str) -> bool {
+        table == self.subset_table
+    }
+
+    #[inline]
+    fn restricted_row_ids(&self) -> &[u64] {
+        &self.sorted_allowed_row_ids
+    }
+
+    #[inline]
+    fn subset_driven(&self) -> bool {
+        self.subset_decision.variant == RootSubsetPlanVariant::Small
+    }
+
+    fn scalar_range(
+        range_start: Option<&Value>,
+        range_end: Option<&Value>,
+        include_start: bool,
+        include_end: bool,
+    ) -> Option<KeyRange<Value>> {
+        match (range_start, range_end) {
+            (Some(start), Some(end)) => Some(KeyRange::bound(
+                start.clone(),
+                end.clone(),
+                !include_start,
+                !include_end,
+            )),
+            (Some(start), None) => Some(KeyRange::lower_bound(start.clone(), !include_start)),
+            (None, Some(end)) => Some(KeyRange::upper_bound(end.clone(), !include_end)),
+            (None, None) => None,
+        }
     }
 }
 
@@ -451,13 +559,18 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
         table: &str,
         index: &str,
         pairs: &[(&str, &str)],
+        match_all: bool,
     ) -> ExecutionResult<Vec<Rc<Row>>> {
         let store = self
             .cache
             .get_table(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
-        Ok(store.gin_index_get_by_key_values_all(index, pairs))
+        Ok(if match_all {
+            store.gin_index_get_by_key_values_all(index, pairs)
+        } else {
+            store.gin_index_get_by_key_values_any(index, pairs)
+        })
     }
 
     fn visit_gin_index_rows_multi<F>(
@@ -465,6 +578,7 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
         table: &str,
         index: &str,
         pairs: &[(&str, &str)],
+        match_all: bool,
         mut visitor: F,
     ) -> ExecutionResult<()>
     where
@@ -475,7 +589,532 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
             .get_table(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
-        store.visit_gin_index_by_key_values_all(index, pairs, |row| visitor(row));
+        if match_all {
+            store.visit_gin_index_by_key_values_all(index, pairs, |row| visitor(row));
+        } else {
+            store.visit_gin_index_by_key_values_any(index, pairs, |row| visitor(row));
+        }
+        Ok(())
+    }
+}
+
+impl<'a> DataSource for TableSubsetDataSource<'a> {
+    fn get_table_rows(&self, table: &str) -> ExecutionResult<Vec<Rc<Row>>> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            return Ok(store.scan().collect());
+        }
+
+        Ok(store.get_rows_by_ids(self.restricted_row_ids()))
+    }
+
+    fn visit_table_rows<F>(&self, table: &str, mut visitor: F) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        if !self.is_subset_table(table) {
+            store.visit_rows(|row| visitor(row));
+            return Ok(());
+        }
+
+        store.visit_rows_by_ids(self.restricted_row_ids(), |row| visitor(row));
+        Ok(())
+    }
+
+    fn get_index_range_with_limit(
+        &self,
+        table: &str,
+        index: &str,
+        range_start: Option<&Value>,
+        range_end: Option<&Value>,
+        include_start: bool,
+        include_end: bool,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        let range = Self::scalar_range(range_start, range_end, include_start, include_end);
+        if !self.is_subset_table(table) {
+            return Ok(store.index_scan_with_options(
+                index,
+                range.as_ref(),
+                limit,
+                offset,
+                reverse,
+            ));
+        }
+
+        let mut rows = Vec::new();
+        store.visit_index_scan_with_options_restricted(
+            index,
+            range.as_ref(),
+            limit,
+            offset,
+            reverse,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        Ok(rows)
+    }
+
+    fn visit_index_range_with_limit<F>(
+        &self,
+        table: &str,
+        index: &str,
+        range_start: Option<&Value>,
+        range_end: Option<&Value>,
+        include_start: bool,
+        include_end: bool,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        let range = Self::scalar_range(range_start, range_end, include_start, include_end);
+        if !self.is_subset_table(table) {
+            store.visit_index_scan_with_options(
+                index,
+                range.as_ref(),
+                limit,
+                offset,
+                reverse,
+                |row| visitor(row),
+            );
+            return Ok(());
+        }
+
+        store.visit_index_scan_with_options_restricted(
+            index,
+            range.as_ref(),
+            limit,
+            offset,
+            reverse,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| visitor(row),
+        );
+        Ok(())
+    }
+
+    fn visit_index_range_composite_with_limit<F>(
+        &self,
+        table: &str,
+        index: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            store.visit_index_scan_composite_with_options(
+                index,
+                range,
+                limit,
+                offset,
+                reverse,
+                |row| visitor(row),
+            );
+            return Ok(());
+        }
+
+        store.visit_index_scan_composite_with_options_restricted(
+            index,
+            range,
+            limit,
+            offset,
+            reverse,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| visitor(row),
+        );
+        Ok(())
+    }
+
+    fn visit_index_point_with_limit<F>(
+        &self,
+        table: &str,
+        index: &str,
+        key: &Value,
+        limit: Option<usize>,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            store.visit_index_scan_with_options(
+                index,
+                Some(&KeyRange::only(key.clone())),
+                limit,
+                0,
+                false,
+                |row| visitor(row),
+            );
+            return Ok(());
+        }
+
+        store.visit_index_scan_with_options_restricted(
+            index,
+            Some(&KeyRange::only(key.clone())),
+            limit,
+            0,
+            false,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| visitor(row),
+        );
+        Ok(())
+    }
+
+    fn get_index_range_composite_with_limit(
+        &self,
+        table: &str,
+        index: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        if !self.is_subset_table(table) {
+            return Ok(
+                store.index_scan_composite_with_options(index, range, limit, offset, reverse)
+            );
+        }
+
+        let mut rows = Vec::new();
+        store.visit_index_scan_composite_with_options_restricted(
+            index,
+            range,
+            limit,
+            offset,
+            reverse,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        Ok(rows)
+    }
+
+    fn get_index_point(
+        &self,
+        table: &str,
+        index: &str,
+        key: &Value,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        if !self.is_subset_table(table) {
+            return Ok(store.index_scan(index, Some(&KeyRange::only(key.clone()))));
+        }
+
+        let mut rows = Vec::new();
+        store.visit_index_scan_with_options_restricted(
+            index,
+            Some(&KeyRange::only(key.clone())),
+            None,
+            0,
+            false,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        Ok(rows)
+    }
+
+    fn get_index_point_with_limit(
+        &self,
+        table: &str,
+        index: &str,
+        key: &Value,
+        limit: Option<usize>,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            return Ok(store.index_scan_with_options(
+                index,
+                Some(&KeyRange::only(key.clone())),
+                limit,
+                0,
+                false,
+            ));
+        }
+
+        let mut rows = Vec::new();
+        store.visit_index_scan_with_options_restricted(
+            index,
+            Some(&KeyRange::only(key.clone())),
+            limit,
+            0,
+            false,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        Ok(rows)
+    }
+
+    fn get_column_count(&self, table: &str) -> ExecutionResult<usize> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        Ok(store.schema().columns().len())
+    }
+
+    fn get_table_row_count(&self, table: &str) -> ExecutionResult<usize> {
+        if !self.is_subset_table(table) {
+            let store = self
+                .cache
+                .get_table(table)
+                .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+            return Ok(store.len());
+        }
+
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        Ok(store.count_existing_rows_by_ids(self.restricted_row_ids()))
+    }
+
+    fn get_gin_index_rows(
+        &self,
+        table: &str,
+        index: &str,
+        key: &str,
+        value: &str,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            return Ok(store.gin_index_get_by_key_value(index, key, value));
+        }
+        let mut rows = Vec::new();
+        store.visit_gin_index_by_key_value_restricted(
+            index,
+            key,
+            value,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        Ok(rows)
+    }
+
+    fn get_gin_index_rows_by_key(
+        &self,
+        table: &str,
+        index: &str,
+        key: &str,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            return Ok(store.gin_index_get_by_key(index, key));
+        }
+        let mut rows = Vec::new();
+        store.visit_gin_index_by_key_restricted(
+            index,
+            key,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        Ok(rows)
+    }
+
+    fn get_gin_index_rows_multi(
+        &self,
+        table: &str,
+        index: &str,
+        pairs: &[(&str, &str)],
+        match_all: bool,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            return Ok(if match_all {
+                store.gin_index_get_by_key_values_all(index, pairs)
+            } else {
+                store.gin_index_get_by_key_values_any(index, pairs)
+            });
+        }
+
+        let mut rows = Vec::new();
+        store.visit_gin_index_by_key_values_restricted(
+            index,
+            pairs,
+            match_all,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        Ok(rows)
+    }
+
+    fn visit_gin_index_rows<F>(
+        &self,
+        table: &str,
+        index: &str,
+        key: &str,
+        value: &str,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            store.visit_gin_index_by_key_value(index, key, value, |row| visitor(row));
+            return Ok(());
+        }
+
+        store.visit_gin_index_by_key_value_restricted(
+            index,
+            key,
+            value,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| visitor(row),
+        );
+        Ok(())
+    }
+
+    fn visit_gin_index_rows_by_key<F>(
+        &self,
+        table: &str,
+        index: &str,
+        key: &str,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            store.visit_gin_index_by_key(index, key, |row| visitor(row));
+            return Ok(());
+        }
+
+        store.visit_gin_index_by_key_restricted(
+            index,
+            key,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| visitor(row),
+        );
+        Ok(())
+    }
+
+    fn visit_gin_index_rows_multi<F>(
+        &self,
+        table: &str,
+        index: &str,
+        pairs: &[(&str, &str)],
+        match_all: bool,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        if !self.is_subset_table(table) {
+            if match_all {
+                store.visit_gin_index_by_key_values_all(index, pairs, |row| visitor(row));
+            } else {
+                store.visit_gin_index_by_key_values_any(index, pairs, |row| visitor(row));
+            }
+            return Ok(());
+        }
+
+        store.visit_gin_index_by_key_values_restricted(
+            index,
+            pairs,
+            match_all,
+            self.restricted_row_ids(),
+            self.subset_driven(),
+            |row| visitor(row),
+        );
         Ok(())
     }
 }
@@ -491,14 +1130,16 @@ fn register_table_context(cache: &TableCache, ctx: &mut ExecutionContext, table_
                 cynos_core::schema::IndexType::BTree => QueryIndexType::BTree,
                 cynos_core::schema::IndexType::Gin => QueryIndexType::Gin,
             };
-            indexes.push(
-                IndexInfo::new(
-                    idx.name(),
-                    idx.columns().iter().map(|c| c.name.clone()).collect(),
-                    idx.is_unique(),
-                )
-                .with_type(index_type),
-            );
+            let mut index_info = IndexInfo::new(
+                idx.name(),
+                idx.columns().iter().map(|c| c.name.clone()).collect(),
+                idx.is_unique(),
+            )
+            .with_type(index_type);
+            if let Some(paths) = idx.gin_paths() {
+                index_info = index_info.with_gin_paths(paths.to_vec());
+            }
+            indexes.push(index_info);
         }
 
         ctx.register_table(
@@ -509,6 +1150,265 @@ fn register_table_context(cache: &TableCache, ctx: &mut ExecutionContext, table_
                 indexes,
             },
         );
+
+        for idx in schema.indices() {
+            if idx.get_index_type() == cynos_core::schema::IndexType::Gin {
+                continue;
+            }
+            if let Some(distinct_keys) = store.secondary_index_distinct_key_count(idx.name()) {
+                ctx.register_index_distinct_count(table_name, idx.name(), distinct_keys);
+            }
+        }
+    }
+}
+
+fn register_restricted_relation_intent(
+    cache: &TableCache,
+    ctx: &mut ExecutionContext,
+    restricted_table: &str,
+    profile: RootSubsetPlanningProfile,
+) {
+    let table_rows = cache
+        .get_table(restricted_table)
+        .map(|store| store.len())
+        .unwrap_or(0);
+    let planning_input = RootSubsetPlanningCostInput::new(profile.variant, table_rows);
+    let Some(decision) =
+        SnapshotRefreshCostModel::DEFAULT.root_subset_planning_decision_for(planning_input)
+    else {
+        return;
+    };
+
+    ctx.set_planner_feature_flags(PlannerFeatureFlags {
+        restricted_relation_cbo: true,
+    });
+    ctx.set_planning_intent(PlanningIntent {
+        mode: PlanningMode::RestrictedRelation,
+        restricted_table: Some(restricted_table.to_string()),
+        exact_subset_rows: Some(decision.effective_subset_rows),
+        subset_fraction: decision.subset_fraction,
+        preferred_access_mode: decision.preferred_access_mode,
+        anchor_table: Some(restricted_table.to_string()),
+        allow_global_fallback: true,
+    });
+    ctx.register_effective_row_count(restricted_table, decision.effective_subset_rows);
+}
+
+fn register_plan_costs(cache: &TableCache, ctx: &mut ExecutionContext, plan: &LogicalPlan) {
+    register_plan_gin_costs(cache, ctx, plan);
+}
+
+fn register_plan_gin_costs(cache: &TableCache, ctx: &mut ExecutionContext, plan: &LogicalPlan) {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            register_plan_gin_costs(cache, ctx, input);
+            register_predicate_gin_costs(cache, ctx, predicate);
+        }
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => register_plan_gin_costs(cache, ctx, input),
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            register_plan_gin_costs(cache, ctx, left);
+            register_plan_gin_costs(cache, ctx, right);
+            register_predicate_gin_costs(cache, ctx, condition);
+        }
+        LogicalPlan::CrossProduct { left, right } | LogicalPlan::Union { left, right, .. } => {
+            register_plan_gin_costs(cache, ctx, left);
+            register_plan_gin_costs(cache, ctx, right);
+        }
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::IndexScan { .. }
+        | LogicalPlan::IndexGet { .. }
+        | LogicalPlan::IndexInGet { .. }
+        | LogicalPlan::GinIndexScan { .. }
+        | LogicalPlan::GinIndexScanMulti { .. }
+        | LogicalPlan::Empty => {}
+    }
+}
+
+fn register_predicate_gin_costs(
+    cache: &TableCache,
+    ctx: &mut ExecutionContext,
+    predicate: &AstExpr,
+) {
+    match predicate {
+        AstExpr::BinaryOp {
+            left,
+            op: BinaryOp::And | BinaryOp::Or,
+            right,
+        } => {
+            register_predicate_gin_costs(cache, ctx, left);
+            register_predicate_gin_costs(cache, ctx, right);
+        }
+        AstExpr::Function { name, args } => {
+            let Some(request) = extract_gin_cost_request(name, args) else {
+                return;
+            };
+            let Some(index) = ctx
+                .find_gin_index_for_path(&request.table, &request.column, &request.path)
+                .or_else(|| ctx.find_gin_index(&request.table, &request.column))
+            else {
+                return;
+            };
+            let index_name = index.name.clone();
+            let Some(store) = cache.get_table(&request.table) else {
+                return;
+            };
+
+            ctx.register_gin_key_cost(
+                &request.table,
+                &index_name,
+                &request.path,
+                store.gin_index_cost_key(&index_name, &request.path),
+            );
+
+            if let Some(value) = &request.value {
+                ctx.register_gin_key_value_cost(
+                    &request.table,
+                    &index_name,
+                    &request.path,
+                    value,
+                    store.gin_index_cost_key_value(&index_name, &request.path, value),
+                );
+            }
+
+            for (key, value) in request.prefilter_pairs {
+                ctx.register_gin_key_value_cost(
+                    &request.table,
+                    &index_name,
+                    &key,
+                    &value,
+                    store.gin_index_cost_key_value(&index_name, &key, &value),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+struct GinCostRequest {
+    table: String,
+    column: String,
+    path: String,
+    value: Option<String>,
+    prefilter_pairs: Vec<(String, String)>,
+}
+
+fn extract_gin_cost_request(name: &str, args: &[AstExpr]) -> Option<GinCostRequest> {
+    let upper = name.to_uppercase();
+    match upper.as_str() {
+        "JSONB_PATH_EQ" if args.len() >= 3 => {
+            let column = match args.first()? {
+                AstExpr::Column(column) => column,
+                _ => return None,
+            };
+            let path = normalize_gin_path(&extract_string_literal(args.get(1)?)?)?;
+            let value = extract_literal_string(args.get(2)?)?;
+            Some(GinCostRequest {
+                table: column.table.clone(),
+                column: column.column.clone(),
+                path,
+                value: Some(value),
+                prefilter_pairs: Vec::new(),
+            })
+        }
+        "JSONB_EXISTS" if args.len() >= 2 => {
+            let column = match args.first()? {
+                AstExpr::Column(column) => column,
+                _ => return None,
+            };
+            let path = normalize_gin_path(&extract_string_literal(args.get(1)?)?)?;
+            Some(GinCostRequest {
+                table: column.table.clone(),
+                column: column.column.clone(),
+                path,
+                value: None,
+                prefilter_pairs: Vec::new(),
+            })
+        }
+        "JSONB_CONTAINS" if args.len() >= 3 => {
+            let column = match args.first()? {
+                AstExpr::Column(column) => column,
+                _ => return None,
+            };
+            let path = normalize_gin_path(&extract_string_literal(args.get(1)?)?)?;
+            let needle = extract_string_literal(args.get(2)?)?;
+            Some(GinCostRequest {
+                table: column.table.clone(),
+                column: column.column.clone(),
+                path: path.clone(),
+                value: None,
+                prefilter_pairs: contains_trigram_pairs(&path, &needle),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn extract_string_literal(expr: &AstExpr) -> Option<String> {
+    match expr {
+        AstExpr::Literal(Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn extract_literal_string(expr: &AstExpr) -> Option<String> {
+    match expr {
+        AstExpr::Literal(Value::String(value)) => Some(value.clone()),
+        AstExpr::Literal(Value::Int32(value)) => Some(value.to_string()),
+        AstExpr::Literal(Value::Int64(value)) => Some(value.to_string()),
+        AstExpr::Literal(Value::Boolean(value)) => {
+            Some(if *value { "true" } else { "false" }.into())
+        }
+        AstExpr::Literal(Value::Float64(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn normalize_gin_path(path: &str) -> Option<String> {
+    let parsed = JsonPath::parse(path).ok()?;
+    let mut segments = Vec::new();
+    if !collect_gin_path_segments(&parsed, &mut segments) || segments.is_empty() {
+        return None;
+    }
+
+    let mut normalized = String::new();
+    for segment in segments {
+        if !normalized.is_empty() {
+            normalized.push('.');
+        }
+        normalized.push_str(&segment);
+    }
+    Some(normalized)
+}
+
+fn collect_gin_path_segments(path: &JsonPath, segments: &mut Vec<String>) -> bool {
+    match path {
+        JsonPath::Root => true,
+        JsonPath::Field(parent, field) => {
+            if !collect_gin_path_segments(parent, segments) {
+                return false;
+            }
+            segments.push(field.clone());
+            true
+        }
+        JsonPath::Index(parent, index) => {
+            if !collect_gin_path_segments(parent, segments) {
+                return false;
+            }
+            segments.push(index.to_string());
+            true
+        }
+        JsonPath::Slice(_, _, _)
+        | JsonPath::RecursiveField(_, _)
+        | JsonPath::Wildcard(_)
+        | JsonPath::Filter(_, _) => false,
     }
 }
 
@@ -528,6 +1428,20 @@ pub fn build_execution_context_for_plan(
     table_name: &str,
     plan: &LogicalPlan,
 ) -> ExecutionContext {
+    build_execution_context_for_plan_with_profile(
+        cache,
+        table_name,
+        plan,
+        CompilePlanProfile::Default,
+    )
+}
+
+pub(crate) fn build_execution_context_for_plan_with_profile(
+    cache: &TableCache,
+    table_name: &str,
+    plan: &LogicalPlan,
+    profile: CompilePlanProfile,
+) -> ExecutionContext {
     let mut ctx = ExecutionContext::new();
     let mut tables = plan.collect_tables();
     if !tables.iter().any(|table| table == table_name) {
@@ -537,6 +1451,11 @@ pub fn build_execution_context_for_plan(
     for table in tables {
         register_table_context(cache, &mut ctx, &table);
     }
+
+    if let CompilePlanProfile::RootSubset(root_subset_profile) = profile {
+        register_restricted_relation_intent(cache, &mut ctx, table_name, root_subset_profile);
+    }
+    register_plan_costs(cache, &mut ctx, plan);
 
     ctx
 }
@@ -572,7 +1491,12 @@ fn execute_plan_internal(
     _debug: bool,
 ) -> ExecutionResult<Vec<Rc<Row>>> {
     // Build execution context with index info
-    let ctx = build_execution_context_for_plan(cache, table_name, &plan);
+    let ctx = build_execution_context_for_plan_with_profile(
+        cache,
+        table_name,
+        &plan,
+        CompilePlanProfile::Default,
+    );
 
     // Use unified QueryPlanner for complete optimization pipeline
     let planner = QueryPlanner::new(ctx);
@@ -589,11 +1513,26 @@ fn execute_plan_internal(
 /// Compiles a logical plan to a physical plan.
 /// The physical plan can be cached and reused for repeated executions.
 pub fn compile_plan(cache: &TableCache, table_name: &str, plan: LogicalPlan) -> PhysicalPlan {
-    // Build execution context with index info
-    let ctx = build_execution_context_for_plan(cache, table_name, &plan);
+    compile_plan_with_profile(cache, table_name, plan, CompilePlanProfile::Default)
+}
 
-    // Use unified QueryPlanner for complete optimization pipeline
-    let planner = QueryPlanner::new(ctx);
+pub(crate) fn compile_plan_with_profile(
+    cache: &TableCache,
+    table_name: &str,
+    plan: LogicalPlan,
+    profile: CompilePlanProfile,
+) -> PhysicalPlan {
+    // Build execution context with index info
+    let ctx = build_execution_context_for_plan_with_profile(cache, table_name, &plan, profile);
+
+    // Use a dedicated planner profile when subset refresh wants the declared root table
+    // to remain the execution driver.
+    let planner = match profile {
+        CompilePlanProfile::Default => QueryPlanner::new(ctx),
+        CompilePlanProfile::RootSubset(_) => {
+            QueryPlanner::for_profile(ctx, PlannerProfile::RootSubset)
+        }
+    };
     planner.plan(plan)
 }
 
@@ -603,7 +1542,16 @@ pub fn compile_cached_plan(
     table_name: &str,
     plan: LogicalPlan,
 ) -> CompiledPhysicalPlan {
-    let physical_plan = compile_plan(cache, table_name, plan);
+    compile_cached_plan_with_profile(cache, table_name, plan, CompilePlanProfile::Default)
+}
+
+pub(crate) fn compile_cached_plan_with_profile(
+    cache: &TableCache,
+    table_name: &str,
+    plan: LogicalPlan,
+    profile: CompilePlanProfile,
+) -> CompiledPhysicalPlan {
+    let physical_plan = compile_plan_with_profile(cache, table_name, plan, profile);
     let data_source = TableCacheDataSource::new(cache);
     CompiledPhysicalPlan::new_with_data_source(physical_plan, &data_source)
 }
@@ -667,6 +1615,18 @@ pub fn execute_compiled_physical_plan(
 }
 
 #[doc(hidden)]
+pub fn execute_compiled_physical_plan_on_table_subset(
+    cache: &TableCache,
+    compiled_plan: &CompiledPhysicalPlan,
+    subset_table: &str,
+    allowed_row_ids: &HashSet<u64>,
+) -> ExecutionResult<Vec<Rc<Row>>> {
+    let data_source = TableSubsetDataSource::try_new(cache, subset_table, allowed_row_ids)?;
+    let runner = PhysicalPlanRunner::new(&data_source);
+    runner.execute_with_artifact_row_vec(compiled_plan.physical_plan(), compiled_plan.artifact())
+}
+
+#[doc(hidden)]
 pub fn execute_physical_plan_with_summary(
     cache: &TableCache,
     physical_plan: &PhysicalPlan,
@@ -713,9 +1673,37 @@ pub fn execute_compiled_physical_plan_with_summary(
     })
 }
 
+#[doc(hidden)]
+pub fn execute_compiled_physical_plan_with_summary_on_table_subset(
+    cache: &TableCache,
+    compiled_plan: &CompiledPhysicalPlan,
+    subset_table: &str,
+    allowed_row_ids: &HashSet<u64>,
+) -> ExecutionResult<QueryExecutionOutput> {
+    let data_source = TableSubsetDataSource::try_new(cache, subset_table, allowed_row_ids)?;
+    let runner = PhysicalPlanRunner::new(&data_source);
+    let mut rows = Vec::new();
+    let mut summary = QueryResultSummaryBuilder::default();
+    runner.execute_with_artifact_rows(
+        compiled_plan.physical_plan(),
+        compiled_plan.artifact(),
+        |row| {
+            summary.push(row.as_ref());
+            rows.push(row);
+            Ok(true)
+        },
+    )?;
+
+    Ok(QueryExecutionOutput {
+        rows,
+        summary: summary.finish(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot_refresh_policy::{RootSubsetDecisionReason, SnapshotRefreshCostHints};
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Row, Value};
     use cynos_query::ast::Expr as AstExpr;
@@ -890,7 +1878,7 @@ mod tests {
             .unwrap()
             .add_primary_key(&["id"], false)
             .unwrap()
-            .add_index("idx_metadata_gin", &["metadata"], false)
+            .add_jsonb_index("idx_metadata_gin", "metadata", &["$.tags", "$.category"])
             .unwrap()
             .build()
             .unwrap();
@@ -951,6 +1939,198 @@ mod tests {
         assert_eq!(ctx.row_count("users"), 32);
         assert_eq!(ctx.row_count("orders"), 4096);
         assert!(ctx.find_index("orders", &["user_id"]).is_some());
+    }
+
+    #[test]
+    fn test_root_subset_profile_registers_effective_row_count_and_intent() {
+        let cache = create_join_test_cache();
+        let plan = LogicalPlan::inner_join(
+            LogicalPlan::scan("orders"),
+            LogicalPlan::scan("users"),
+            AstExpr::eq(
+                AstExpr::column("orders", "user_id", 1),
+                AstExpr::column("users", "id", 0),
+            ),
+        );
+
+        let ctx = build_execution_context_for_plan_with_profile(
+            &cache,
+            "orders",
+            &plan,
+            CompilePlanProfile::RootSubset(RootSubsetPlanningProfile::small()),
+        );
+
+        assert_eq!(ctx.base_row_count("orders"), 4096);
+        assert_eq!(ctx.row_count("orders"), 1024);
+        assert!(ctx.is_restricted_relation("orders"));
+        assert!(ctx.is_anchor_relation("orders"));
+        assert!(ctx.restricted_relation_cbo_enabled());
+    }
+
+    #[test]
+    fn test_choose_root_subset_plan_variant_uses_shared_thresholds() {
+        let cost_model = SnapshotRefreshCostModel::DEFAULT;
+        assert_eq!(
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(64, 10_000))
+                .variant,
+            RootSubsetPlanVariant::Small
+        );
+        assert_eq!(
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(2_500, 10_000))
+                .variant,
+            RootSubsetPlanVariant::Small
+        );
+        assert_eq!(
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(8_193, 10_000))
+                .variant,
+            RootSubsetPlanVariant::Large
+        );
+        assert_eq!(
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(10_000, 30_000))
+                .variant,
+            RootSubsetPlanVariant::Large
+        );
+    }
+
+    #[test]
+    fn test_snapshot_refresh_cost_policies_preserve_cutoffs() {
+        let cost_model = SnapshotRefreshCostModel::DEFAULT;
+        assert_eq!(
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(8_192, 10_000))
+                .variant,
+            RootSubsetPlanVariant::Small
+        );
+        assert_eq!(
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(8_193, 10_000))
+                .variant,
+            RootSubsetPlanVariant::Large
+        );
+        assert_eq!(
+            cost_model
+                .decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(9_000, 40_000))
+                .reason,
+            RootSubsetDecisionReason::WithinSubsetFractionCeiling
+        );
+        assert_eq!(
+            cost_model
+                .root_subset_planning_decision_for(RootSubsetPlanningCostInput::new(
+                    RootSubsetPlanVariant::Small,
+                    4_096
+                ))
+                .map(|decision| decision.effective_subset_rows),
+            Some(1_024)
+        );
+        assert_eq!(
+            cost_model.root_subset_planning_decision_for(RootSubsetPlanningCostInput::new(
+                RootSubsetPlanVariant::Large,
+                0
+            )),
+            None
+        );
+
+        assert_eq!(
+            cost_model
+                .decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(100))
+                .overscan,
+            256
+        );
+        assert_eq!(
+            cost_model
+                .decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(4_096))
+                .overscan,
+            1_024
+        );
+        assert_eq!(
+            cost_model
+                .decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(20_000))
+                .overscan,
+            1_024
+        );
+    }
+
+    #[test]
+    fn test_snapshot_refresh_cost_inputs_preserve_current_behavior() {
+        let cost_model = SnapshotRefreshCostModel::DEFAULT;
+        let future_hints = SnapshotRefreshCostHints {
+            estimated_row_width_bytes: Some(512),
+            estimated_join_fanout: Some(3.5),
+            estimated_index_selectivity: Some(0.08),
+            estimated_access_path_locality: Some(0.75),
+        };
+
+        let refresh_input = RootSubsetRefreshCostInput {
+            hints: future_hints,
+            ..RootSubsetRefreshCostInput::new(8_193, 10_000)
+        };
+        let refresh_decision = cost_model.decide_root_subset_refresh_for(refresh_input);
+        assert_eq!(
+            refresh_decision,
+            cost_model.decide_root_subset_refresh_for(RootSubsetRefreshCostInput::new(
+                refresh_input.affected_row_count,
+                refresh_input.table_row_count
+            ))
+        );
+        assert_eq!(refresh_decision.variant, RootSubsetPlanVariant::Large);
+        assert_eq!(
+            refresh_decision.reason,
+            RootSubsetDecisionReason::PreferIndexDrivenIntersect
+        );
+
+        let planning_input = RootSubsetPlanningCostInput {
+            hints: future_hints,
+            ..RootSubsetPlanningCostInput::new(RootSubsetPlanVariant::Small, 4_096)
+        };
+        let planning_decision = cost_model
+            .root_subset_planning_decision_for(planning_input)
+            .expect("small root-subset planning decision");
+        assert_eq!(planning_decision.effective_subset_rows, 1_024);
+        assert_eq!(
+            planning_decision,
+            cost_model
+                .root_subset_planning_decision_for(RootSubsetPlanningCostInput::new(
+                    planning_input.variant,
+                    planning_input.table_row_count
+                ))
+                .expect("legacy planning decision")
+        );
+
+        let window_input = PartialRefreshWindowCostInput {
+            hints: future_hints,
+            ..PartialRefreshWindowCostInput::new(4_096)
+        };
+        assert_eq!(
+            cost_model.decide_partial_refresh_window_for(window_input),
+            cost_model.decide_partial_refresh_window_for(PartialRefreshWindowCostInput::new(4_096))
+        );
+    }
+
+    #[test]
+    fn test_execution_context_registers_gin_costs_for_literal_predicates() {
+        let cache = create_jsonb_test_cache();
+        let plan = LogicalPlan::filter(
+            LogicalPlan::scan("documents"),
+            AstExpr::jsonb_path_eq(
+                AstExpr::column("documents", "metadata", 1),
+                "$.category",
+                Value::String("tech".into()),
+            ),
+        );
+
+        let ctx = build_execution_context_for_plan(&cache, "documents", &plan);
+        let gin_index = ctx
+            .find_gin_index("documents", "metadata")
+            .expect("expected registered GIN index on metadata column");
+        assert!(
+            ctx.gin_key_value_cost("documents", &gin_index.name, "category", "tech")
+                .is_some(),
+            "expected registered GIN posting cost entry"
+        );
     }
 
     #[test]
@@ -1028,6 +2208,34 @@ mod tests {
 
         assert_eq!(actual_ids, expected_ids);
         assert_eq!(actual_ids, alloc::vec![1, 3]);
+    }
+
+    #[test]
+    fn test_compiled_plan_table_subset_respects_jsonb_gin_predicate() {
+        let cache = create_jsonb_test_cache();
+        let compiled = compile_cached_plan(
+            &cache,
+            "documents",
+            LogicalPlan::filter(
+                LogicalPlan::scan("documents"),
+                AstExpr::jsonb_contains(
+                    AstExpr::column("documents", "metadata", 1),
+                    "$.tags",
+                    Value::String("portable".into()),
+                ),
+            ),
+        );
+
+        let subset_rows = execute_compiled_physical_plan_with_summary_on_table_subset(
+            &cache,
+            &compiled,
+            "documents",
+            &HashSet::from([1u64, 2u64]),
+        )
+        .unwrap();
+
+        let row_ids: Vec<u64> = subset_rows.rows.iter().map(|row| row.id()).collect();
+        assert_eq!(row_ids, alloc::vec![1]);
     }
 
     #[test]

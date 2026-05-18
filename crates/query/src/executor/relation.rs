@@ -4,7 +4,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use cynos_core::{Row, RowId, Value};
+use cynos_core::{join_row_id, left_join_null_row_id, right_join_null_row_id, Row, RowId, Value};
 
 /// Shared table names to avoid repeated cloning during joins.
 pub type SharedTables = Arc<[String]>;
@@ -154,7 +154,11 @@ impl RelationEntry {
         let combined_version = left.row.version().wrapping_add(right.row.version());
 
         Self {
-            row: Rc::new(Row::dummy_with_version(combined_version, values)),
+            row: Rc::new(Row::new_with_version(
+                join_row_id(left.row.id(), right.row.id()),
+                combined_version,
+                values,
+            )),
             is_combined: true,
             tables: TablesStorage::Owned(tables),
         }
@@ -183,7 +187,11 @@ impl RelationEntry {
         let combined_version = left.row.version();
 
         Self {
-            row: Rc::new(Row::dummy_with_version(combined_version, values)),
+            row: Rc::new(Row::new_with_version(
+                left_join_null_row_id(left.row.id()),
+                combined_version,
+                values,
+            )),
             is_combined: true,
             tables: TablesStorage::Owned(tables),
         }
@@ -209,7 +217,11 @@ impl RelationEntry {
         let combined_version = left.row.version().wrapping_add(right.row.version());
 
         Self {
-            row: Rc::new(Row::dummy_with_version(combined_version, values)),
+            row: Rc::new(Row::new_with_version(
+                join_row_id(left.row.id(), right.row.id()),
+                combined_version,
+                values,
+            )),
             is_combined: true,
             tables: TablesStorage::Shared(combined_tables),
         }
@@ -234,7 +246,11 @@ impl RelationEntry {
         let combined_version = left.row.version();
 
         Self {
-            row: Rc::new(Row::dummy_with_version(combined_version, values)),
+            row: Rc::new(Row::new_with_version(
+                left_join_null_row_id(left.row.id()),
+                combined_version,
+                values,
+            )),
             is_combined: true,
             tables: TablesStorage::Shared(combined_tables),
         }
@@ -258,7 +274,11 @@ impl RelationEntry {
         let combined_version = right.row.version();
 
         Self {
-            row: Rc::new(Row::dummy_with_version(combined_version, values)),
+            row: Rc::new(Row::new_with_version(
+                right_join_null_row_id(right.row.id()),
+                combined_version,
+                values,
+            )),
             is_combined: true,
             tables: TablesStorage::Shared(combined_tables),
         }
@@ -287,7 +307,11 @@ impl RelationEntry {
         let combined_version = right.row.version();
 
         Self {
-            row: Rc::new(Row::dummy_with_version(combined_version, values)),
+            row: Rc::new(Row::new_with_version(
+                right_join_null_row_id(right.row.id()),
+                combined_version,
+                values,
+            )),
             is_combined: true,
             tables: TablesStorage::Owned(tables),
         }

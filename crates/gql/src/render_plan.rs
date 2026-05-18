@@ -5,7 +5,8 @@ use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 
 use crate::bind::{
-    BoundCollectionQuery, BoundField, BoundRootField, BoundRootFieldKind, BoundSelectionSet,
+    BoundCollectionQuery, BoundField, BoundFilter, BoundRootField, BoundRootFieldKind,
+    BoundSelectionSet,
 };
 use crate::catalog::{GraphqlCatalog, RelationMeta, TableMeta};
 use crate::error::{GqlError, GqlErrorKind, GqlResult};
@@ -314,10 +315,11 @@ fn choose_forward_strategy(
 }
 
 fn choose_reverse_strategy(query: &BoundCollectionQuery) -> RelationFetchStrategy {
-    if query.filter.is_none()
-        && query.order_by.is_empty()
-        && query.limit.is_none()
-        && query.offset == 0
+    if query.order_by.is_empty()
+        && query
+            .filter
+            .as_ref()
+            .is_none_or(|filter| !uses_relation_filter(filter))
     {
         RelationFetchStrategy::IndexedProbeBatch
     } else {
@@ -325,8 +327,62 @@ fn choose_reverse_strategy(query: &BoundCollectionQuery) -> RelationFetchStrateg
     }
 }
 
+fn uses_relation_filter(filter: &BoundFilter) -> bool {
+    match filter {
+        BoundFilter::And(filters) | BoundFilter::Or(filters) => {
+            filters.iter().any(uses_relation_filter)
+        }
+        BoundFilter::Column(_) => false,
+        BoundFilter::Relation(_) => true,
+    }
+}
+
 fn is_single_column_primary_key(table: &TableMeta, column_name: &str) -> bool {
     table
         .primary_key()
         .is_some_and(|pk| pk.columns.len() == 1 && pk.columns[0].name == column_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bind::{ColumnPredicate, PredicateOp};
+    use cynos_core::{DataType, Value};
+
+    #[test]
+    fn reverse_strategy_uses_indexed_probe_for_windowed_non_relational_queries() {
+        let query = BoundCollectionQuery {
+            filter: Some(BoundFilter::Column(ColumnPredicate {
+                column_index: 1,
+                data_type: DataType::Int64,
+                ops: vec![PredicateOp::Eq(Value::Int64(1))],
+            })),
+            order_by: Vec::new(),
+            limit: Some(5),
+            offset: 2,
+        };
+
+        assert_eq!(
+            choose_reverse_strategy(&query),
+            RelationFetchStrategy::IndexedProbeBatch
+        );
+    }
+
+    #[test]
+    fn reverse_strategy_keeps_planner_batch_for_ordered_queries() {
+        let query = BoundCollectionQuery {
+            filter: None,
+            order_by: vec![crate::bind::OrderSpec {
+                column_index: 0,
+                descending: true,
+            }],
+            limit: Some(1),
+            offset: 0,
+        };
+
+        assert_eq!(
+            choose_reverse_strategy(&query),
+            RelationFetchStrategy::PlannerBatch
+        );
+    }
 }

@@ -197,120 +197,101 @@ impl PredicatePushdown {
         output_tables: Vec<String>,
         predicate: Expr,
     ) -> LogicalPlan {
-        // Extract tables referenced by each side of the join
         let left_tables = self.extract_tables(&left);
         let right_tables = self.extract_tables(&right);
+        let mut left_predicates = Vec::new();
+        let mut right_predicates = Vec::new();
+        let mut remaining_predicates = Vec::new();
 
-        // Extract tables referenced by the predicate
-        let pred_tables = self.extract_predicate_tables(&predicate);
+        for predicate in Self::split_conjuncts(predicate) {
+            let pred_tables = self.extract_predicate_tables(&predicate);
+            let refs_left = pred_tables.iter().any(|t| left_tables.contains(t));
+            let refs_right = pred_tables.iter().any(|t| right_tables.contains(t));
 
-        // Check if predicate references only left side
-        let refs_left = pred_tables.iter().any(|t| left_tables.contains(t));
-        let refs_right = pred_tables.iter().any(|t| right_tables.contains(t));
-
-        match join_type {
-            JoinType::Inner => {
-                // For inner join, we can push to either side
-                if refs_left && !refs_right {
-                    // Push to left side
-                    LogicalPlan::Join {
-                        left: Box::new(self.try_push_filter(left, predicate)),
-                        right: Box::new(right),
-                        condition,
-                        join_type,
-                        output_tables,
-                    }
-                } else if refs_right && !refs_left {
-                    // Push to right side
-                    LogicalPlan::Join {
-                        left: Box::new(left),
-                        right: Box::new(self.try_push_filter(right, predicate)),
-                        condition,
-                        join_type,
-                        output_tables,
-                    }
-                } else {
-                    // References both sides or neither - keep above join
-                    LogicalPlan::Filter {
-                        input: Box::new(LogicalPlan::Join {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                            condition,
-                            join_type,
-                            output_tables,
-                        }),
-                        predicate,
+            match join_type {
+                JoinType::Inner => {
+                    if refs_left && !refs_right {
+                        left_predicates.push(predicate);
+                    } else if refs_right && !refs_left {
+                        right_predicates.push(predicate);
+                    } else {
+                        remaining_predicates.push(predicate);
                     }
                 }
-            }
-
-            JoinType::LeftOuter => {
-                // For left outer join:
-                // - Can push predicates on LEFT side down (preserves NULL extension)
-                // - Cannot push predicates on RIGHT side (would filter out NULLs incorrectly)
-                if refs_left && !refs_right {
-                    LogicalPlan::Join {
-                        left: Box::new(self.try_push_filter(left, predicate)),
-                        right: Box::new(right),
-                        condition,
-                        join_type,
-                        output_tables,
-                    }
-                } else {
-                    // Keep above join
-                    LogicalPlan::Filter {
-                        input: Box::new(LogicalPlan::Join {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                            condition,
-                            join_type,
-                            output_tables,
-                        }),
-                        predicate,
+                JoinType::LeftOuter => {
+                    if refs_left && !refs_right {
+                        left_predicates.push(predicate);
+                    } else {
+                        remaining_predicates.push(predicate);
                     }
                 }
-            }
-
-            JoinType::RightOuter => {
-                // For right outer join:
-                // - Can push predicates on RIGHT side down
-                // - Cannot push predicates on LEFT side
-                if refs_right && !refs_left {
-                    LogicalPlan::Join {
-                        left: Box::new(left),
-                        right: Box::new(self.try_push_filter(right, predicate)),
-                        condition,
-                        join_type,
-                        output_tables,
-                    }
-                } else {
-                    LogicalPlan::Filter {
-                        input: Box::new(LogicalPlan::Join {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                            condition,
-                            join_type,
-                            output_tables,
-                        }),
-                        predicate,
+                JoinType::RightOuter => {
+                    if refs_right && !refs_left {
+                        right_predicates.push(predicate);
+                    } else {
+                        remaining_predicates.push(predicate);
                     }
                 }
-            }
-
-            JoinType::FullOuter | JoinType::Cross => {
-                // For full outer join and cross join, cannot push predicates
-                LogicalPlan::Filter {
-                    input: Box::new(LogicalPlan::Join {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                        condition,
-                        join_type,
-                        output_tables,
-                    }),
-                    predicate,
+                JoinType::FullOuter | JoinType::Cross => {
+                    remaining_predicates.push(predicate);
                 }
             }
         }
+
+        let left = if left_predicates.is_empty() {
+            left
+        } else {
+            self.try_push_filter(left, Self::combine_predicates(left_predicates))
+        };
+        let right = if right_predicates.is_empty() {
+            right
+        } else {
+            self.try_push_filter(right, Self::combine_predicates(right_predicates))
+        };
+
+        let join = LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            condition,
+            join_type,
+            output_tables,
+        };
+
+        if remaining_predicates.is_empty() {
+            join
+        } else {
+            LogicalPlan::Filter {
+                input: Box::new(join),
+                predicate: Self::combine_predicates(remaining_predicates),
+            }
+        }
+    }
+
+    fn split_conjuncts(predicate: Expr) -> Vec<Expr> {
+        let mut predicates = Vec::new();
+        Self::split_conjuncts_into(predicate, &mut predicates);
+        predicates
+    }
+
+    fn split_conjuncts_into(predicate: Expr, predicates: &mut Vec<Expr>) {
+        match predicate {
+            Expr::BinaryOp {
+                left,
+                op: crate::ast::BinaryOp::And,
+                right,
+            } => {
+                Self::split_conjuncts_into(*left, predicates);
+                Self::split_conjuncts_into(*right, predicates);
+            }
+            other => predicates.push(other),
+        }
+    }
+
+    fn combine_predicates(predicates: Vec<Expr>) -> Expr {
+        predicates
+            .into_iter()
+            .reduce(Expr::and)
+            .expect("combine_predicates requires at least one predicate")
     }
 
     /// Extract all table names referenced by a plan.
@@ -421,6 +402,7 @@ impl PredicatePushdown {
 mod tests {
     use super::*;
     use crate::ast::{BinaryOp, SortOrder};
+    use alloc::format;
 
     #[test]
     fn test_predicate_pushdown_basic() {
@@ -539,6 +521,36 @@ mod tests {
     }
 
     #[test]
+    fn test_pushdown_splits_and_across_inner_join_sides() {
+        let pass = PredicatePushdown;
+
+        let plan = LogicalPlan::filter(
+            LogicalPlan::inner_join(
+                LogicalPlan::scan("users"),
+                LogicalPlan::scan("orders"),
+                Expr::eq(
+                    Expr::column("users", "id", 0),
+                    Expr::column("orders", "user_id", 0),
+                ),
+            ),
+            Expr::and(
+                Expr::eq(Expr::column("users", "active", 1), Expr::literal(true)),
+                Expr::gt(Expr::column("orders", "amount", 1), Expr::literal(100i64)),
+            ),
+        );
+
+        let optimized = pass.optimize(plan);
+
+        match optimized {
+            LogicalPlan::Join { left, right, .. } => {
+                assert!(matches!(*left, LogicalPlan::Filter { .. }));
+                assert!(matches!(*right, LogicalPlan::Filter { .. }));
+            }
+            other => panic!("Expected Join with pushed predicates, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_filter_on_both_sides_stays_above_join() {
         let pass = PredicatePushdown;
 
@@ -621,6 +633,43 @@ mod tests {
         assert!(matches!(optimized, LogicalPlan::Filter { .. }));
         if let LogicalPlan::Filter { input, .. } = optimized {
             assert!(matches!(*input, LogicalPlan::Join { .. }));
+        }
+    }
+
+    #[test]
+    fn test_left_join_splits_and_pushes_left_only() {
+        let pass = PredicatePushdown;
+
+        let plan = LogicalPlan::filter(
+            LogicalPlan::left_join(
+                LogicalPlan::scan("users"),
+                LogicalPlan::scan("orders"),
+                Expr::eq(
+                    Expr::column("users", "id", 0),
+                    Expr::column("orders", "user_id", 0),
+                ),
+            ),
+            Expr::and(
+                Expr::eq(Expr::column("users", "active", 1), Expr::literal(true)),
+                Expr::gt(Expr::column("orders", "amount", 1), Expr::literal(100i64)),
+            ),
+        );
+
+        let optimized = pass.optimize(plan);
+
+        match optimized {
+            LogicalPlan::Filter { input, predicate } => {
+                let predicate_debug = format!("{:?}", predicate).to_lowercase();
+                assert!(predicate_debug.contains("orders"));
+                match *input {
+                    LogicalPlan::Join { left, right, .. } => {
+                        assert!(matches!(*left, LogicalPlan::Filter { .. }));
+                        assert!(matches!(*right, LogicalPlan::Scan { .. }));
+                    }
+                    other => panic!("Expected Join under Filter, got {:?}", other),
+                }
+            }
+            other => panic!("Expected Filter over Join, got {:?}", other),
         }
     }
 

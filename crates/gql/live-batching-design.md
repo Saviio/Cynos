@@ -1,6 +1,6 @@
 # GraphQL Live Batching Design
 
-Status: proposed
+Status: active design
 Owner: cynos-gql / cynos-database
 Scope: `crates/gql`, `crates/database`, `crates/storage`
 
@@ -746,7 +746,74 @@ The batched renderer must preserve the semantics of:
 
 Directive handling remains naturally compatible because batching happens after binding, when the active selection tree is already known.
 
-### 15.3 Delta capability semantics
+### 15.3 Internal Payload Adapter Boundary
+
+The JS-facing GraphQL subscription surface continues to emit full GraphQL response objects.
+That external shape is intentionally stable.
+
+Internally, the database bridge routes GraphQL responses through a small output adapter boundary:
+
+- `GraphqlResponsePayloadCache`
+  - owns the last semantic `GraphqlResponse`
+  - owns the cached JS payload
+  - owns the per-subscription encode caches
+- `GraphqlOutputAdapter`
+  - chooses how the current response should be encoded
+  - owns the payload-level change decision
+  - currently supports `FullPayload`
+- `GraphqlResponseEncoding`
+  - distinguishes plain full-payload encoding from batched root-list patch-assisted full-payload encoding
+
+This boundary is deliberately internal. It is not a public GraphQL delta API.
+
+The important architectural rule is:
+
+- GraphQL output mode is selected at the adapter boundary
+- snapshot and delta observables do not hand-roll separate payload encoding paths
+- future delta-native payload modes must plug into the same adapter boundary
+- public `subscribeGraphql()` and `PreparedGraphqlQuery.subscribe()` semantics stay unchanged unless a separate API design explicitly changes them
+
+The likely future internal modes are:
+
+- `FullPayload`
+  - current public behavior
+  - emits a normal `{ data: ... }` response object
+- `FullPayloadWithRootPatch`
+  - still public full payload
+  - internally reuses root-list JS array/object structure when root positions are stable or splice-compatible
+- `DeltaNativeInternal`
+  - internal-only representation of GraphQL tree mutations
+  - may feed a full-payload adapter, a binary transport, or a future opt-in public API
+
+The last mode should not be exposed directly until the API surface answers:
+
+- path addressing format
+- nullability and list splice semantics
+- interaction with aliases and directives
+- object identity expectations on the JS side
+- fallback behavior for unsupported query shapes
+
+### 15.4 Cache Lifecycle Semantics
+
+Batch rendering and response encoding both use long-lived per-subscription caches. These caches are necessary for performance, but they must have explicit lifecycle rules:
+
+- rendered row cache is keyed by `(node_id, row_id, row_version)`
+- relation bucket cache is keyed by `(edge_id, relation_key)`
+- parent membership tracks which rendered parents depend on which buckets
+- root-list cache owns only the current root list
+- JS encode caches share one central capacity policy in `crates/database/src/convert.rs`
+
+Current batch-state cache pruning is intentionally lazy:
+
+- normal renders pay only a size check
+- when the row cache exceeds the policy ceiling, pruning starts from the current root list
+- reachable nested rows are preserved by following registered relation dependencies and bucket contents
+- unreachable row render entries are removed
+- edge buckets without any parent membership are removed
+
+This gives long-lived subscriptions a bounded degradation path without adding expensive GC work to normal small and medium renders.
+
+### 15.5 Delta capability semantics
 
 This design does not change the current delta eligibility gate in `crates/gql/src/bind.rs`.
 

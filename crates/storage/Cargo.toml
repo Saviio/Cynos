@@ -8,6 +8,7 @@ description = "Storage layer for Cynos in-memory database"
 
 [features]
 default = []
+benchmark = []
 hash-store = ["hashbrown"]
 
 [dependencies]

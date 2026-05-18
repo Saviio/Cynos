@@ -3,16 +3,25 @@
 //! This module provides the `RowStore` struct which manages rows for a single table,
 //! including primary key and secondary index maintenance.
 
-use alloc::collections::BTreeMap;
+#[cfg(feature = "benchmark")]
+use crate::profiling::StorageInsertProfile;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use cynos_core::schema::{IndexType, Table};
 use cynos_core::{Error, Result, Row, RowId, Value};
 use cynos_incremental::Delta;
 use cynos_index::{
-    contains_trigram_pairs, BTreeIndex, GinIndex, HashIndex, Index, KeyRange, RangeIndex,
+    contains_trigram_pairs, BTreeIndex, GinBulkBuilder, GinIndex, HashIndex, Index, KeyRange,
+    RangeIndex,
+};
+use cynos_jsonb::path::{
+    scan_json_string_end as scan_json_string_end_bytes,
+    scan_json_value_end as scan_json_value_end_bytes,
+    skip_json_whitespace as skip_json_whitespace_bytes,
 };
 use cynos_jsonb::{JsonbObject, JsonbValue as ParsedJsonbValue};
 
@@ -28,10 +37,364 @@ struct RowSlot {
     row: Rc<Row>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug)]
+struct GinIndexConfig {
+    column_idx: usize,
+    indexed_paths: Option<Vec<String>>,
+    compiled_indexed_paths: Option<Vec<CompiledGinPath>>,
+    compiled_indexed_path_tree: Option<CompiledGinPathTree>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledGinPath {
+    encoded_path: String,
+    contains_key: String,
+    segments: Vec<CompiledGinPathSegment>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledGinPathSegment {
+    key: String,
+    lookup_key: Option<String>,
+    array_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompiledGinPathTree {
+    nodes: Vec<CompiledGinPathNode>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompiledGinPathNode {
+    terminal_path_indices: Vec<usize>,
+    object_children: BTreeMap<String, usize>,
+    array_children: BTreeMap<usize, usize>,
+}
+
+enum ExtractedJsonbTextValue<'a> {
+    ScalarText(&'a str),
+    Parsed(ParsedJsonbValue),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum JsonScalarIndexValue<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+}
+
+impl JsonScalarIndexValue<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value.as_str(),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_owned(self) -> String {
+        match self {
+            Self::Borrowed(value) => value.into(),
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+impl GinIndexConfig {
+    fn new(column_idx: usize, indexed_paths: Option<Vec<String>>) -> Self {
+        let indexed_paths = indexed_paths.filter(|paths| !paths.is_empty());
+        let compiled_indexed_paths = indexed_paths.as_ref().map(|paths| {
+            paths
+                .iter()
+                .cloned()
+                .map(CompiledGinPath::new)
+                .collect::<Vec<_>>()
+        });
+        let compiled_indexed_path_tree = compiled_indexed_paths
+            .as_ref()
+            .map(|paths| CompiledGinPathTree::new(paths));
+        Self {
+            column_idx,
+            indexed_paths,
+            compiled_indexed_paths,
+            compiled_indexed_path_tree,
+        }
+    }
+}
+
+impl CompiledGinPath {
+    fn new(encoded_path: String) -> Self {
+        let segments = decode_gin_path_segments(&encoded_path)
+            .into_iter()
+            .map(|key| CompiledGinPathSegment {
+                array_index: key.parse::<usize>().ok(),
+                lookup_key: Some(escape_json_string_fragment(&key)),
+                key,
+            })
+            .collect();
+        Self {
+            contains_key: cynos_index::contains_trigram_key(&encoded_path),
+            encoded_path,
+            segments,
+        }
+    }
+}
+
+impl CompiledGinPathTree {
+    fn new(paths: &[CompiledGinPath]) -> Self {
+        let mut tree = Self {
+            nodes: vec![CompiledGinPathNode::default()],
+        };
+
+        for (path_index, path) in paths.iter().enumerate() {
+            let mut node_index = 0usize;
+            for segment in &path.segments {
+                let next_node_index = if let Some(array_index) = segment.array_index {
+                    if let Some(existing) = tree.nodes[node_index].array_children.get(&array_index)
+                    {
+                        *existing
+                    } else {
+                        let next = tree.nodes.len();
+                        tree.nodes.push(CompiledGinPathNode::default());
+                        tree.nodes[node_index]
+                            .array_children
+                            .insert(array_index, next);
+                        next
+                    }
+                } else if let Some(lookup_key) = segment.lookup_key.as_ref() {
+                    if let Some(existing) = tree.nodes[node_index].object_children.get(lookup_key) {
+                        *existing
+                    } else {
+                        let next = tree.nodes.len();
+                        tree.nodes.push(CompiledGinPathNode::default());
+                        tree.nodes[node_index]
+                            .object_children
+                            .insert(lookup_key.clone(), next);
+                        next
+                    }
+                } else {
+                    node_index
+                };
+                node_index = next_node_index;
+            }
+
+            tree.nodes[node_index]
+                .terminal_path_indices
+                .push(path_index);
+        }
+
+        tree
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BatchSecondaryDef {
+    name: String,
+    cols: Vec<usize>,
+    unique: bool,
+}
+
+struct PreparedBatchInsert {
+    row_id_entries: Vec<(Value, RowId)>,
+    primary_entries: Option<Vec<(IndexKey, RowId)>>,
+    secondary_entries: Vec<Vec<(IndexKey, RowId)>>,
+}
+
+#[derive(Clone, Copy)]
+enum InsertProfilePhase {
+    Validation,
+    RowIdIndex,
+    PrimaryIndex,
+    SecondaryIndex,
+    GinCollect,
+    GinFlush,
+    RowSlot,
+}
+
+#[derive(Clone, Copy)]
+enum GinInsertProfilePhase {
+    ParseJson,
+    PathLookup,
+    ScalarEmit,
+    ContainsStringify,
+    ContainsTrigramEmit,
+}
+
+struct InsertBatchProfiler {
+    #[cfg(feature = "benchmark")]
+    now_ms: Option<fn() -> f64>,
+    #[cfg(feature = "benchmark")]
+    profile: StorageInsertProfile,
+}
+
+impl InsertBatchProfiler {
+    fn disabled(row_count: usize, secondary_index_count: usize, gin_index_count: usize) -> Self {
+        #[cfg(feature = "benchmark")]
+        {
+            Self {
+                now_ms: None,
+                profile: StorageInsertProfile {
+                    row_count,
+                    secondary_index_count,
+                    gin_index_count,
+                    ..StorageInsertProfile::default()
+                },
+            }
+        }
+
+        #[cfg(not(feature = "benchmark"))]
+        {
+            let _ = (row_count, secondary_index_count, gin_index_count);
+            Self {}
+        }
+    }
+
+    #[cfg(feature = "benchmark")]
+    fn enabled(
+        row_count: usize,
+        secondary_index_count: usize,
+        gin_index_count: usize,
+        now_ms: fn() -> f64,
+    ) -> Self {
+        Self {
+            now_ms: Some(now_ms),
+            profile: StorageInsertProfile {
+                row_count,
+                secondary_index_count,
+                gin_index_count,
+                ..StorageInsertProfile::default()
+            },
+        }
+    }
+
+    fn start_timer(&self) -> Option<f64> {
+        #[cfg(feature = "benchmark")]
+        {
+            self.now_ms.map(|now_ms| now_ms())
+        }
+
+        #[cfg(not(feature = "benchmark"))]
+        {
+            None
+        }
+    }
+
+    fn finish_phase(&mut self, phase: InsertProfilePhase, started_at: Option<f64>) {
+        #[cfg(feature = "benchmark")]
+        {
+            let Some(started_at) = started_at else {
+                return;
+            };
+            let Some(now_ms) = self.now_ms else {
+                return;
+            };
+            let elapsed = now_ms() - started_at;
+            match phase {
+                InsertProfilePhase::Validation => self.profile.validation_ms += elapsed,
+                InsertProfilePhase::RowIdIndex => self.profile.row_id_index_ms += elapsed,
+                InsertProfilePhase::PrimaryIndex => self.profile.primary_index_ms += elapsed,
+                InsertProfilePhase::SecondaryIndex => self.profile.secondary_index_ms += elapsed,
+                InsertProfilePhase::GinCollect => self.profile.gin_collect_ms += elapsed,
+                InsertProfilePhase::GinFlush => self.profile.gin_flush_ms += elapsed,
+                InsertProfilePhase::RowSlot => self.profile.row_slot_ms += elapsed,
+            }
+        }
+
+        #[cfg(not(feature = "benchmark"))]
+        let _ = (phase, started_at);
+    }
+
+    fn finish_gin_phase(&mut self, phase: GinInsertProfilePhase, started_at: Option<f64>) {
+        #[cfg(feature = "benchmark")]
+        {
+            let Some(started_at) = started_at else {
+                return;
+            };
+            let Some(now_ms) = self.now_ms else {
+                return;
+            };
+            let elapsed = now_ms() - started_at;
+            match phase {
+                GinInsertProfilePhase::ParseJson => self.profile.gin.parse_json_ms += elapsed,
+                GinInsertProfilePhase::PathLookup => self.profile.gin.path_lookup_ms += elapsed,
+                GinInsertProfilePhase::ScalarEmit => self.profile.gin.scalar_emit_ms += elapsed,
+                GinInsertProfilePhase::ContainsStringify => {
+                    self.profile.gin.contains_stringify_ms += elapsed
+                }
+                GinInsertProfilePhase::ContainsTrigramEmit => {
+                    self.profile.gin.contains_trigram_emit_ms += elapsed
+                }
+            }
+        }
+
+        #[cfg(not(feature = "benchmark"))]
+        let _ = (phase, started_at);
+    }
+
+    fn record_gin_parse_call(&mut self) {
+        #[cfg(feature = "benchmark")]
+        {
+            self.profile.gin.parse_call_count += 1;
+        }
+    }
+
+    fn record_gin_selected_path_eval(&mut self) {
+        #[cfg(feature = "benchmark")]
+        {
+            self.profile.gin.selected_path_eval_count += 1;
+        }
+    }
+
+    fn record_gin_selected_path_hit(&mut self) {
+        #[cfg(feature = "benchmark")]
+        {
+            self.profile.gin.selected_path_hit_count += 1;
+        }
+    }
+
+    fn record_gin_path_key_emit(&mut self) {
+        #[cfg(feature = "benchmark")]
+        {
+            self.profile.gin.path_key_emit_count += 1;
+        }
+    }
+
+    fn record_gin_scalar_value(&mut self) {
+        #[cfg(feature = "benchmark")]
+        {
+            self.profile.gin.scalar_value_count += 1;
+        }
+    }
+
+    fn record_gin_contains_value(&mut self) {
+        #[cfg(feature = "benchmark")]
+        {
+            self.profile.gin.contains_value_count += 1;
+        }
+    }
+
+    fn record_gin_contains_trigrams(&mut self, count: usize) {
+        #[cfg(feature = "benchmark")]
+        {
+            self.profile.gin.contains_trigram_count += count;
+        }
+
+        #[cfg(not(feature = "benchmark"))]
+        let _ = count;
+    }
+
+    #[cfg(feature = "benchmark")]
+    fn finish(mut self, total_ms: f64) -> StorageInsertProfile {
+        self.profile.total_ms = total_ms;
+        self.profile
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum IndexKey {
     Scalar(Value),
     Composite(Vec<Value>),
+    CompositePrefixLower(Vec<Value>),
+    CompositePrefixUpper(Vec<Value>),
 }
 
 impl IndexKey {
@@ -47,6 +410,16 @@ impl IndexKey {
         } else {
             Self::Composite(values)
         }
+    }
+
+    #[inline]
+    fn composite_prefix_lower(values: &[Value]) -> Self {
+        Self::CompositePrefixLower(values.to_vec())
+    }
+
+    #[inline]
+    fn composite_prefix_upper(values: &[Value]) -> Self {
+        Self::CompositePrefixUpper(values.to_vec())
     }
 
     #[inline]
@@ -113,8 +486,101 @@ impl IndexKey {
     fn to_error_value(&self) -> Value {
         match self {
             Self::Scalar(value) => value.clone(),
-            Self::Composite(values) => Value::String(format!("{:?}", values)),
+            Self::Composite(values)
+            | Self::CompositePrefixLower(values)
+            | Self::CompositePrefixUpper(values) => Value::String(format!("{:?}", values)),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexKeyComponent<'a> {
+    Low,
+    End,
+    Value(&'a Value),
+    High,
+}
+
+impl IndexKey {
+    fn composite_component_at(&self, index: usize) -> IndexKeyComponent<'_> {
+        match self {
+            Self::Composite(values) => values
+                .get(index)
+                .map(IndexKeyComponent::Value)
+                .unwrap_or(IndexKeyComponent::End),
+            Self::CompositePrefixLower(values) => values
+                .get(index)
+                .map(IndexKeyComponent::Value)
+                .unwrap_or(IndexKeyComponent::Low),
+            Self::CompositePrefixUpper(values) => values
+                .get(index)
+                .map(IndexKeyComponent::Value)
+                .unwrap_or(IndexKeyComponent::High),
+            Self::Scalar(value) => {
+                if index == 0 {
+                    IndexKeyComponent::Value(value)
+                } else {
+                    IndexKeyComponent::End
+                }
+            }
+        }
+    }
+
+    fn composite_like_len(&self) -> usize {
+        match self {
+            Self::Scalar(_) => 1,
+            Self::Composite(values)
+            | Self::CompositePrefixLower(values)
+            | Self::CompositePrefixUpper(values) => values.len(),
+        }
+    }
+}
+
+impl Ord for IndexKey {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+
+        match (self, other) {
+            (Self::Scalar(left), Self::Scalar(right)) => left.cmp(right),
+            (Self::Scalar(_), _) => Ordering::Less,
+            (_, Self::Scalar(_)) => Ordering::Greater,
+            _ => {
+                let max_len = self
+                    .composite_like_len()
+                    .max(other.composite_like_len())
+                    .saturating_add(1);
+                for index in 0..max_len {
+                    let left = self.composite_component_at(index);
+                    let right = other.composite_component_at(index);
+                    let ordering = match (left, right) {
+                        (IndexKeyComponent::Low, IndexKeyComponent::Low)
+                        | (IndexKeyComponent::End, IndexKeyComponent::End)
+                        | (IndexKeyComponent::High, IndexKeyComponent::High) => Ordering::Equal,
+                        (IndexKeyComponent::Value(left), IndexKeyComponent::Value(right)) => {
+                            left.cmp(right)
+                        }
+                        (IndexKeyComponent::Low, _) => Ordering::Less,
+                        (_, IndexKeyComponent::Low) => Ordering::Greater,
+                        (IndexKeyComponent::End, IndexKeyComponent::Value(_))
+                        | (IndexKeyComponent::End, IndexKeyComponent::High) => Ordering::Less,
+                        (IndexKeyComponent::Value(_), IndexKeyComponent::End)
+                        | (IndexKeyComponent::High, IndexKeyComponent::End) => Ordering::Greater,
+                        (IndexKeyComponent::Value(_), IndexKeyComponent::High) => Ordering::Less,
+                        (IndexKeyComponent::High, IndexKeyComponent::Value(_)) => Ordering::Greater,
+                    };
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                Ordering::Equal
+            }
+        }
+    }
+}
+
+impl PartialOrd for IndexKey {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -126,6 +592,16 @@ pub trait IndexStore {
         key: Value,
         row_id: RowId,
     ) -> core::result::Result<(), cynos_index::IndexError>;
+    /// Adds multiple key-value pairs to the index.
+    fn add_batch(
+        &mut self,
+        entries: &[(Value, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        for (key, row_id) in entries {
+            self.add(key.clone(), *row_id)?;
+        }
+        Ok(())
+    }
     /// Sets a key-value pair, replacing any existing values.
     fn set(&mut self, key: Value, row_id: RowId);
     /// Gets all row IDs for a key.
@@ -174,6 +650,8 @@ pub trait IndexStore {
     }
     /// Returns all row IDs in the index.
     fn get_all(&self) -> Vec<RowId>;
+    /// Returns the number of distinct keys currently stored in the index.
+    fn distinct_key_count(&self) -> usize;
 }
 
 /// Wrapper for BTreeIndex that implements IndexStore.
@@ -195,6 +673,13 @@ impl BTreeIndexStore {
         row_id: RowId,
     ) -> core::result::Result<(), cynos_index::IndexError> {
         self.inner.add(key, row_id)
+    }
+
+    fn add_batch_index_keys(
+        &mut self,
+        entries: &[(IndexKey, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        self.inner.add_batch(entries)
     }
 
     fn set_index_key(&mut self, key: IndexKey, row_id: RowId) {
@@ -239,6 +724,10 @@ impl BTreeIndexStore {
     {
         self.inner.visit_range(range, reverse, limit, skip, visitor);
     }
+
+    fn distinct_key_count(&self) -> usize {
+        self.inner.distinct_key_count()
+    }
 }
 
 impl IndexStore for BTreeIndexStore {
@@ -248,6 +737,17 @@ impl IndexStore for BTreeIndexStore {
         row_id: RowId,
     ) -> core::result::Result<(), cynos_index::IndexError> {
         self.add_index_key(IndexKey::scalar(key), row_id)
+    }
+
+    fn add_batch(
+        &mut self,
+        entries: &[(Value, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        let entries: Vec<(IndexKey, RowId)> = entries
+            .iter()
+            .map(|(key, row_id)| (IndexKey::scalar(key.clone()), *row_id))
+            .collect();
+        self.add_batch_index_keys(&entries)
     }
 
     fn set(&mut self, key: Value, row_id: RowId) {
@@ -301,6 +801,10 @@ impl IndexStore for BTreeIndexStore {
         self.get_range_index_keys(None, false, None, 0)
     }
 
+    fn distinct_key_count(&self) -> usize {
+        self.inner.distinct_key_count()
+    }
+
     fn visit_range<F>(
         &self,
         range: Option<&KeyRange<Value>>,
@@ -335,6 +839,13 @@ impl HashIndexStore {
         row_id: RowId,
     ) -> core::result::Result<(), cynos_index::IndexError> {
         self.inner.add(key, row_id)
+    }
+
+    fn add_batch_index_keys(
+        &mut self,
+        entries: &[(IndexKey, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        self.inner.add_batch(entries)
     }
 
     fn set_index_key(&mut self, key: IndexKey, row_id: RowId) {
@@ -383,6 +894,10 @@ impl HashIndexStore {
             }
         }
     }
+
+    fn distinct_key_count(&self) -> usize {
+        self.inner.distinct_key_count()
+    }
 }
 
 impl IndexStore for HashIndexStore {
@@ -392,6 +907,17 @@ impl IndexStore for HashIndexStore {
         row_id: RowId,
     ) -> core::result::Result<(), cynos_index::IndexError> {
         self.add_index_key(IndexKey::scalar(key), row_id)
+    }
+
+    fn add_batch(
+        &mut self,
+        entries: &[(Value, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        let entries: Vec<(IndexKey, RowId)> = entries
+            .iter()
+            .map(|(key, row_id)| (IndexKey::scalar(key.clone()), *row_id))
+            .collect();
+        self.add_batch_index_keys(&entries)
     }
 
     fn set(&mut self, key: Value, row_id: RowId) {
@@ -443,6 +969,10 @@ impl IndexStore for HashIndexStore {
         self.inner.get_all_row_ids()
     }
 
+    fn distinct_key_count(&self) -> usize {
+        self.inner.distinct_key_count()
+    }
+
     fn visit_range<F>(
         &self,
         range: Option<&KeyRange<Value>>,
@@ -485,6 +1015,16 @@ impl SecondaryIndexStore {
         }
     }
 
+    fn add_batch_index_keys(
+        &mut self,
+        entries: &[(IndexKey, RowId)],
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        match self {
+            Self::BTree(index) => index.add_batch_index_keys(entries),
+            Self::Hash(index) => index.add_batch_index_keys(entries),
+        }
+    }
+
     fn remove_index_key(&mut self, key: &IndexKey, row_id: Option<RowId>) {
         match self {
             Self::BTree(index) => index.remove_index_key(key, row_id),
@@ -520,6 +1060,13 @@ impl SecondaryIndexStore {
         }
     }
 
+    fn distinct_key_count(&self) -> usize {
+        match self {
+            Self::BTree(index) => index.distinct_key_count(),
+            Self::Hash(index) => index.distinct_key_count(),
+        }
+    }
+
     fn visit_range_index_keys<F>(
         &self,
         range: Option<&KeyRange<IndexKey>>,
@@ -548,6 +1095,17 @@ fn extract_key_from_values(values: &[Value]) -> IndexKey {
     IndexKey::from_values(values.to_vec())
 }
 
+fn first_duplicate_batch_key<K: Clone + Ord>(entries: &[(K, RowId)]) -> Option<K> {
+    let mut keys: Vec<&K> = entries.iter().map(|(key, _)| key).collect();
+    keys.sort();
+    keys.windows(2).find_map(|window| {
+        let [left, right] = window else {
+            return None;
+        };
+        (left == right).then(|| (*left).clone())
+    })
+}
+
 fn composite_range_has_expected_arity(range: &KeyRange<Vec<Value>>, expected: usize) -> bool {
     match range {
         KeyRange::All => true,
@@ -574,8 +1132,8 @@ pub struct RowStore {
     index_columns: BTreeMap<String, Vec<usize>>,
     /// GIN indexes for JSONB columns
     gin_indices: BTreeMap<String, GinIndex>,
-    /// Column indices for GIN indexes
-    gin_index_columns: BTreeMap<String, usize>,
+    /// Column index and path configuration for GIN indexes
+    gin_index_configs: BTreeMap<String, GinIndexConfig>,
 }
 
 impl RowStore {
@@ -592,7 +1150,7 @@ impl RowStore {
             secondary_indices: BTreeMap::new(),
             index_columns: BTreeMap::new(),
             gin_indices: BTreeMap::new(),
-            gin_index_columns: BTreeMap::new(),
+            gin_index_configs: BTreeMap::new(),
         };
 
         if let Some(pk) = schema.primary_key() {
@@ -617,9 +1175,10 @@ impl RowStore {
                     store
                         .gin_indices
                         .insert(idx.name().to_string(), GinIndex::new());
-                    store
-                        .gin_index_columns
-                        .insert(idx.name().to_string(), col_idx);
+                    store.gin_index_configs.insert(
+                        idx.name().to_string(),
+                        GinIndexConfig::new(col_idx, idx.gin_paths().map(|paths| paths.to_vec())),
+                    );
                 }
             } else {
                 store.secondary_indices.insert(
@@ -636,6 +1195,36 @@ impl RowStore {
     /// Returns the table schema.
     pub fn schema(&self) -> &Table {
         &self.schema
+    }
+
+    /// Returns the number of distinct primary-key values, if this table has a primary key.
+    pub fn primary_index_distinct_key_count(&self) -> Option<usize> {
+        self.primary_index
+            .as_ref()
+            .map(BTreeIndexStore::distinct_key_count)
+    }
+
+    /// Returns the number of distinct keys tracked by the named secondary index.
+    pub fn secondary_index_distinct_key_count(&self, index_name: &str) -> Option<usize> {
+        self.secondary_indices
+            .get(index_name)
+            .map(SecondaryIndexStore::distinct_key_count)
+    }
+
+    /// Returns the posting-list size for a GIN key lookup.
+    pub fn gin_index_cost_key(&self, index_name: &str, key: &str) -> usize {
+        self.gin_indices
+            .get(index_name)
+            .map(|gin| gin.cost_key(key))
+            .unwrap_or(0)
+    }
+
+    /// Returns the posting-list size for a GIN key/value lookup.
+    pub fn gin_index_cost_key_value(&self, index_name: &str, key: &str, value: &str) -> usize {
+        self.gin_indices
+            .get(index_name)
+            .map(|gin| gin.cost_key_value(key, value))
+            .unwrap_or(0)
     }
 
     /// Returns the number of rows.
@@ -672,6 +1261,16 @@ impl RowStore {
         let slot_idx = self.row_slots.len();
         self.row_slots.push(RowSlot { row_id, row });
         self.rows.insert(row_id, slot_idx);
+
+        let append_only = self
+            .scan_order
+            .last()
+            .map(|&last_slot_idx| self.row_slots[last_slot_idx].row_id < row_id)
+            .unwrap_or(true);
+        if append_only {
+            self.scan_order.push(slot_idx);
+            return;
+        }
 
         let scan_pos = self.scan_position(row_id).unwrap_or_else(|pos| pos);
         self.scan_order.insert(scan_pos, slot_idx);
@@ -712,6 +1311,745 @@ impl RowStore {
         }
 
         Some(removed_slot.row)
+    }
+
+    /// Bulk loads rows into an empty store without per-row slot/index interleaving.
+    ///
+    /// This is intended for initial hydration paths where the table is known to be
+    /// empty and no live-query notifications should be emitted between rows.
+    pub fn bulk_load(&mut self, rows: Vec<Row>) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        if !self.is_empty() {
+            return Err(Error::invalid_operation(
+                "Bulk load requires an empty table store",
+            ));
+        }
+
+        let secondary_defs: Vec<BatchSecondaryDef> = self
+            .index_columns
+            .iter()
+            .map(|(name, cols)| BatchSecondaryDef {
+                name: name.clone(),
+                cols: cols.clone(),
+                unique: self
+                    .secondary_indices
+                    .get(name)
+                    .map(|idx| idx.is_unique())
+                    .unwrap_or(false),
+            })
+            .collect();
+        let gin_defs: Vec<(String, GinIndexConfig)> = self
+            .gin_index_configs
+            .iter()
+            .map(|(name, config)| (name.clone(), config.clone()))
+            .collect();
+        let mut profiler =
+            InsertBatchProfiler::disabled(rows.len(), secondary_defs.len(), gin_defs.len());
+        self.validate_empty_bulk_load_rows(&rows, &secondary_defs)?;
+        self.bulk_load_with_profiler(rows, &secondary_defs, &gin_defs, &mut profiler)
+    }
+
+    fn bulk_load_with_profiler(
+        &mut self,
+        rows: Vec<Row>,
+        secondary_defs: &[BatchSecondaryDef],
+        gin_defs: &[(String, GinIndexConfig)],
+        profiler: &mut InsertBatchProfiler,
+    ) -> Result<usize> {
+        debug_assert!(rows
+            .windows(2)
+            .all(|window| window[0].id() < window[1].id()));
+
+        let mut row_id_entries = Vec::with_capacity(rows.len());
+        let mut primary_entries = self
+            .primary_index
+            .as_ref()
+            .map(|_| Vec::with_capacity(rows.len()));
+        let mut secondary_entries: Vec<Vec<(IndexKey, RowId)>> = secondary_defs
+            .iter()
+            .map(|_| Vec::with_capacity(rows.len()))
+            .collect();
+        for row in &rows {
+            let row_id = row.id();
+            row_id_entries.push((Value::Int64(row_id as i64), row_id));
+            if let Some(entries) = primary_entries.as_mut() {
+                entries.push((extract_key(row, &self.pk_columns), row_id));
+            }
+            for (def, entries) in secondary_defs.iter().zip(secondary_entries.iter_mut()) {
+                entries.push((extract_key(row, &def.cols), row_id));
+            }
+        }
+
+        let started = profiler.start_timer();
+        if self.row_id_index.add_batch(&row_id_entries).is_err() {
+            self.clear();
+            return Err(Error::invalid_operation(
+                "Failed to add to row ID index during bulk load",
+            ));
+        }
+        profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
+
+        if let Some(ref mut pk_index) = self.primary_index {
+            let started = profiler.start_timer();
+            let violation = primary_entries
+                .as_ref()
+                .and_then(|entries| {
+                    pk_index
+                        .add_batch_index_keys(entries)
+                        .err()
+                        .map(|_| entries)
+                })
+                .and_then(|entries| first_duplicate_batch_key(entries))
+                .map(|pk: IndexKey| Error::UniqueConstraint {
+                    column: "primary_key".into(),
+                    value: pk.to_error_value(),
+                });
+            profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
+            if let Some(error) = violation {
+                self.clear();
+                return Err(error);
+            }
+        }
+
+        let started = profiler.start_timer();
+        for (def, entries) in secondary_defs.iter().zip(secondary_entries.iter()) {
+            let mut violation = None;
+            {
+                let Some(idx) = self.secondary_indices.get_mut(&def.name) else {
+                    continue;
+                };
+                if idx.add_batch_index_keys(entries).is_err() {
+                    let value = first_duplicate_batch_key(entries)
+                        .map(|key| key.to_error_value())
+                        .unwrap_or(Value::Null);
+                    violation = Some(Error::UniqueConstraint {
+                        column: def.name.clone(),
+                        value,
+                    });
+                }
+            }
+            if let Some(error) = violation {
+                profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
+                self.clear();
+                return Err(error);
+            }
+        }
+        profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
+
+        for (idx_name, config) in gin_defs {
+            let Some(gin_idx) = self.gin_indices.get_mut(idx_name) else {
+                continue;
+            };
+            let mut builder = GinBulkBuilder::new();
+            let collect_started = profiler.start_timer();
+            for row in &rows {
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::collect_jsonb_value_into_builder_profiled(
+                        &mut builder,
+                        value,
+                        row.id(),
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                        profiler,
+                    );
+                }
+            }
+            profiler.finish_phase(InsertProfilePhase::GinCollect, collect_started);
+            let flush_started = profiler.start_timer();
+            gin_idx.apply_bulk_builder(builder);
+            profiler.finish_phase(InsertProfilePhase::GinFlush, flush_started);
+        }
+
+        self.row_slots.reserve(rows.len());
+        self.scan_order.reserve(rows.len());
+
+        let started = profiler.start_timer();
+        for (slot_idx, row) in rows.into_iter().enumerate() {
+            let row_id = row.id();
+            self.rows.insert(row_id, slot_idx);
+            self.row_slots.push(RowSlot {
+                row_id,
+                row: Rc::new(row),
+            });
+            self.scan_order.push(slot_idx);
+        }
+        profiler.finish_phase(InsertProfilePhase::RowSlot, started);
+
+        Ok(self.row_slots.len())
+    }
+
+    /// Inserts multiple rows while batching GIN index maintenance per insert call.
+    ///
+    /// The visible semantics remain aligned with sequential inserts: rows accepted
+    /// before a later validation failure remain committed.
+    pub fn insert_batch(&mut self, rows: Vec<Row>) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let secondary_defs: Vec<BatchSecondaryDef> = self
+            .index_columns
+            .iter()
+            .map(|(name, cols)| BatchSecondaryDef {
+                name: name.clone(),
+                cols: cols.clone(),
+                unique: self
+                    .secondary_indices
+                    .get(name)
+                    .map(|idx| idx.is_unique())
+                    .unwrap_or(false),
+            })
+            .collect();
+        let gin_defs: Vec<(String, GinIndexConfig)> = self
+            .gin_index_configs
+            .iter()
+            .map(|(name, config)| (name.clone(), config.clone()))
+            .collect();
+        let mut profiler =
+            InsertBatchProfiler::disabled(rows.len(), secondary_defs.len(), gin_defs.len());
+        self.insert_batch_with_profiler(rows, &secondary_defs, &gin_defs, &mut profiler)
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub fn insert_batch_profiled(
+        &mut self,
+        rows: Vec<Row>,
+        now_ms: fn() -> f64,
+    ) -> Result<(usize, StorageInsertProfile)> {
+        let secondary_defs: Vec<BatchSecondaryDef> = self
+            .index_columns
+            .iter()
+            .map(|(name, cols)| BatchSecondaryDef {
+                name: name.clone(),
+                cols: cols.clone(),
+                unique: self
+                    .secondary_indices
+                    .get(name)
+                    .map(|idx| idx.is_unique())
+                    .unwrap_or(false),
+            })
+            .collect();
+        let gin_defs: Vec<(String, GinIndexConfig)> = self
+            .gin_index_configs
+            .iter()
+            .map(|(name, config)| (name.clone(), config.clone()))
+            .collect();
+        let total_started = now_ms();
+        let mut profiler =
+            InsertBatchProfiler::enabled(rows.len(), secondary_defs.len(), gin_defs.len(), now_ms);
+        let inserted =
+            self.insert_batch_with_profiler(rows, &secondary_defs, &gin_defs, &mut profiler)?;
+        Ok((inserted, profiler.finish(now_ms() - total_started)))
+    }
+
+    fn insert_batch_with_profiler(
+        &mut self,
+        rows: Vec<Row>,
+        secondary_defs: &[BatchSecondaryDef],
+        gin_defs: &[(String, GinIndexConfig)],
+        profiler: &mut InsertBatchProfiler,
+    ) -> Result<usize> {
+        let validation_started = profiler.start_timer();
+        if self.is_empty() && self.can_use_bulk_insert_fast_path(&rows, secondary_defs) {
+            profiler.finish_phase(InsertProfilePhase::Validation, validation_started);
+            return self.bulk_load_with_profiler(rows, secondary_defs, gin_defs, profiler);
+        }
+        let prepared_batch = self.prepare_batch_insert_merge(&rows, secondary_defs);
+        profiler.finish_phase(InsertProfilePhase::Validation, validation_started);
+
+        if let Some(prepared_batch) = prepared_batch {
+            return self.apply_prepared_batch_insert_with_profiler(
+                rows,
+                prepared_batch,
+                secondary_defs,
+                gin_defs,
+                profiler,
+            );
+        }
+
+        let mut gin_builders: Vec<GinBulkBuilder> =
+            gin_defs.iter().map(|_| GinBulkBuilder::new()).collect();
+
+        self.row_slots.reserve(rows.len());
+        self.scan_order.reserve(rows.len());
+
+        let mut inserted = 0usize;
+
+        for row in rows {
+            let row_id = row.id();
+
+            if self.rows.contains_key(&row_id) {
+                Self::flush_gin_bulk_builders_profiled(
+                    &mut self.gin_indices,
+                    gin_defs,
+                    &mut gin_builders,
+                    profiler,
+                );
+                return Err(Error::invalid_operation("Row ID already exists"));
+            }
+
+            let pk_value = if !self.pk_columns.is_empty() {
+                let pk = extract_key(&row, &self.pk_columns);
+                if let Some(ref pk_index) = self.primary_index {
+                    if pk_index.contains_index_key(&pk) {
+                        Self::flush_gin_bulk_builders_profiled(
+                            &mut self.gin_indices,
+                            gin_defs,
+                            &mut gin_builders,
+                            profiler,
+                        );
+                        return Err(Error::UniqueConstraint {
+                            column: "primary_key".into(),
+                            value: pk.to_error_value(),
+                        });
+                    }
+                }
+                Some(pk)
+            } else {
+                None
+            };
+
+            let mut secondary_keys = Vec::with_capacity(secondary_defs.len());
+            for def in secondary_defs {
+                let key = extract_key(&row, &def.cols);
+                if def.unique {
+                    if let Some(idx) = self.secondary_indices.get(&def.name) {
+                        if idx.contains_index_key(&key) {
+                            Self::flush_gin_bulk_builders_profiled(
+                                &mut self.gin_indices,
+                                gin_defs,
+                                &mut gin_builders,
+                                profiler,
+                            );
+                            return Err(Error::UniqueConstraint {
+                                column: def.name.clone(),
+                                value: key.to_error_value(),
+                            });
+                        }
+                    }
+                }
+                secondary_keys.push(key);
+            }
+
+            let started = profiler.start_timer();
+            if self
+                .row_id_index
+                .add(Value::Int64(row_id as i64), row_id)
+                .is_err()
+            {
+                profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
+                Self::flush_gin_bulk_builders_profiled(
+                    &mut self.gin_indices,
+                    gin_defs,
+                    &mut gin_builders,
+                    profiler,
+                );
+                return Err(Error::invalid_operation("Failed to add to row ID index"));
+            }
+            profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
+
+            let started = profiler.start_timer();
+            if let (Some(ref mut pk_index), Some(pk)) = (&mut self.primary_index, pk_value.clone())
+            {
+                if pk_index.add_index_key(pk.clone(), row_id).is_err() {
+                    self.row_id_index
+                        .remove(&Value::Int64(row_id as i64), Some(row_id));
+                    profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
+                    Self::flush_gin_bulk_builders_profiled(
+                        &mut self.gin_indices,
+                        gin_defs,
+                        &mut gin_builders,
+                        profiler,
+                    );
+                    return Err(Error::UniqueConstraint {
+                        column: "primary_key".into(),
+                        value: pk.to_error_value(),
+                    });
+                }
+            }
+            profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
+
+            for (secondary_offset, key) in secondary_keys.iter().enumerate() {
+                let def = &secondary_defs[secondary_offset];
+                if let Some(idx) = self.secondary_indices.get_mut(&def.name) {
+                    let started = profiler.start_timer();
+                    if idx.add_index_key(key.clone(), row_id).is_err() {
+                        profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
+                        for (rollback_offset, rollback_key) in
+                            secondary_keys.iter().take(secondary_offset).enumerate()
+                        {
+                            let rollback_def = &secondary_defs[rollback_offset];
+                            if let Some(rollback_idx) =
+                                self.secondary_indices.get_mut(&rollback_def.name)
+                            {
+                                rollback_idx.remove_index_key(rollback_key, Some(row_id));
+                            }
+                        }
+                        if let (Some(ref mut pk_index), Some(pk)) =
+                            (&mut self.primary_index, pk_value.as_ref())
+                        {
+                            pk_index.remove_index_key(pk, Some(row_id));
+                        }
+                        self.row_id_index
+                            .remove(&Value::Int64(row_id as i64), Some(row_id));
+                        Self::flush_gin_bulk_builders_profiled(
+                            &mut self.gin_indices,
+                            gin_defs,
+                            &mut gin_builders,
+                            profiler,
+                        );
+                        return Err(Error::UniqueConstraint {
+                            column: def.name.clone(),
+                            value: key.to_error_value(),
+                        });
+                    }
+                    profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
+                }
+            }
+
+            let started = profiler.start_timer();
+            for ((_, config), builder) in gin_defs.iter().zip(gin_builders.iter_mut()) {
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::collect_jsonb_value_into_builder_profiled(
+                        builder,
+                        value,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                        profiler,
+                    );
+                }
+            }
+            profiler.finish_phase(InsertProfilePhase::GinCollect, started);
+
+            let started = profiler.start_timer();
+            self.insert_row_slot(row_id, Rc::new(row));
+            profiler.finish_phase(InsertProfilePhase::RowSlot, started);
+            inserted += 1;
+        }
+
+        Self::flush_gin_bulk_builders_profiled(
+            &mut self.gin_indices,
+            gin_defs,
+            &mut gin_builders,
+            profiler,
+        );
+        Ok(inserted)
+    }
+
+    fn prepare_batch_insert_merge(
+        &self,
+        rows: &[Row],
+        secondary_defs: &[BatchSecondaryDef],
+    ) -> Option<PreparedBatchInsert> {
+        if rows.is_empty()
+            || !rows
+                .windows(2)
+                .all(|window| window[0].id() <= window[1].id())
+        {
+            return None;
+        }
+
+        let mut row_id_entries = Vec::with_capacity(rows.len());
+        let mut primary_entries =
+            (!self.pk_columns.is_empty()).then(|| Vec::with_capacity(rows.len()));
+        let mut secondary_entries: Vec<Vec<(IndexKey, RowId)>> = secondary_defs
+            .iter()
+            .map(|_| Vec::with_capacity(rows.len()))
+            .collect();
+
+        let mut seen_row_ids = BTreeSet::new();
+        let mut seen_primary_keys = (!self.pk_columns.is_empty()).then(BTreeSet::new);
+        let mut seen_secondary_keys: Vec<Option<BTreeSet<IndexKey>>> = secondary_defs
+            .iter()
+            .map(|def| def.unique.then(BTreeSet::new))
+            .collect();
+
+        for row in rows {
+            let row_id = row.id();
+            if self.rows.contains_key(&row_id) || !seen_row_ids.insert(row_id) {
+                return None;
+            }
+            row_id_entries.push((Value::Int64(row_id as i64), row_id));
+
+            if let Some(entries) = primary_entries.as_mut() {
+                let pk = extract_key(row, &self.pk_columns);
+                if self
+                    .primary_index
+                    .as_ref()
+                    .is_some_and(|pk_index| pk_index.contains_index_key(&pk))
+                {
+                    return None;
+                }
+                if !seen_primary_keys
+                    .as_mut()
+                    .is_some_and(|seen| seen.insert(pk.clone()))
+                {
+                    return None;
+                }
+                entries.push((pk, row_id));
+            }
+
+            for ((def, entries), maybe_seen) in secondary_defs
+                .iter()
+                .zip(secondary_entries.iter_mut())
+                .zip(seen_secondary_keys.iter_mut())
+            {
+                let key = extract_key(row, &def.cols);
+                if let Some(seen) = maybe_seen.as_mut() {
+                    if self
+                        .secondary_indices
+                        .get(&def.name)
+                        .is_some_and(|idx| idx.contains_index_key(&key))
+                        || !seen.insert(key.clone())
+                    {
+                        return None;
+                    }
+                }
+                entries.push((key, row_id));
+            }
+        }
+
+        Some(PreparedBatchInsert {
+            row_id_entries,
+            primary_entries,
+            secondary_entries,
+        })
+    }
+
+    fn apply_prepared_batch_insert_with_profiler(
+        &mut self,
+        rows: Vec<Row>,
+        prepared_batch: PreparedBatchInsert,
+        secondary_defs: &[BatchSecondaryDef],
+        gin_defs: &[(String, GinIndexConfig)],
+        profiler: &mut InsertBatchProfiler,
+    ) -> Result<usize> {
+        let PreparedBatchInsert {
+            row_id_entries,
+            primary_entries,
+            secondary_entries,
+        } = prepared_batch;
+
+        let row_count = rows.len();
+
+        let started = profiler.start_timer();
+        if self.row_id_index.add_batch(&row_id_entries).is_err() {
+            profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
+            return Err(Error::invalid_operation("Failed to add to row ID index"));
+        }
+        profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
+
+        let started = profiler.start_timer();
+        if let (Some(ref mut pk_index), Some(entries)) =
+            (&mut self.primary_index, primary_entries.as_ref())
+        {
+            if pk_index.add_batch_index_keys(entries).is_err() {
+                self.row_id_index.remove_batch(&row_id_entries);
+                profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
+                let value = first_duplicate_batch_key(entries)
+                    .map(|pk| pk.to_error_value())
+                    .unwrap_or(Value::Null);
+                return Err(Error::UniqueConstraint {
+                    column: "primary_key".into(),
+                    value,
+                });
+            }
+        }
+        profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
+
+        let started = profiler.start_timer();
+        for (secondary_offset, def) in secondary_defs.iter().enumerate() {
+            let entries = &secondary_entries[secondary_offset];
+            let Some(idx) = self.secondary_indices.get_mut(&def.name) else {
+                continue;
+            };
+            if idx.add_batch_index_keys(entries).is_err() {
+                for (rollback_def, rollback_entries) in secondary_defs
+                    .iter()
+                    .zip(secondary_entries.iter())
+                    .take(secondary_offset)
+                {
+                    if let Some(rollback_idx) = self.secondary_indices.get_mut(&rollback_def.name) {
+                        rollback_idx.remove_batch_index_keys(rollback_entries);
+                    }
+                }
+                if let (Some(ref mut pk_index), Some(entries)) =
+                    (&mut self.primary_index, primary_entries.as_ref())
+                {
+                    pk_index.remove_batch_index_keys(entries);
+                }
+                self.row_id_index.remove_batch(&row_id_entries);
+                profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
+                let value = first_duplicate_batch_key(entries)
+                    .map(|key| key.to_error_value())
+                    .unwrap_or(Value::Null);
+                return Err(Error::UniqueConstraint {
+                    column: def.name.clone(),
+                    value,
+                });
+            }
+        }
+        profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
+
+        let mut gin_builders: Vec<GinBulkBuilder> =
+            gin_defs.iter().map(|_| GinBulkBuilder::new()).collect();
+        let started = profiler.start_timer();
+        for row in &rows {
+            let row_id = row.id();
+            for ((_, config), builder) in gin_defs.iter().zip(gin_builders.iter_mut()) {
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::collect_jsonb_value_into_builder_profiled(
+                        builder,
+                        value,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                        profiler,
+                    );
+                }
+            }
+        }
+        profiler.finish_phase(InsertProfilePhase::GinCollect, started);
+
+        Self::flush_gin_bulk_builders_profiled(
+            &mut self.gin_indices,
+            gin_defs,
+            &mut gin_builders,
+            profiler,
+        );
+
+        self.row_slots.reserve(row_count);
+        self.scan_order.reserve(row_count);
+
+        let started = profiler.start_timer();
+        for row in rows {
+            let row_id = row.id();
+            self.insert_row_slot(row_id, Rc::new(row));
+        }
+        profiler.finish_phase(InsertProfilePhase::RowSlot, started);
+
+        Ok(row_count)
+    }
+
+    fn flush_gin_bulk_builders(
+        gin_indices: &mut BTreeMap<String, GinIndex>,
+        gin_defs: &[(String, GinIndexConfig)],
+        gin_builders: &mut [GinBulkBuilder],
+    ) {
+        for ((idx_name, _), builder) in gin_defs.iter().zip(gin_builders.iter_mut()) {
+            let Some(gin_idx) = gin_indices.get_mut(idx_name) else {
+                continue;
+            };
+            gin_idx.apply_bulk_builder(core::mem::take(builder));
+        }
+    }
+
+    fn flush_gin_bulk_builders_profiled(
+        gin_indices: &mut BTreeMap<String, GinIndex>,
+        gin_defs: &[(String, GinIndexConfig)],
+        gin_builders: &mut [GinBulkBuilder],
+        profiler: &mut InsertBatchProfiler,
+    ) {
+        let started = profiler.start_timer();
+        Self::flush_gin_bulk_builders(gin_indices, gin_defs, gin_builders);
+        profiler.finish_phase(InsertProfilePhase::GinFlush, started);
+    }
+
+    fn can_use_bulk_insert_fast_path(
+        &self,
+        rows: &[Row],
+        secondary_defs: &[BatchSecondaryDef],
+    ) -> bool {
+        if !rows
+            .windows(2)
+            .all(|window| window[0].id() <= window[1].id())
+        {
+            return false;
+        }
+
+        let mut seen_row_ids = BTreeSet::new();
+        let mut seen_primary_keys = BTreeSet::new();
+        let mut seen_secondary_keys: Vec<Option<BTreeSet<IndexKey>>> = secondary_defs
+            .iter()
+            .map(|def| def.unique.then(BTreeSet::new))
+            .collect();
+
+        for row in rows {
+            if !seen_row_ids.insert(row.id()) {
+                return false;
+            }
+
+            if !self.pk_columns.is_empty() {
+                let pk = extract_key(row, &self.pk_columns);
+                if !seen_primary_keys.insert(pk) {
+                    return false;
+                }
+            }
+
+            for (def, maybe_seen) in secondary_defs.iter().zip(seen_secondary_keys.iter_mut()) {
+                let Some(seen) = maybe_seen.as_mut() else {
+                    continue;
+                };
+                let key = extract_key(row, &def.cols);
+                if !seen.insert(key) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn validate_empty_bulk_load_rows(
+        &self,
+        rows: &[Row],
+        secondary_defs: &[BatchSecondaryDef],
+    ) -> Result<()> {
+        if !rows
+            .windows(2)
+            .all(|window| window[0].id() < window[1].id())
+        {
+            return Err(Error::invalid_operation(
+                "Bulk load rows must be sorted by strictly increasing row ID",
+            ));
+        }
+
+        let mut seen_primary_keys = (!self.pk_columns.is_empty()).then(BTreeSet::new);
+        let mut seen_secondary_keys: Vec<Option<BTreeSet<IndexKey>>> = secondary_defs
+            .iter()
+            .map(|def| def.unique.then(BTreeSet::new))
+            .collect();
+
+        for row in rows {
+            if let Some(seen) = seen_primary_keys.as_mut() {
+                let key = extract_key(row, &self.pk_columns);
+                if !seen.insert(key.clone()) {
+                    return Err(Error::UniqueConstraint {
+                        column: "primary_key".into(),
+                        value: key.to_error_value(),
+                    });
+                }
+            }
+
+            for (def, maybe_seen) in secondary_defs.iter().zip(seen_secondary_keys.iter_mut()) {
+                let Some(seen) = maybe_seen.as_mut() else {
+                    continue;
+                };
+                let key = extract_key(row, &def.cols);
+                if !seen.insert(key.clone()) {
+                    return Err(Error::UniqueConstraint {
+                        column: def.name.clone(),
+                        value: key.to_error_value(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Inserts a row into the store.
@@ -773,12 +2111,20 @@ impl RowStore {
         }
 
         // Add to GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(col_idx) {
-                    Self::index_jsonb_value(gin_idx, value, row_id);
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::index_jsonb_value(
+                        gin_idx,
+                        value,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                    );
                 }
             }
         }
@@ -806,12 +2152,20 @@ impl RowStore {
         }
 
         // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(col_idx) {
-                    Self::remove_jsonb_from_gin(gin_idx, value, row_id);
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::remove_jsonb_from_gin(
+                        gin_idx,
+                        value,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                    );
                 }
             }
         }
@@ -879,19 +2233,33 @@ impl RowStore {
         }
 
         // Update GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                let old_value = old_row.get(col_idx);
-                let new_value = new_row.get(col_idx);
+                let old_value = old_row.get(config.column_idx);
+                let new_value = new_row.get(config.column_idx);
                 // Only update if the JSONB value changed
                 if old_value != new_value {
                     if let Some(old_val) = old_value {
-                        Self::remove_jsonb_from_gin(gin_idx, old_val, row_id);
+                        Self::remove_jsonb_from_gin(
+                            gin_idx,
+                            old_val,
+                            row_id,
+                            config.compiled_indexed_paths.as_deref(),
+                            config.compiled_indexed_path_tree.as_ref(),
+                        );
                     }
                     if let Some(new_val) = new_value {
-                        Self::index_jsonb_value(gin_idx, new_val, row_id);
+                        Self::index_jsonb_value(
+                            gin_idx,
+                            new_val,
+                            row_id,
+                            config.compiled_indexed_paths.as_deref(),
+                            config.compiled_indexed_path_tree.as_ref(),
+                        );
                     }
                 }
             }
@@ -927,12 +2295,20 @@ impl RowStore {
         }
 
         // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(col_idx) {
-                    Self::remove_jsonb_from_gin(gin_idx, value, row_id);
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::remove_jsonb_from_gin(
+                        gin_idx,
+                        value,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                    );
                 }
             }
         }
@@ -992,13 +2368,21 @@ impl RowStore {
         }
 
         // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
         for idx_name in &gin_index_names {
-            let col_idx = self.gin_index_columns[idx_name];
+            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
+                continue;
+            };
             if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
                 for row in &deleted_rows {
-                    if let Some(value) = row.get(col_idx) {
-                        Self::remove_jsonb_from_gin(gin_idx, value, row.id());
+                    if let Some(value) = row.get(config.column_idx) {
+                        Self::remove_jsonb_from_gin(
+                            gin_idx,
+                            value,
+                            row.id(),
+                            config.compiled_indexed_paths.as_deref(),
+                            config.compiled_indexed_path_tree.as_ref(),
+                        );
                     }
                 }
             }
@@ -1045,6 +2429,57 @@ impl RowStore {
         }
     }
 
+    /// Visits rows identified by a row-id subset in the same deterministic order as table scans.
+    /// Missing row ids are skipped.
+    pub fn visit_rows_by_ids<F>(&self, row_ids: &[RowId], mut visitor: F)
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        for &row_id in row_ids {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                continue;
+            };
+            if !visitor(row) {
+                break;
+            }
+        }
+    }
+
+    /// Visits rows identified by an arbitrary row-id iterator.
+    /// Missing row ids are skipped and iteration order follows the provided iterator.
+    pub fn visit_rows_by_iter<I, F>(&self, row_ids: I, mut visitor: F)
+    where
+        I: IntoIterator<Item = RowId>,
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        for row_id in row_ids {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                continue;
+            };
+            if !visitor(row) {
+                break;
+            }
+        }
+    }
+
+    /// Returns rows identified by a row-id subset in scan order.
+    pub fn get_rows_by_ids(&self, row_ids: &[RowId]) -> Vec<Rc<Row>> {
+        let mut rows = Vec::with_capacity(row_ids.len().min(self.len()));
+        self.visit_rows_by_ids(row_ids, |row| {
+            rows.push(row.clone());
+            true
+        });
+        rows
+    }
+
+    /// Counts how many row ids in a subset still exist in the store.
+    pub fn count_existing_rows_by_ids(&self, row_ids: &[RowId]) -> usize {
+        row_ids
+            .iter()
+            .filter(|row_id| self.rows.contains_key(row_id))
+            .count()
+    }
+
     /// Returns all row IDs.
     pub fn row_ids(&self) -> Vec<RowId> {
         self.scan_order
@@ -1074,6 +2509,36 @@ impl RowStore {
         } else {
             Vec::new()
         }
+    }
+
+    /// Visits row ids matching the provided primary-key components.
+    pub fn visit_row_ids_by_pk_values<F>(&self, pk_values: &[Value], mut visitor: F)
+    where
+        F: FnMut(RowId) -> bool,
+    {
+        if pk_values.len() != self.pk_columns.len() {
+            return;
+        }
+
+        let Some(ref pk_index) = self.primary_index else {
+            return;
+        };
+        let pk_key = extract_key_from_values(pk_values);
+        for row_id in pk_index.get_index_key(&pk_key) {
+            if !visitor(row_id) {
+                break;
+            }
+        }
+    }
+
+    /// Finds the first row id matching the provided primary-key components.
+    pub fn find_row_id_by_pk_values(&self, pk_values: &[Value]) -> Option<RowId> {
+        let mut found = None;
+        self.visit_row_ids_by_pk_values(pk_values, |row_id| {
+            found = Some(row_id);
+            false
+        });
+        found
     }
 
     /// Finds existing row ID by primary key.
@@ -1194,6 +2659,109 @@ impl RowStore {
         }
     }
 
+    /// Visits row ids from a single-column index equality scan without materializing rows.
+    pub fn visit_index_row_ids_by_value<F>(&self, index_name: &str, value: &Value, visitor: F)
+    where
+        F: FnMut(RowId) -> bool,
+    {
+        let Some(idx) = self.secondary_indices.get(index_name) else {
+            return;
+        };
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return;
+        };
+        if columns.len() != 1 {
+            return;
+        }
+
+        let range = IndexKey::from_scalar_range(Some(&KeyRange::only(value.clone())));
+        idx.visit_range_index_keys(range.as_ref(), false, None, 0, visitor);
+    }
+
+    /// Returns whether a row matches the scalar key range for a single-column index.
+    pub fn row_matches_index_range(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Value>>,
+        row: &Row,
+    ) -> bool {
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return false;
+        };
+        if columns.len() != 1 {
+            return false;
+        }
+
+        let key = row.get(columns[0]).cloned().unwrap_or(Value::Null);
+        range.map_or(true, |range| range.contains(&key))
+    }
+
+    /// Visits rows from an index scan restricted to a row-id subset.
+    /// `subset_driven=true` iterates the subset directly; otherwise it intersects an index scan.
+    pub fn visit_index_scan_with_options_restricted<F>(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Value>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let mut skipped = 0usize;
+        let mut emitted = 0usize;
+        let mut visit_matched = |row: &Rc<Row>| {
+            if skipped < offset {
+                skipped += 1;
+                return true;
+            }
+            if let Some(limit) = limit {
+                if emitted >= limit {
+                    return false;
+                }
+            }
+            emitted += 1;
+            visitor(row)
+        };
+
+        if subset_driven {
+            let mut visit_subset_row_id = |row_id: RowId| {
+                let Some(row) = self.row_ref_by_id(row_id) else {
+                    return true;
+                };
+                if !self.row_matches_index_range(index_name, range, row) {
+                    return true;
+                }
+                visit_matched(row)
+            };
+
+            if reverse {
+                for &row_id in allowed_row_ids.iter().rev() {
+                    if !visit_subset_row_id(row_id) {
+                        break;
+                    }
+                }
+            } else {
+                for &row_id in allowed_row_ids {
+                    if !visit_subset_row_id(row_id) {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        self.visit_index_scan_with_options(index_name, range, None, 0, reverse, |row| {
+            if allowed_row_ids.binary_search(&row.id()).is_err() {
+                return true;
+            }
+            visit_matched(row)
+        });
+    }
+
     /// Gets rows by composite index scan.
     /// Use this for multi-column indexes where the bounds are real tuple keys.
     pub fn index_scan_composite(
@@ -1290,6 +2858,162 @@ impl RowStore {
                 visitor(row)
             },
         );
+    }
+
+    /// Gets rows by composite index prefix scan with limit, offset, and reverse option.
+    ///
+    /// The prefix must match the leading columns of a composite BTree index. This is useful for
+    /// top-N-per-parent probes such as scanning `(parent_id, created_at)` for one parent without
+    /// fetching the parent's full child fan-out first.
+    pub fn index_scan_composite_prefix_with_options(
+        &self,
+        index_name: &str,
+        prefix: &[Value],
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    ) -> Vec<Rc<Row>> {
+        let mut rows = Vec::new();
+        self.visit_index_scan_composite_prefix_with_options(
+            index_name,
+            prefix,
+            limit,
+            offset,
+            reverse,
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        rows
+    }
+
+    /// Visits rows by composite index prefix scan with limit, offset, and reverse option.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_index_scan_composite_prefix_with_options<F>(
+        &self,
+        index_name: &str,
+        prefix: &[Value],
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        if prefix.is_empty() {
+            self.visit_index_scan_composite_with_options(
+                index_name, None, limit, offset, reverse, visitor,
+            );
+            return;
+        }
+
+        let Some(idx) = self.secondary_indices.get(index_name) else {
+            return;
+        };
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return;
+        };
+        if columns.len() <= 1 || prefix.len() >= columns.len() {
+            return;
+        }
+
+        let lower = IndexKey::composite_prefix_lower(prefix);
+        let upper = IndexKey::composite_prefix_upper(prefix);
+        let range = KeyRange::bound(lower, upper, false, false);
+        idx.visit_range_index_keys(Some(&range), reverse, limit, offset, |row_id| {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                return true;
+            };
+            visitor(row)
+        });
+    }
+
+    /// Returns whether a row matches the tuple key range for a composite index.
+    pub fn row_matches_index_composite_range(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        row: &Row,
+    ) -> bool {
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return false;
+        };
+        if columns.len() <= 1 {
+            return false;
+        }
+
+        let key: Vec<Value> = columns
+            .iter()
+            .map(|&column_index| row.get(column_index).cloned().unwrap_or(Value::Null))
+            .collect();
+        range.map_or(true, |range| range.contains(&key))
+    }
+
+    /// Visits rows from a composite index scan restricted to a row-id subset.
+    /// `subset_driven=true` iterates the subset directly; otherwise it intersects an index scan.
+    pub fn visit_index_scan_composite_with_options_restricted<F>(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let mut skipped = 0usize;
+        let mut emitted = 0usize;
+        let mut visit_matched = |row: &Rc<Row>| {
+            if skipped < offset {
+                skipped += 1;
+                return true;
+            }
+            if let Some(limit) = limit {
+                if emitted >= limit {
+                    return false;
+                }
+            }
+            emitted += 1;
+            visitor(row)
+        };
+
+        if subset_driven {
+            let mut visit_subset_row_id = |row_id: RowId| {
+                let Some(row) = self.row_ref_by_id(row_id) else {
+                    return true;
+                };
+                if !self.row_matches_index_composite_range(index_name, range, row) {
+                    return true;
+                }
+                visit_matched(row)
+            };
+
+            if reverse {
+                for &row_id in allowed_row_ids.iter().rev() {
+                    if !visit_subset_row_id(row_id) {
+                        break;
+                    }
+                }
+            } else {
+                for &row_id in allowed_row_ids {
+                    if !visit_subset_row_id(row_id) {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        self.visit_index_scan_composite_with_options(index_name, range, None, 0, reverse, |row| {
+            if allowed_row_ids.binary_search(&row.id()).is_err() {
+                return true;
+            }
+            visit_matched(row)
+        });
     }
 
     /// Clears all rows and indices.
@@ -1419,13 +3143,84 @@ impl RowStore {
     // ========== GIN Index Methods ==========
 
     /// Indexes a JSONB value into the GIN index.
-    fn index_jsonb_value(gin_idx: &mut GinIndex, value: &Value, row_id: RowId) {
+    fn index_jsonb_value(
+        gin_idx: &mut GinIndex,
+        value: &Value,
+        row_id: RowId,
+        indexed_paths: Option<&[CompiledGinPath]>,
+        indexed_path_tree: Option<&CompiledGinPathTree>,
+    ) {
+        if let Some(paths) = indexed_paths {
+            if let Some(extracted) = Self::extract_selected_jsonb_entries_from_text(
+                value,
+                paths,
+                indexed_path_tree,
+                None,
+            ) {
+                Self::index_extracted_jsonb_selected_paths(gin_idx, row_id, paths, extracted);
+                return;
+            }
+        }
+
         let Some(parsed) = Self::parse_jsonb_value(value) else {
             return;
         };
 
+        if let Some(paths) = indexed_paths {
+            Self::index_jsonb_selected_paths(gin_idx, &parsed, row_id, paths);
+            return;
+        }
+
         let mut current_path = String::new();
-        Self::index_jsonb_node(gin_idx, &parsed, row_id, &mut current_path);
+        Self::index_jsonb_node(gin_idx, &parsed, row_id, &mut current_path, None);
+    }
+
+    fn collect_jsonb_value_into_builder_profiled(
+        builder: &mut GinBulkBuilder,
+        value: &Value,
+        row_id: RowId,
+        indexed_paths: Option<&[CompiledGinPath]>,
+        indexed_path_tree: Option<&CompiledGinPathTree>,
+        profiler: &mut InsertBatchProfiler,
+    ) {
+        if let Some(paths) = indexed_paths {
+            if let Some(extracted) = Self::extract_selected_jsonb_entries_from_text(
+                value,
+                paths,
+                indexed_path_tree,
+                Some(profiler),
+            ) {
+                Self::collect_extracted_jsonb_selected_paths_into_builder_profiled(
+                    builder, row_id, paths, extracted, profiler,
+                );
+                return;
+            }
+        }
+
+        let parse_started = profiler.start_timer();
+        let parsed = Self::parse_jsonb_value(value);
+        profiler.record_gin_parse_call();
+        profiler.finish_gin_phase(GinInsertProfilePhase::ParseJson, parse_started);
+        let Some(parsed) = parsed else {
+            return;
+        };
+
+        if let Some(paths) = indexed_paths {
+            Self::collect_jsonb_selected_paths_into_builder_profiled(
+                builder, &parsed, row_id, paths, profiler,
+            );
+            return;
+        }
+
+        let mut current_path = String::new();
+        Self::collect_jsonb_node_into_builder_profiled(
+            builder,
+            &parsed,
+            row_id,
+            &mut current_path,
+            None,
+            profiler,
+        );
     }
 
     fn index_jsonb_node(
@@ -1433,16 +3228,21 @@ impl RowStore {
         value: &ParsedJsonbValue,
         row_id: RowId,
         current_path: &mut String,
+        indexed_paths: Option<&[String]>,
     ) {
         match value {
             ParsedJsonbValue::Object(obj) => {
                 for (key, child) in obj.iter() {
                     let saved_len = current_path.len();
                     Self::append_gin_path_segment(current_path, key);
-                    gin_idx.add_key(current_path.clone(), row_id);
-                    Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
-                    Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
-                    Self::index_jsonb_node(gin_idx, child, row_id, current_path);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        gin_idx.add_key(current_path.clone(), row_id);
+                        Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
+                        Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::index_jsonb_node(gin_idx, child, row_id, current_path, indexed_paths);
+                    }
                     current_path.truncate(saved_len);
                 }
             }
@@ -1451,10 +3251,14 @@ impl RowStore {
                     let saved_len = current_path.len();
                     let segment = idx.to_string();
                     Self::append_gin_path_segment(current_path, &segment);
-                    gin_idx.add_key(current_path.clone(), row_id);
-                    Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
-                    Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
-                    Self::index_jsonb_node(gin_idx, child, row_id, current_path);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        gin_idx.add_key(current_path.clone(), row_id);
+                        Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
+                        Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::index_jsonb_node(gin_idx, child, row_id, current_path, indexed_paths);
+                    }
                     current_path.truncate(saved_len);
                 }
             }
@@ -1480,34 +3284,62 @@ impl RowStore {
         row_id: RowId,
     ) {
         let value_str = value.stringify_for_contains();
-        gin_idx.add_key_values(contains_trigram_pairs(current_path, &value_str), row_id);
+        gin_idx.add_contains_trigrams(current_path, &value_str, row_id);
     }
 
-    /// Removes JSONB value from the GIN index.
-    fn remove_jsonb_from_gin(gin_idx: &mut GinIndex, value: &Value, row_id: RowId) {
-        let Some(parsed) = Self::parse_jsonb_value(value) else {
-            return;
-        };
-
-        let mut current_path = String::new();
-        Self::remove_jsonb_node(gin_idx, &parsed, row_id, &mut current_path);
-    }
-
-    fn remove_jsonb_node(
+    fn index_jsonb_contains_prefilter_for_key(
         gin_idx: &mut GinIndex,
+        contains_key: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        let value_str = value.stringify_for_contains();
+        for gram in cynos_index::contains_trigrams(&value_str) {
+            gin_idx.add_key_value(contains_key.into(), gram, row_id);
+        }
+    }
+
+    fn collect_jsonb_node_into_builder_profiled(
+        builder: &mut GinBulkBuilder,
         value: &ParsedJsonbValue,
         row_id: RowId,
         current_path: &mut String,
+        indexed_paths: Option<&[String]>,
+        profiler: &mut InsertBatchProfiler,
     ) {
         match value {
             ParsedJsonbValue::Object(obj) => {
                 for (key, child) in obj.iter() {
                     let saved_len = current_path.len();
                     Self::append_gin_path_segment(current_path, key);
-                    gin_idx.remove_key(current_path, row_id);
-                    Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
-                    Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
-                    Self::remove_jsonb_node(gin_idx, child, row_id, current_path);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        builder.add_key_ref(current_path, row_id);
+                        profiler.record_gin_path_key_emit();
+                        Self::collect_jsonb_scalar_into_builder_profiled(
+                            builder,
+                            current_path,
+                            child,
+                            row_id,
+                            profiler,
+                        );
+                        Self::collect_jsonb_contains_prefilter_into_builder_profiled(
+                            builder,
+                            current_path,
+                            child,
+                            row_id,
+                            profiler,
+                        );
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::collect_jsonb_node_into_builder_profiled(
+                            builder,
+                            child,
+                            row_id,
+                            current_path,
+                            indexed_paths,
+                            profiler,
+                        );
+                    }
                     current_path.truncate(saved_len);
                 }
             }
@@ -1516,15 +3348,387 @@ impl RowStore {
                     let saved_len = current_path.len();
                     let segment = idx.to_string();
                     Self::append_gin_path_segment(current_path, &segment);
-                    gin_idx.remove_key(current_path, row_id);
-                    Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
-                    Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
-                    Self::remove_jsonb_node(gin_idx, child, row_id, current_path);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        builder.add_key_ref(current_path, row_id);
+                        profiler.record_gin_path_key_emit();
+                        Self::collect_jsonb_scalar_into_builder_profiled(
+                            builder,
+                            current_path,
+                            child,
+                            row_id,
+                            profiler,
+                        );
+                        Self::collect_jsonb_contains_prefilter_into_builder_profiled(
+                            builder,
+                            current_path,
+                            child,
+                            row_id,
+                            profiler,
+                        );
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::collect_jsonb_node_into_builder_profiled(
+                            builder,
+                            child,
+                            row_id,
+                            current_path,
+                            indexed_paths,
+                            profiler,
+                        );
+                    }
                     current_path.truncate(saved_len);
                 }
             }
             _ => {}
         }
+    }
+
+    fn collect_jsonb_scalar_into_builder_profiled(
+        builder: &mut GinBulkBuilder,
+        current_path: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        profiler: &mut InsertBatchProfiler,
+    ) {
+        let started = profiler.start_timer();
+        let value_str = Self::jsonb_scalar_to_index_value(value);
+        profiler.finish_gin_phase(GinInsertProfilePhase::ScalarEmit, started);
+        if let Some(value_str) = value_str {
+            profiler.record_gin_scalar_value();
+            builder.add_key_value_ref(current_path, &value_str, row_id);
+        }
+    }
+
+    fn index_jsonb_scalar_text_for_selected_path(
+        gin_idx: &mut GinIndex,
+        path: &CompiledGinPath,
+        scalar_text: &str,
+        row_id: RowId,
+    ) {
+        let Some(value_str) = Self::json_text_scalar_to_index_value_ref(scalar_text) else {
+            return;
+        };
+        gin_idx.add_key_value(path.encoded_path.clone(), value_str.as_str().into(), row_id);
+        for gram in cynos_index::contains_trigrams(value_str.as_str()) {
+            gin_idx.add_key_value(path.contains_key.clone(), gram, row_id);
+        }
+    }
+
+    fn collect_jsonb_scalar_text_into_builder_for_key_profiled(
+        builder: &mut GinBulkBuilder,
+        path: &CompiledGinPath,
+        scalar_text: &str,
+        row_id: RowId,
+        profiler: &mut InsertBatchProfiler,
+    ) {
+        let scalar_started = profiler.start_timer();
+        let scalar_value = Self::json_text_scalar_to_index_value_ref(scalar_text);
+        profiler.finish_gin_phase(GinInsertProfilePhase::ScalarEmit, scalar_started);
+        let Some(scalar_value) = scalar_value else {
+            return;
+        };
+
+        profiler.record_gin_scalar_value();
+        builder.add_key_value_ref(&path.encoded_path, scalar_value.as_str(), row_id);
+
+        let stringify_started = profiler.start_timer();
+        let contains_value = scalar_value.as_str();
+        profiler.finish_gin_phase(GinInsertProfilePhase::ContainsStringify, stringify_started);
+        profiler.record_gin_contains_value();
+
+        let trigram_started = profiler.start_timer();
+        let trigram_count =
+            builder.add_contains_trigrams_for_key(&path.contains_key, &contains_value, row_id);
+        profiler.finish_gin_phase(GinInsertProfilePhase::ContainsTrigramEmit, trigram_started);
+        profiler.record_gin_contains_trigrams(trigram_count);
+    }
+
+    fn collect_jsonb_contains_prefilter_into_builder_profiled(
+        builder: &mut GinBulkBuilder,
+        current_path: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        profiler: &mut InsertBatchProfiler,
+    ) {
+        let stringify_started = profiler.start_timer();
+        let value_str = value.stringify_for_contains();
+        profiler.finish_gin_phase(GinInsertProfilePhase::ContainsStringify, stringify_started);
+        profiler.record_gin_contains_value();
+
+        let trigram_started = profiler.start_timer();
+        let trigram_count = builder.add_contains_trigrams(current_path, &value_str, row_id);
+        profiler.finish_gin_phase(GinInsertProfilePhase::ContainsTrigramEmit, trigram_started);
+        profiler.record_gin_contains_trigrams(trigram_count);
+    }
+
+    fn index_jsonb_selected_paths(
+        gin_idx: &mut GinIndex,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        indexed_paths: &[CompiledGinPath],
+    ) {
+        for path in indexed_paths {
+            let Some(selected) = Self::jsonb_value_at_compiled_gin_path(value, path) else {
+                continue;
+            };
+            gin_idx.add_key(path.encoded_path.clone(), row_id);
+            Self::index_jsonb_scalar(gin_idx, &path.encoded_path, selected, row_id);
+            Self::index_jsonb_contains_prefilter_for_key(
+                gin_idx,
+                &path.contains_key,
+                selected,
+                row_id,
+            );
+        }
+    }
+
+    fn index_extracted_jsonb_selected_paths(
+        gin_idx: &mut GinIndex,
+        row_id: RowId,
+        indexed_paths: &[CompiledGinPath],
+        extracted: Vec<(usize, ExtractedJsonbTextValue<'_>)>,
+    ) {
+        for (path_index, selected) in extracted {
+            let path = &indexed_paths[path_index];
+            gin_idx.add_key(path.encoded_path.clone(), row_id);
+            match selected {
+                ExtractedJsonbTextValue::ScalarText(scalar_text) => {
+                    Self::index_jsonb_scalar_text_for_selected_path(
+                        gin_idx,
+                        path,
+                        scalar_text,
+                        row_id,
+                    );
+                }
+                ExtractedJsonbTextValue::Parsed(selected) => {
+                    Self::index_jsonb_scalar(gin_idx, &path.encoded_path, &selected, row_id);
+                    Self::index_jsonb_contains_prefilter_for_key(
+                        gin_idx,
+                        &path.contains_key,
+                        &selected,
+                        row_id,
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_jsonb_selected_paths_into_builder_profiled(
+        builder: &mut GinBulkBuilder,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        indexed_paths: &[CompiledGinPath],
+        profiler: &mut InsertBatchProfiler,
+    ) {
+        for path in indexed_paths {
+            profiler.record_gin_selected_path_eval();
+            let lookup_started = profiler.start_timer();
+            let selected = Self::jsonb_value_at_compiled_gin_path(value, path);
+            profiler.finish_gin_phase(GinInsertProfilePhase::PathLookup, lookup_started);
+            let Some(selected) = selected else {
+                continue;
+            };
+
+            profiler.record_gin_selected_path_hit();
+            builder.add_key_ref(&path.encoded_path, row_id);
+            profiler.record_gin_path_key_emit();
+            Self::collect_jsonb_scalar_into_builder_profiled(
+                builder,
+                &path.encoded_path,
+                selected,
+                row_id,
+                profiler,
+            );
+            Self::collect_jsonb_contains_prefilter_into_builder_for_key_profiled(
+                builder,
+                &path.contains_key,
+                selected,
+                row_id,
+                profiler,
+            );
+        }
+    }
+
+    fn collect_extracted_jsonb_selected_paths_into_builder_profiled(
+        builder: &mut GinBulkBuilder,
+        row_id: RowId,
+        indexed_paths: &[CompiledGinPath],
+        extracted: Vec<(usize, ExtractedJsonbTextValue<'_>)>,
+        profiler: &mut InsertBatchProfiler,
+    ) {
+        for (path_index, selected) in extracted {
+            let path = &indexed_paths[path_index];
+            builder.add_key_ref(&path.encoded_path, row_id);
+            profiler.record_gin_path_key_emit();
+            profiler.record_gin_selected_path_hit();
+            match selected {
+                ExtractedJsonbTextValue::ScalarText(scalar_text) => {
+                    Self::collect_jsonb_scalar_text_into_builder_for_key_profiled(
+                        builder,
+                        path,
+                        scalar_text,
+                        row_id,
+                        profiler,
+                    );
+                }
+                ExtractedJsonbTextValue::Parsed(selected) => {
+                    Self::collect_jsonb_scalar_into_builder_profiled(
+                        builder,
+                        &path.encoded_path,
+                        &selected,
+                        row_id,
+                        profiler,
+                    );
+                    Self::collect_jsonb_contains_prefilter_into_builder_for_key_profiled(
+                        builder,
+                        &path.contains_key,
+                        &selected,
+                        row_id,
+                        profiler,
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_jsonb_contains_prefilter_into_builder_for_key_profiled(
+        builder: &mut GinBulkBuilder,
+        contains_key: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        profiler: &mut InsertBatchProfiler,
+    ) {
+        let stringify_started = profiler.start_timer();
+        let value_str = value.stringify_for_contains();
+        profiler.finish_gin_phase(GinInsertProfilePhase::ContainsStringify, stringify_started);
+        profiler.record_gin_contains_value();
+
+        let trigram_started = profiler.start_timer();
+        let trigram_count = builder.add_contains_trigrams_for_key(contains_key, &value_str, row_id);
+        profiler.finish_gin_phase(GinInsertProfilePhase::ContainsTrigramEmit, trigram_started);
+        profiler.record_gin_contains_trigrams(trigram_count);
+    }
+
+    fn remove_jsonb_scalar_text_for_selected_path(
+        gin_idx: &mut GinIndex,
+        path: &CompiledGinPath,
+        scalar_text: &str,
+        row_id: RowId,
+    ) {
+        let Some(value_str) = Self::json_text_scalar_to_index_value_ref(scalar_text) else {
+            return;
+        };
+        gin_idx.remove_key_value(&path.encoded_path, value_str.as_str(), row_id);
+        for gram in cynos_index::contains_trigrams(value_str.as_str()) {
+            gin_idx.remove_key_value(&path.contains_key, &gram, row_id);
+        }
+    }
+
+    /// Removes JSONB value from the GIN index.
+    fn remove_jsonb_from_gin(
+        gin_idx: &mut GinIndex,
+        value: &Value,
+        row_id: RowId,
+        indexed_paths: Option<&[CompiledGinPath]>,
+        indexed_path_tree: Option<&CompiledGinPathTree>,
+    ) {
+        if let Some(paths) = indexed_paths {
+            if let Some(extracted) = Self::extract_selected_jsonb_entries_from_text(
+                value,
+                paths,
+                indexed_path_tree,
+                None,
+            ) {
+                Self::remove_extracted_jsonb_selected_paths(gin_idx, row_id, paths, extracted);
+                return;
+            }
+        }
+
+        let Some(parsed) = Self::parse_jsonb_value(value) else {
+            return;
+        };
+
+        if let Some(paths) = indexed_paths {
+            Self::remove_jsonb_selected_paths(gin_idx, &parsed, row_id, paths);
+            return;
+        }
+
+        let mut current_path = String::new();
+        Self::remove_jsonb_node(gin_idx, &parsed, row_id, &mut current_path, None);
+    }
+
+    fn remove_jsonb_node(
+        gin_idx: &mut GinIndex,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        current_path: &mut String,
+        indexed_paths: Option<&[String]>,
+    ) {
+        match value {
+            ParsedJsonbValue::Object(obj) => {
+                for (key, child) in obj.iter() {
+                    let saved_len = current_path.len();
+                    Self::append_gin_path_segment(current_path, key);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        gin_idx.remove_key(current_path, row_id);
+                        Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
+                        Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::remove_jsonb_node(
+                            gin_idx,
+                            child,
+                            row_id,
+                            current_path,
+                            indexed_paths,
+                        );
+                    }
+                    current_path.truncate(saved_len);
+                }
+            }
+            ParsedJsonbValue::Array(items) => {
+                for (idx, child) in items.iter().enumerate() {
+                    let saved_len = current_path.len();
+                    let segment = idx.to_string();
+                    Self::append_gin_path_segment(current_path, &segment);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        gin_idx.remove_key(current_path, row_id);
+                        Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
+                        Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path) {
+                        Self::remove_jsonb_node(
+                            gin_idx,
+                            child,
+                            row_id,
+                            current_path,
+                            indexed_paths,
+                        );
+                    }
+                    current_path.truncate(saved_len);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn should_index_gin_path(indexed_paths: Option<&[String]>, current_path: &str) -> bool {
+        indexed_paths.map_or(true, |paths| {
+            paths
+                .iter()
+                .any(|indexed_path| indexed_path == current_path)
+        })
+    }
+
+    fn should_descend_gin_path(indexed_paths: Option<&[String]>, current_path: &str) -> bool {
+        indexed_paths.map_or(true, |paths| {
+            let mut prefix = String::with_capacity(current_path.len() + 1);
+            prefix.push_str(current_path);
+            prefix.push('.');
+            paths
+                .iter()
+                .any(|indexed_path| indexed_path.starts_with(&prefix))
+        })
     }
 
     fn remove_jsonb_scalar(
@@ -1550,12 +3754,351 @@ impl RowStore {
         }
     }
 
+    fn remove_jsonb_contains_prefilter_for_key(
+        gin_idx: &mut GinIndex,
+        contains_key: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        let value_str = value.stringify_for_contains();
+        for gram in cynos_index::contains_trigrams(&value_str) {
+            gin_idx.remove_key_value(contains_key, &gram, row_id);
+        }
+    }
+
+    fn remove_jsonb_selected_paths(
+        gin_idx: &mut GinIndex,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        indexed_paths: &[CompiledGinPath],
+    ) {
+        for path in indexed_paths {
+            let Some(selected) = Self::jsonb_value_at_compiled_gin_path(value, path) else {
+                continue;
+            };
+            gin_idx.remove_key(&path.encoded_path, row_id);
+            Self::remove_jsonb_scalar(gin_idx, &path.encoded_path, selected, row_id);
+            Self::remove_jsonb_contains_prefilter_for_key(
+                gin_idx,
+                &path.contains_key,
+                selected,
+                row_id,
+            );
+        }
+    }
+
+    fn remove_extracted_jsonb_selected_paths(
+        gin_idx: &mut GinIndex,
+        row_id: RowId,
+        indexed_paths: &[CompiledGinPath],
+        extracted: Vec<(usize, ExtractedJsonbTextValue<'_>)>,
+    ) {
+        for (path_index, selected) in extracted {
+            let path = &indexed_paths[path_index];
+            gin_idx.remove_key(&path.encoded_path, row_id);
+            match selected {
+                ExtractedJsonbTextValue::ScalarText(scalar_text) => {
+                    Self::remove_jsonb_scalar_text_for_selected_path(
+                        gin_idx,
+                        path,
+                        scalar_text,
+                        row_id,
+                    );
+                }
+                ExtractedJsonbTextValue::Parsed(selected) => {
+                    Self::remove_jsonb_scalar(gin_idx, &path.encoded_path, &selected, row_id);
+                    Self::remove_jsonb_contains_prefilter_for_key(
+                        gin_idx,
+                        &path.contains_key,
+                        &selected,
+                        row_id,
+                    );
+                }
+            }
+        }
+    }
+
     fn parse_jsonb_value(value: &Value) -> Option<ParsedJsonbValue> {
         let Value::Jsonb(jsonb) = value else {
             return None;
         };
         let json_str = core::str::from_utf8(&jsonb.0).ok()?;
         parse_json_text(json_str)
+    }
+
+    #[cfg(test)]
+    fn json_text_scalar_to_index_value(value_slice: &str) -> Option<String> {
+        Self::json_text_scalar_to_index_value_ref(value_slice).map(JsonScalarIndexValue::into_owned)
+    }
+
+    fn json_text_scalar_to_index_value_ref(value_slice: &str) -> Option<JsonScalarIndexValue<'_>> {
+        let value_slice = value_slice.trim();
+        if value_slice == "null" || value_slice == "true" || value_slice == "false" {
+            return Some(JsonScalarIndexValue::Borrowed(value_slice));
+        }
+        if value_slice.starts_with('"') && value_slice.ends_with('"') && value_slice.len() >= 2 {
+            let inner = &value_slice[1..value_slice.len() - 1];
+            if !inner.as_bytes().contains(&b'\\') {
+                return Some(JsonScalarIndexValue::Borrowed(inner));
+            }
+            return Some(JsonScalarIndexValue::Owned(unescape_json(inner)));
+        }
+        if is_fast_json_integer_literal(value_slice) {
+            return Some(JsonScalarIndexValue::Borrowed(value_slice));
+        }
+        let number = value_slice.parse::<f64>().ok()?;
+        Some(JsonScalarIndexValue::Owned(format!("{number}")))
+    }
+
+    fn extract_selected_jsonb_entries_from_text<'a>(
+        value: &'a Value,
+        indexed_paths: &[CompiledGinPath],
+        indexed_path_tree: Option<&CompiledGinPathTree>,
+        profiler: Option<&mut InsertBatchProfiler>,
+    ) -> Option<Vec<(usize, ExtractedJsonbTextValue<'a>)>> {
+        let Value::Jsonb(jsonb) = value else {
+            return None;
+        };
+        let json_text = core::str::from_utf8(&jsonb.0).ok()?;
+        let mut extracted = Vec::with_capacity(indexed_paths.len());
+        let mut profiler = profiler;
+        let indexed_path_tree = indexed_path_tree?;
+
+        if let Some(profiler) = profiler.as_deref_mut() {
+            for _ in indexed_paths {
+                profiler.record_gin_selected_path_eval();
+            }
+        }
+
+        let lookup_started = profiler
+            .as_deref_mut()
+            .and_then(|profiler| profiler.start_timer());
+        if Self::extract_selected_jsonb_entries_from_slice(
+            json_text.trim(),
+            indexed_paths,
+            indexed_path_tree,
+            0,
+            &mut extracted,
+            &mut profiler,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        if let Some(profiler) = profiler.as_deref_mut() {
+            profiler.finish_gin_phase(GinInsertProfilePhase::PathLookup, lookup_started);
+        }
+
+        extracted.sort_unstable_by_key(|(path_index, _)| *path_index);
+
+        Some(extracted)
+    }
+
+    fn extract_selected_jsonb_entries_from_slice<'a>(
+        json_text: &'a str,
+        indexed_paths: &[CompiledGinPath],
+        indexed_path_tree: &CompiledGinPathTree,
+        node_index: usize,
+        extracted: &mut Vec<(usize, ExtractedJsonbTextValue<'a>)>,
+        profiler: &mut Option<&mut InsertBatchProfiler>,
+    ) -> core::result::Result<(), ()> {
+        let json_text = json_text.trim();
+        let Some(node) = indexed_path_tree.nodes.get(node_index) else {
+            return Err(());
+        };
+
+        for &path_index in &node.terminal_path_indices {
+            Self::push_extracted_jsonb_entry(json_text, path_index, extracted, profiler)?;
+        }
+
+        if node.object_children.is_empty() && node.array_children.is_empty() {
+            return Ok(());
+        }
+
+        match json_text.as_bytes().first().copied() {
+            Some(b'{') => Self::extract_selected_jsonb_entries_from_object(
+                json_text,
+                indexed_paths,
+                indexed_path_tree,
+                node_index,
+                extracted,
+                profiler,
+            ),
+            Some(b'[') => Self::extract_selected_jsonb_entries_from_array(
+                json_text,
+                indexed_paths,
+                indexed_path_tree,
+                node_index,
+                extracted,
+                profiler,
+            ),
+            Some(_) => Ok(()),
+            None => Err(()),
+        }
+    }
+
+    fn extract_selected_jsonb_entries_from_object<'a>(
+        json_text: &'a str,
+        indexed_paths: &[CompiledGinPath],
+        indexed_path_tree: &CompiledGinPathTree,
+        node_index: usize,
+        extracted: &mut Vec<(usize, ExtractedJsonbTextValue<'a>)>,
+        profiler: &mut Option<&mut InsertBatchProfiler>,
+    ) -> core::result::Result<(), ()> {
+        let bytes = json_text.as_bytes();
+        if bytes.first().copied() != Some(b'{') {
+            return Err(());
+        }
+        let Some(node) = indexed_path_tree.nodes.get(node_index) else {
+            return Err(());
+        };
+
+        let mut index = 1usize;
+        loop {
+            index = skip_json_whitespace_bytes(bytes, index);
+            match bytes.get(index).copied() {
+                Some(b'}') => return Ok(()),
+                Some(b'"') => {}
+                Some(_) => return Err(()),
+                None => return Err(()),
+            }
+
+            let key_end = scan_json_string_end_bytes(bytes, index).ok_or(())?;
+            let key = &json_text[index + 1..key_end - 1];
+            index = skip_json_whitespace_bytes(bytes, key_end);
+            if bytes.get(index).copied() != Some(b':') {
+                return Err(());
+            }
+            index = skip_json_whitespace_bytes(bytes, index + 1);
+
+            let value_start = index;
+            let value_end = scan_json_value_end_bytes(bytes, value_start).ok_or(())?;
+            let value_slice = json_text[value_start..value_end].trim();
+            if let Some(&child_node_index) = node.object_children.get(key) {
+                Self::extract_selected_jsonb_entries_from_slice(
+                    value_slice,
+                    indexed_paths,
+                    indexed_path_tree,
+                    child_node_index,
+                    extracted,
+                    profiler,
+                )?;
+            }
+
+            index = skip_json_whitespace_bytes(bytes, value_end);
+            match bytes.get(index).copied() {
+                Some(b',') => index += 1,
+                Some(b'}') => return Ok(()),
+                Some(_) => return Err(()),
+                None => return Err(()),
+            }
+        }
+    }
+
+    fn extract_selected_jsonb_entries_from_array<'a>(
+        json_text: &'a str,
+        indexed_paths: &[CompiledGinPath],
+        indexed_path_tree: &CompiledGinPathTree,
+        node_index: usize,
+        extracted: &mut Vec<(usize, ExtractedJsonbTextValue<'a>)>,
+        profiler: &mut Option<&mut InsertBatchProfiler>,
+    ) -> core::result::Result<(), ()> {
+        let bytes = json_text.as_bytes();
+        if bytes.first().copied() != Some(b'[') {
+            return Err(());
+        }
+        let Some(node) = indexed_path_tree.nodes.get(node_index) else {
+            return Err(());
+        };
+
+        let mut index = 1usize;
+        let mut current_index = 0usize;
+        loop {
+            index = skip_json_whitespace_bytes(bytes, index);
+            match bytes.get(index).copied() {
+                Some(b']') => return Ok(()),
+                Some(_) => {}
+                None => return Err(()),
+            }
+
+            let value_start = index;
+            let value_end = scan_json_value_end_bytes(bytes, value_start).ok_or(())?;
+            let value_slice = json_text[value_start..value_end].trim();
+            if let Some(&child_node_index) = node.array_children.get(&current_index) {
+                Self::extract_selected_jsonb_entries_from_slice(
+                    value_slice,
+                    indexed_paths,
+                    indexed_path_tree,
+                    child_node_index,
+                    extracted,
+                    profiler,
+                )?;
+            }
+
+            current_index += 1;
+            index = skip_json_whitespace_bytes(bytes, value_end);
+            match bytes.get(index).copied() {
+                Some(b',') => index += 1,
+                Some(b']') => return Ok(()),
+                Some(_) => return Err(()),
+                None => return Err(()),
+            }
+        }
+    }
+
+    fn push_extracted_jsonb_entry<'a>(
+        value_slice: &'a str,
+        path_index: usize,
+        extracted: &mut Vec<(usize, ExtractedJsonbTextValue<'a>)>,
+        profiler: &mut Option<&mut InsertBatchProfiler>,
+    ) -> core::result::Result<(), ()> {
+        match value_slice.as_bytes().first().copied() {
+            Some(b'{') | Some(b'[') => {
+                let parse_started = profiler
+                    .as_deref_mut()
+                    .and_then(|profiler| profiler.start_timer());
+                let parsed = parse_json_text(value_slice);
+                if let Some(profiler) = profiler.as_deref_mut() {
+                    profiler.record_gin_parse_call();
+                    profiler.finish_gin_phase(GinInsertProfilePhase::ParseJson, parse_started);
+                }
+
+                let Some(parsed) = parsed else {
+                    return Err(());
+                };
+                extracted.push((path_index, ExtractedJsonbTextValue::Parsed(parsed)));
+            }
+            Some(_) => {
+                extracted.push((path_index, ExtractedJsonbTextValue::ScalarText(value_slice)))
+            }
+            None => return Err(()),
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn extract_selected_jsonb_values_from_text(
+        value: &Value,
+        indexed_paths: &[CompiledGinPath],
+        indexed_path_tree: Option<&CompiledGinPathTree>,
+        profiler: Option<&mut InsertBatchProfiler>,
+    ) -> Option<Vec<(usize, ParsedJsonbValue)>> {
+        let extracted = Self::extract_selected_jsonb_entries_from_text(
+            value,
+            indexed_paths,
+            indexed_path_tree,
+            profiler,
+        )?;
+        let mut parsed_values = Vec::with_capacity(extracted.len());
+        for (path_index, value) in extracted {
+            let parsed = match value {
+                ExtractedJsonbTextValue::ScalarText(value_slice) => parse_json_text(value_slice)?,
+                ExtractedJsonbTextValue::Parsed(parsed) => parsed,
+            };
+            parsed_values.push((path_index, parsed));
+        }
+        Some(parsed_values)
     }
 
     fn jsonb_scalar_to_index_value(value: &ParsedJsonbValue) -> Option<String> {
@@ -1666,6 +4209,104 @@ impl RowStore {
         });
     }
 
+    /// Returns whether a row contains the indexed JSON path.
+    pub fn row_matches_gin_key(&self, index_name: &str, row: &Row, key: &str) -> bool {
+        self.row_gin_path_value(index_name, row, key).is_some()
+    }
+
+    /// Returns whether a row contains the indexed JSON path with the expected scalar value.
+    pub fn row_matches_gin_key_value(
+        &self,
+        index_name: &str,
+        row: &Row,
+        key: &str,
+        value: &str,
+    ) -> bool {
+        self.row_contains_gin_token_pair(index_name, row, key, value)
+    }
+
+    /// Returns whether a row satisfies a multi-key GIN predicate.
+    pub fn row_matches_gin_key_values(
+        &self,
+        index_name: &str,
+        row: &Row,
+        pairs: &[(&str, &str)],
+        match_all: bool,
+    ) -> bool {
+        if match_all {
+            pairs
+                .iter()
+                .all(|(key, value)| self.row_matches_gin_key_value(index_name, row, key, value))
+        } else {
+            pairs
+                .iter()
+                .any(|(key, value)| self.row_matches_gin_key_value(index_name, row, key, value))
+        }
+    }
+
+    /// Visits rows matching a GIN key-value query restricted to a row-id subset.
+    pub fn visit_gin_index_by_key_value_restricted<F>(
+        &self,
+        index_name: &str,
+        key: &str,
+        value: &str,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        if subset_driven {
+            self.visit_rows_by_ids(allowed_row_ids, |row| {
+                if self.row_matches_gin_key_value(index_name, row, key, value) {
+                    visitor(row)
+                } else {
+                    true
+                }
+            });
+            return;
+        }
+
+        self.visit_gin_index_by_key_value(index_name, key, value, |row| {
+            if allowed_row_ids.binary_search(&row.id()).is_ok() {
+                visitor(row)
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Visits rows matching a GIN key-existence query restricted to a row-id subset.
+    pub fn visit_gin_index_by_key_restricted<F>(
+        &self,
+        index_name: &str,
+        key: &str,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        if subset_driven {
+            self.visit_rows_by_ids(allowed_row_ids, |row| {
+                if self.row_matches_gin_key(index_name, row, key) {
+                    visitor(row)
+                } else {
+                    true
+                }
+            });
+            return;
+        }
+
+        self.visit_gin_index_by_key(index_name, key, |row| {
+            if allowed_row_ids.binary_search(&row.id()).is_ok() {
+                visitor(row)
+            } else {
+                true
+            }
+        });
+    }
+
     /// Queries the GIN index by multiple key-value pairs (AND query).
     /// Returns rows that match ALL of the given key-value pairs.
     pub fn gin_index_get_by_key_values_all(
@@ -1675,6 +4316,24 @@ impl RowStore {
     ) -> Vec<Rc<Row>> {
         if let Some(gin_idx) = self.gin_indices.get(index_name) {
             let row_ids = gin_idx.get_by_key_values_all(pairs);
+            row_ids
+                .iter()
+                .filter_map(|&id| self.row_ref_by_id(id).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Queries the GIN index by multiple key-value pairs (OR query).
+    /// Returns rows that match ANY of the given key-value pairs.
+    pub fn gin_index_get_by_key_values_any(
+        &self,
+        index_name: &str,
+        pairs: &[(&str, &str)],
+    ) -> Vec<Rc<Row>> {
+        if let Some(gin_idx) = self.gin_indices.get(index_name) {
+            let row_ids = gin_idx.get_by_key_values_any(pairs);
             row_ids
                 .iter()
                 .filter_map(|&id| self.row_ref_by_id(id).cloned())
@@ -1706,6 +4365,66 @@ impl RowStore {
         });
     }
 
+    /// Visits rows matching any GIN key-value pairs without materializing the full row set.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_gin_index_by_key_values_any<F>(
+        &self,
+        index_name: &str,
+        pairs: &[(&str, &str)],
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let Some(gin_idx) = self.gin_indices.get(index_name) else {
+            return;
+        };
+
+        gin_idx.visit_by_key_values_any(pairs, |row_id| {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                return true;
+            };
+            visitor(row)
+        });
+    }
+
+    /// Visits rows matching a multi-predicate GIN query restricted to a row-id subset.
+    pub fn visit_gin_index_by_key_values_restricted<F>(
+        &self,
+        index_name: &str,
+        pairs: &[(&str, &str)],
+        match_all: bool,
+        allowed_row_ids: &[RowId],
+        subset_driven: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        if subset_driven {
+            self.visit_rows_by_ids(allowed_row_ids, |row| {
+                if self.row_matches_gin_key_values(index_name, row, pairs, match_all) {
+                    visitor(row)
+                } else {
+                    true
+                }
+            });
+            return;
+        }
+
+        let mut visit_intersected = |row: &Rc<Row>| {
+            if allowed_row_ids.binary_search(&row.id()).is_ok() {
+                visitor(row)
+            } else {
+                true
+            }
+        };
+
+        if match_all {
+            self.visit_gin_index_by_key_values_all(index_name, pairs, |row| visit_intersected(row));
+        } else {
+            self.visit_gin_index_by_key_values_any(index_name, pairs, |row| visit_intersected(row));
+        }
+    }
+
     /// Returns the raw row IDs from the GIN index for a given key.
     /// This is useful for testing to detect ghost entries (entries that point to deleted rows).
     #[cfg(test)]
@@ -1732,6 +4451,199 @@ impl RowStore {
             Vec::new()
         }
     }
+
+    fn row_gin_path_value(
+        &self,
+        index_name: &str,
+        row: &Row,
+        key: &str,
+    ) -> Option<ParsedJsonbValue> {
+        let config = self.gin_index_configs.get(index_name)?;
+        let value = row.get(config.column_idx)?;
+        let parsed = Self::parse_jsonb_value(value)?;
+        if let Some(paths) = config.compiled_indexed_paths.as_ref() {
+            if let Some(path) = paths.iter().find(|path| path.encoded_path == key) {
+                return Self::jsonb_value_at_compiled_gin_path(&parsed, path).cloned();
+            }
+        }
+        Self::jsonb_value_at_encoded_gin_path(&parsed, key).cloned()
+    }
+
+    fn row_contains_gin_token_pair(
+        &self,
+        index_name: &str,
+        row: &Row,
+        key: &str,
+        value: &str,
+    ) -> bool {
+        let Some(config) = self.gin_index_configs.get(index_name) else {
+            return false;
+        };
+        let Some(row_value) = row.get(config.column_idx) else {
+            return false;
+        };
+        let Some(parsed) = Self::parse_jsonb_value(row_value) else {
+            return false;
+        };
+
+        let mut current_path = String::new();
+        let mut matched = false;
+        Self::visit_jsonb_gin_pairs(
+            &parsed,
+            &mut current_path,
+            config.indexed_paths.as_deref(),
+            &mut |candidate_key, candidate_value| {
+                if candidate_key == key && candidate_value == value {
+                    matched = true;
+                    false
+                } else {
+                    true
+                }
+            },
+        );
+        matched
+    }
+
+    fn jsonb_value_at_encoded_gin_path<'a>(
+        value: &'a ParsedJsonbValue,
+        path: &str,
+    ) -> Option<&'a ParsedJsonbValue> {
+        let segments = decode_gin_path_segments(path);
+        let mut current = value;
+        for segment in segments {
+            current = match current {
+                ParsedJsonbValue::Object(object) => object.get(&segment)?,
+                ParsedJsonbValue::Array(items) => {
+                    let index = segment.parse::<usize>().ok()?;
+                    items.get(index)?
+                }
+                ParsedJsonbValue::Null
+                | ParsedJsonbValue::Bool(_)
+                | ParsedJsonbValue::Number(_)
+                | ParsedJsonbValue::String(_) => return None,
+            };
+        }
+        Some(current)
+    }
+
+    fn jsonb_value_at_compiled_gin_path<'a>(
+        value: &'a ParsedJsonbValue,
+        path: &CompiledGinPath,
+    ) -> Option<&'a ParsedJsonbValue> {
+        let mut current = value;
+        for segment in &path.segments {
+            current = match current {
+                ParsedJsonbValue::Object(object) => object.get(&segment.key)?,
+                ParsedJsonbValue::Array(items) => items.get(segment.array_index?)?,
+                ParsedJsonbValue::Null
+                | ParsedJsonbValue::Bool(_)
+                | ParsedJsonbValue::Number(_)
+                | ParsedJsonbValue::String(_) => return None,
+            };
+        }
+        Some(current)
+    }
+
+    fn visit_jsonb_gin_pairs<F>(
+        value: &ParsedJsonbValue,
+        current_path: &mut String,
+        indexed_paths: Option<&[String]>,
+        visitor: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&str, &str) -> bool,
+    {
+        match value {
+            ParsedJsonbValue::Object(object) => {
+                for (key, child) in object.iter() {
+                    let saved_len = current_path.len();
+                    Self::append_gin_path_segment(current_path, key);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        if let Some(value_str) = Self::jsonb_scalar_to_index_value(child) {
+                            if !visitor(current_path, value_str.as_str()) {
+                                return false;
+                            }
+                        }
+                        for (token_key, gram) in
+                            contains_trigram_pairs(current_path, &child.stringify_for_contains())
+                        {
+                            if !visitor(token_key.as_str(), gram.as_str()) {
+                                return false;
+                            }
+                        }
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path)
+                        && !Self::visit_jsonb_gin_pairs(child, current_path, indexed_paths, visitor)
+                    {
+                        return false;
+                    }
+                    current_path.truncate(saved_len);
+                }
+                true
+            }
+            ParsedJsonbValue::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    let saved_len = current_path.len();
+                    let segment = index.to_string();
+                    Self::append_gin_path_segment(current_path, &segment);
+                    if Self::should_index_gin_path(indexed_paths, current_path) {
+                        if let Some(value_str) = Self::jsonb_scalar_to_index_value(child) {
+                            if !visitor(current_path, value_str.as_str()) {
+                                return false;
+                            }
+                        }
+                        for (token_key, gram) in
+                            contains_trigram_pairs(current_path, &child.stringify_for_contains())
+                        {
+                            if !visitor(token_key.as_str(), gram.as_str()) {
+                                return false;
+                            }
+                        }
+                    }
+                    if Self::should_descend_gin_path(indexed_paths, current_path)
+                        && !Self::visit_jsonb_gin_pairs(child, current_path, indexed_paths, visitor)
+                    {
+                        return false;
+                    }
+                    current_path.truncate(saved_len);
+                }
+                true
+            }
+            ParsedJsonbValue::Null
+            | ParsedJsonbValue::Bool(_)
+            | ParsedJsonbValue::Number(_)
+            | ParsedJsonbValue::String(_) => true,
+        }
+    }
+}
+
+fn decode_gin_path_segments(path: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = path.chars();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let Some(escaped) = chars.next() else {
+                    current.push('\\');
+                    break;
+                };
+                match escaped {
+                    '0' if current.is_empty() => {}
+                    other => current.push(other),
+                }
+            }
+            '.' => {
+                segments.push(current);
+                current = String::new();
+            }
+            other => current.push(other),
+        }
+    }
+
+    segments.push(current);
+    segments
 }
 
 fn parse_json_text(s: &str) -> Option<ParsedJsonbValue> {
@@ -1761,7 +4673,11 @@ fn parse_json_text(s: &str) -> Option<ParsedJsonbValue> {
 }
 
 fn unescape_json(s: &str) -> String {
-    let mut result = String::new();
+    if !s.as_bytes().contains(&b'\\') {
+        return s.into();
+    }
+
+    let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -1783,6 +4699,55 @@ fn unescape_json(s: &str) -> String {
         }
     }
     result
+}
+
+fn is_fast_json_integer_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+
+    let digits = if bytes[0] == b'-' { &bytes[1..] } else { bytes };
+
+    if digits.is_empty() {
+        return false;
+    }
+
+    if digits.len() > 1 && digits[0] == b'0' {
+        return false;
+    }
+
+    digits.iter().all(|byte| byte.is_ascii_digit())
+}
+
+fn escape_json_string_fragment(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => {
+                escaped.push('\\');
+                escaped.push('"');
+            }
+            '\\' => {
+                escaped.push('\\');
+                escaped.push('\\');
+            }
+            '\n' => {
+                escaped.push('\\');
+                escaped.push('n');
+            }
+            '\r' => {
+                escaped.push('\\');
+                escaped.push('r');
+            }
+            '\t' => {
+                escaped.push('\\');
+                escaped.push('t');
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn parse_json_object(s: &str) -> Option<ParsedJsonbValue> {
@@ -2004,6 +4969,110 @@ mod tests {
     }
 
     #[test]
+    fn test_row_store_bulk_load_builds_scan_and_secondary_indexes() {
+        let mut store = RowStore::new(test_schema_with_index());
+        let rows = vec![
+            Row::new(10, vec![Value::Int64(1), Value::Int64(100)]),
+            Row::new(11, vec![Value::Int64(2), Value::Int64(200)]),
+            Row::new(12, vec![Value::Int64(3), Value::Int64(100)]),
+        ];
+
+        let loaded = store.bulk_load(rows).unwrap();
+        assert_eq!(loaded, 3);
+        assert_eq!(store.len(), 3);
+
+        let scan_ids: Vec<_> = store.scan().map(|row| row.id()).collect();
+        assert_eq!(scan_ids, vec![10, 11, 12]);
+
+        let pk_rows = store.get_by_pk(&Value::Int64(2));
+        assert_eq!(pk_rows.len(), 1);
+        assert_eq!(pk_rows[0].id(), 11);
+
+        let indexed = store.index_scan("idx_value", Some(&KeyRange::only(Value::Int64(100))));
+        assert_eq!(
+            indexed.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![10, 12]
+        );
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_rejects_duplicate_keys_without_leaking_state() {
+        let mut store = RowStore::new(test_schema());
+        let rows = vec![
+            Row::new(10, vec![Value::Int64(1), Value::String("Alice".into())]),
+            Row::new(11, vec![Value::Int64(1), Value::String("Bob".into())]),
+        ];
+
+        assert!(store.bulk_load(rows).is_err());
+        assert!(store.is_empty());
+        assert!(store.scan().next().is_none());
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_rejects_unsorted_row_ids_without_leaking_state() {
+        let mut store = RowStore::new(test_schema());
+        let rows = vec![
+            Row::new(11, vec![Value::Int64(1), Value::String("Alice".into())]),
+            Row::new(10, vec![Value::Int64(2), Value::String("Bob".into())]),
+        ];
+
+        assert!(store.bulk_load(rows).is_err());
+        assert!(store.is_empty());
+        assert!(store.scan().next().is_none());
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_rejects_duplicate_row_ids_without_leaking_state() {
+        let mut store = RowStore::new(test_schema());
+        let rows = vec![
+            Row::new(10, vec![Value::Int64(1), Value::String("Alice".into())]),
+            Row::new(10, vec![Value::Int64(2), Value::String("Bob".into())]),
+        ];
+
+        assert!(store.bulk_load(rows).is_err());
+        assert!(store.is_empty());
+        assert!(store.scan().next().is_none());
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_builds_hash_secondary_index() {
+        let mut store = RowStore::new(test_schema_with_hash_index());
+        let rows = vec![
+            Row::new(10, vec![Value::Int64(1), Value::Int64(100)]),
+            Row::new(11, vec![Value::Int64(2), Value::Int64(200)]),
+            Row::new(12, vec![Value::Int64(3), Value::Int64(100)]),
+        ];
+
+        let loaded = store.bulk_load(rows).unwrap();
+        assert_eq!(loaded, 3);
+
+        let indexed = store.index_scan("idx_value_hash", Some(&KeyRange::only(Value::Int64(100))));
+        assert_eq!(
+            indexed.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![10, 12]
+        );
+    }
+
+    #[test]
+    fn test_row_store_bulk_load_rejects_unique_secondary_duplicates_without_leaking_state() {
+        let mut store = RowStore::new(test_schema_with_unique_index());
+        let rows = vec![
+            Row::new(
+                10,
+                vec![Value::Int64(1), Value::String("alice@example.com".into())],
+            ),
+            Row::new(
+                11,
+                vec![Value::Int64(2), Value::String("alice@example.com".into())],
+            ),
+        ];
+
+        assert!(store.bulk_load(rows).is_err());
+        assert!(store.is_empty());
+        assert!(store.scan().next().is_none());
+    }
+
+    #[test]
     fn test_row_store_scan() {
         let mut store = RowStore::new(test_schema());
         store
@@ -2103,6 +5172,37 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id(), 2);
         assert_eq!(results[1].id(), 3);
+    }
+
+    #[test]
+    fn test_restricted_index_scan_subset_driven_reverse_preserves_subset_order() {
+        let mut store = RowStore::new(test_schema_with_index());
+        store
+            .insert(Row::new(1, vec![Value::Int64(1), Value::Int64(100)]))
+            .unwrap();
+        store
+            .insert(Row::new(2, vec![Value::Int64(2), Value::Int64(200)]))
+            .unwrap();
+        store
+            .insert(Row::new(3, vec![Value::Int64(3), Value::Int64(300)]))
+            .unwrap();
+
+        let mut row_ids = Vec::new();
+        store.visit_index_scan_with_options_restricted(
+            "idx_value",
+            None,
+            None,
+            0,
+            true,
+            &[1, 3],
+            true,
+            |row| {
+                row_ids.push(row.id());
+                true
+            },
+        );
+
+        assert_eq!(row_ids, vec![3, 1]);
     }
 
     #[test]
@@ -2393,6 +5493,41 @@ mod tests {
             vec![4, 3],
             "Reverse composite range scans should still honor LIMIT/OFFSET in tuple order",
         );
+    }
+
+    #[test]
+    fn test_composite_secondary_index_prefix_scan_limit_offset() {
+        let mut store = RowStore::new(test_schema_with_composite_index());
+
+        for (id, a, b) in [
+            (1_u64, 1_i64, 1_i64),
+            (2, 1, 2),
+            (3, 1, 10),
+            (4, 2, 1),
+            (5, 2, 5),
+        ] {
+            store
+                .insert(Row::new(
+                    id,
+                    vec![Value::Int64(id as i64), Value::Int64(a), Value::Int64(b)],
+                ))
+                .unwrap();
+        }
+
+        let prefix = alloc::vec![Value::Int64(1)];
+        let forward_ids: Vec<RowId> = store
+            .index_scan_composite_prefix_with_options("idx_a_b", &prefix, Some(2), 1, false)
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        let reverse_ids: Vec<RowId> = store
+            .index_scan_composite_prefix_with_options("idx_a_b", &prefix, Some(2), 0, true)
+            .iter()
+            .map(|row| row.id())
+            .collect();
+
+        assert_eq!(forward_ids, vec![2, 3]);
+        assert_eq!(reverse_ids, vec![3, 2]);
     }
 
     #[test]
@@ -2807,6 +5942,40 @@ mod tests {
             .unwrap()
     }
 
+    fn test_schema_with_path_gin_index() -> Table {
+        TableBuilder::new("test_jsonb")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("data", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_jsonb_index("idx_data_gin", "data", &["address.city", "status"])
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn test_schema_with_extended_path_gin_index() -> Table {
+        TableBuilder::new("test_jsonb")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("data", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_jsonb_index(
+                "idx_data_gin",
+                "data",
+                &["address.city", "status", "tags.1", "history.0.state"],
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
     fn make_jsonb(json_str: &str) -> Value {
         Value::Jsonb(cynos_core::JsonbValue(json_str.as_bytes().to_vec()))
     }
@@ -2858,6 +6027,135 @@ mod tests {
     }
 
     #[test]
+    fn test_gin_index_bulk_load_and_query() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+        let rows = vec![
+            Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"name":"Alice","status":"active"}"#),
+                ],
+            ),
+            Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    make_jsonb(r#"{"name":"Bob","status":"inactive"}"#),
+                ],
+            ),
+        ];
+
+        store.bulk_load(rows).unwrap();
+
+        assert_eq!(store.gin_index_get_by_key("idx_data_gin", "name").len(), 2);
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "status", "active")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn test_gin_index_insert_batch_updates_non_empty_store() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"name":"Alice","status":"active"}"#),
+                ],
+            ))
+            .unwrap();
+
+        store
+            .insert_batch(vec![
+                Row::new(
+                    2,
+                    vec![
+                        Value::Int64(2),
+                        make_jsonb(r#"{"name":"Bob","status":"inactive"}"#),
+                    ],
+                ),
+                Row::new(
+                    3,
+                    vec![
+                        Value::Int64(3),
+                        make_jsonb(r#"{"name":"Cara","status":"active"}"#),
+                    ],
+                ),
+            ])
+            .unwrap();
+
+        assert_eq!(store.gin_index_get_by_key("idx_data_gin", "name").len(), 3);
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "status", "active")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn test_insert_batch_preserves_prefix_rows_and_gin_on_unique_violation() {
+        let schema = TableBuilder::new("test_batch_insert_unique_gin")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("email", DataType::String)
+            .unwrap()
+            .add_column("data", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_email", &["email"], true)
+            .unwrap()
+            .add_index("idx_data_gin", &["data"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut store = RowStore::new(schema);
+        let result = store.insert_batch(vec![
+            Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    Value::String("alice@test.com".into()),
+                    make_jsonb(r#"{"role":"admin"}"#),
+                ],
+            ),
+            Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    Value::String("alice@test.com".into()),
+                    make_jsonb(r#"{"role":"user"}"#),
+                ],
+            ),
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(store.len(), 1);
+        assert!(store.get(1).is_some());
+        assert!(store.get(2).is_none());
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "role", "admin")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn test_gin_index_visit_stops_early() {
         let mut store = RowStore::new(test_schema_with_gin_index());
         for row_id in 1..=5 {
@@ -2879,6 +6177,54 @@ mod tests {
         });
 
         assert_eq!(visited, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_gin_index_query_any_key_values() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"status":"active","type":"user"}"#),
+                ],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    make_jsonb(r#"{"status":"active","type":"admin"}"#),
+                ],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                3,
+                vec![
+                    Value::Int64(3),
+                    make_jsonb(r#"{"status":"inactive","type":"user"}"#),
+                ],
+            ))
+            .unwrap();
+
+        let any_results =
+            store.gin_index_get_by_key_values_any("idx_data_gin", &[("status", "active")]);
+        assert_eq!(
+            any_results.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let any_results = store.gin_index_get_by_key_values_any(
+            "idx_data_gin",
+            &[("status", "active"), ("type", "user")],
+        );
+        assert_eq!(
+            any_results.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -2919,6 +6265,316 @@ mod tests {
             1,
             "GIN index should expose indexed array element postings",
         );
+    }
+
+    #[test]
+    fn test_gin_index_respects_configured_paths() {
+        let mut store = RowStore::new(test_schema_with_path_gin_index());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(
+                        r#"{"name":"Alice","status":"active","address":{"city":"Beijing","zip":"100000"},"tags":["vip","premium"]}"#,
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "address.city", "Beijing")
+                .len(),
+            1,
+            "configured nested path should be indexed",
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "status", "active")
+                .len(),
+            1,
+            "configured top-level path should be indexed",
+        );
+        assert_eq!(
+            store.gin_index_get_by_key("idx_data_gin", "name").len(),
+            0,
+            "unconfigured sibling path should not be indexed",
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "tags.1", "premium")
+                .len(),
+            0,
+            "unconfigured array path should not be indexed",
+        );
+    }
+
+    #[test]
+    fn test_path_directed_extractor_matches_nested_object_and_array_values() {
+        let value = make_jsonb(
+            r#"{"name":"Alice","status":"active","address":{"city":"Beijing","zip":"100000"},"tags":["vip","premium"],"history":[{"state":"new"},{"state":"done"}]}"#,
+        );
+        let paths = vec![
+            CompiledGinPath::new("address.city".into()),
+            CompiledGinPath::new("status".into()),
+            CompiledGinPath::new("tags.1".into()),
+            CompiledGinPath::new("history.0.state".into()),
+        ];
+        let path_tree = CompiledGinPathTree::new(&paths);
+
+        let extracted = RowStore::extract_selected_jsonb_values_from_text(
+            &value,
+            &paths,
+            Some(&path_tree),
+            None,
+        )
+        .expect("text extractor should succeed");
+
+        let mut extracted_values = BTreeMap::new();
+        for (path_index, selected) in extracted {
+            extracted_values.insert(paths[path_index].encoded_path.clone(), selected);
+        }
+
+        assert_eq!(
+            extracted_values.get("address.city"),
+            Some(&ParsedJsonbValue::String("Beijing".into()))
+        );
+        assert_eq!(
+            extracted_values.get("status"),
+            Some(&ParsedJsonbValue::String("active".into()))
+        );
+        assert_eq!(
+            extracted_values.get("tags.1"),
+            Some(&ParsedJsonbValue::String("premium".into()))
+        );
+        assert_eq!(
+            extracted_values.get("history.0.state"),
+            Some(&ParsedJsonbValue::String("new".into()))
+        );
+    }
+
+    #[test]
+    fn test_path_directed_extractor_matches_escaped_object_key() {
+        let value = make_jsonb(r#"{"st\"atus":"active"}"#);
+        let paths = vec![CompiledGinPath::new("st\"atus".into())];
+        let path_tree = CompiledGinPathTree::new(&paths);
+
+        let extracted = RowStore::extract_selected_jsonb_values_from_text(
+            &value,
+            &paths,
+            Some(&path_tree),
+            None,
+        )
+        .expect("text extractor should succeed");
+
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(
+            extracted[0].1,
+            ParsedJsonbValue::String("active".into()),
+            "escaped JSON key should still match compiled path",
+        );
+    }
+
+    #[test]
+    fn test_path_directed_scalar_fast_path_preserves_scalar_index_values() {
+        let schema = TableBuilder::new("test_jsonb")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("data", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_jsonb_index("idx_data_gin", "data", &["score", "flag", "unset", "label"])
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut store = RowStore::new(schema);
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"score":1.0,"flag":true,"unset":null,"label":"hi\nthere"}"#),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "score", "1")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1],
+            "numeric scalar fast path should preserve f64 formatting semantics",
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "flag", "true")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1],
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "unset", "null")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1],
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "label", "hi\nthere")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1],
+            "string scalar fast path should still unescape JSON string values",
+        );
+    }
+
+    #[test]
+    fn test_json_text_scalar_to_index_value_fast_paths_preserve_semantics() {
+        assert_eq!(
+            RowStore::json_text_scalar_to_index_value("\"enterprise\""),
+            Some("enterprise".into()),
+            "plain strings should not require the slower unescape path",
+        );
+        assert_eq!(
+            RowStore::json_text_scalar_to_index_value("\"hi\\nthere\""),
+            Some("hi\nthere".into()),
+            "escaped strings must still decode correctly",
+        );
+        assert_eq!(
+            RowStore::json_text_scalar_to_index_value("42"),
+            Some("42".into()),
+            "integer literals should preserve their canonical JSON text form",
+        );
+        assert_eq!(
+            RowStore::json_text_scalar_to_index_value("1.0"),
+            Some("1".into()),
+            "floating-point literals must keep the previous f64 formatting semantics",
+        );
+    }
+
+    #[test]
+    fn test_json_text_scalar_to_index_value_ref_borrows_common_literals() {
+        match RowStore::json_text_scalar_to_index_value_ref("\"enterprise\"") {
+            Some(JsonScalarIndexValue::Borrowed("enterprise")) => {}
+            other => panic!("expected borrowed plain string, got {other:?}"),
+        }
+
+        match RowStore::json_text_scalar_to_index_value_ref("42") {
+            Some(JsonScalarIndexValue::Borrowed("42")) => {}
+            other => panic!("expected borrowed integer literal, got {other:?}"),
+        }
+
+        match RowStore::json_text_scalar_to_index_value_ref("\"hi\\nthere\"") {
+            Some(JsonScalarIndexValue::Owned(value)) => assert_eq!(value, "hi\nthere"),
+            other => panic!("expected owned escaped string, got {other:?}"),
+        }
+
+        match RowStore::json_text_scalar_to_index_value_ref("1.0") {
+            Some(JsonScalarIndexValue::Owned(value)) => assert_eq!(value, "1"),
+            other => panic!("expected owned floating literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_gin_index_configured_paths_update_and_delete_remain_correct() {
+        let mut store = RowStore::new(test_schema_with_extended_path_gin_index());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(
+                        r#"{"status":"active","address":{"city":"Beijing"},"tags":["vip","premium"],"history":[{"state":"new"}]}"#,
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "address.city", "Beijing")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "tags.1", "premium")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        store
+            .update(
+                1,
+                Row::new(
+                    1,
+                    vec![
+                        Value::Int64(1),
+                        make_jsonb(
+                            r#"{"status":"inactive","address":{"city":"Shanghai"},"tags":["desk","office"],"history":[{"state":"done"}]}"#,
+                        ),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        assert!(store
+            .gin_index_get_by_key_value("idx_data_gin", "address.city", "Beijing")
+            .is_empty());
+        assert!(store
+            .gin_index_get_by_key_value("idx_data_gin", "tags.1", "premium")
+            .is_empty());
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "address.city", "Shanghai")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "status", "inactive")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            store
+                .gin_index_get_by_key_value("idx_data_gin", "history.0.state", "done")
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        store.delete(1).unwrap();
+        assert!(store
+            .gin_index_get_by_key_value("idx_data_gin", "address.city", "Shanghai")
+            .is_empty());
+        assert!(store
+            .gin_index_get_by_key_value("idx_data_gin", "status", "inactive")
+            .is_empty());
+        assert!(store
+            .gin_index_get_by_key_value("idx_data_gin", "history.0.state", "done")
+            .is_empty());
     }
 
     #[test]

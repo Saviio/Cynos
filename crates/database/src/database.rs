@@ -6,20 +6,34 @@
 use crate::binary_protocol::SchemaLayoutCache;
 use crate::convert::{gql_response_to_js, js_to_gql_variables};
 use crate::dataflow_compiler::compile_to_dataflow;
-use crate::live_runtime::{LiveDependencySet, LivePlan, LiveRegistry};
+use crate::live_runtime::{
+    collect_trace_bootstrap_source_bindings, LiveDependencySet, LivePlan, LiveRegistry,
+    RowsSnapshotDependencyGraph, RowsSnapshotDirectedJoinEdge, RowsSnapshotLookupPrimitive,
+    RowsSnapshotRootSubsetMetadata, RowsSnapshotRootSubsetPlan, RowsSnapshotRootSubsetVariants,
+};
+#[cfg(feature = "benchmark")]
+use crate::profiling::SnapshotInitProfile;
+use crate::profiling::{
+    DeltaFlushProfile, IvmBridgeProfile, SnapshotFlushProfile, TraceInitProfile,
+};
 use crate::query_builder::{DeleteBuilder, InsertBuilder, SelectBuilder, UpdateBuilder};
 use crate::reactive_bridge::JsGraphqlSubscription;
 use crate::table::{JsTable, JsTableBuilder};
-use crate::transaction::JsTransaction;
+use crate::transaction::{CommitProfile, JsTransaction};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use cynos_core::schema::{IndexType, Table};
 use cynos_core::Row;
+use cynos_gql::bind::{BoundFilter, BoundRootField, BoundRootFieldKind};
 use cynos_gql::{PreparedQuery as GqlPreparedQuery, SchemaCache as GraphqlSchemaCache};
-use cynos_incremental::Delta;
+use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, Delta};
 use cynos_query::plan_cache::PlanCache;
+use cynos_query::planner::PhysicalPlan;
 use cynos_reactive::TableId;
+#[cfg(feature = "benchmark")]
+use cynos_storage::StorageInsertProfile;
 use cynos_storage::TableCache;
 use wasm_bindgen::prelude::*;
 
@@ -41,6 +55,9 @@ pub struct Database {
     plan_cache: Rc<RefCell<PlanCache>>,
     graphql_schema_cache: Rc<RefCell<GraphqlSchemaCache>>,
     schema_epoch: Rc<RefCell<u64>>,
+    last_commit_profile: Rc<RefCell<Option<CommitProfile>>>,
+    #[cfg(feature = "benchmark")]
+    last_insert_profile: Rc<RefCell<Option<StorageInsertProfile>>>,
 }
 
 /// A prepared GraphQL query that reuses the parsed document across executions.
@@ -75,6 +92,9 @@ impl Database {
             plan_cache: Rc::new(RefCell::new(PlanCache::default_size())),
             graphql_schema_cache: Rc::new(RefCell::new(GraphqlSchemaCache::new())),
             schema_epoch: Rc::new(RefCell::new(0)),
+            last_commit_profile: Rc::new(RefCell::new(None)),
+            #[cfg(feature = "benchmark")]
+            last_insert_profile: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -177,6 +197,8 @@ impl Database {
             self.cache.clone(),
             self.query_registry.clone(),
             self.table_id_map.clone(),
+            #[cfg(feature = "benchmark")]
+            self.last_insert_profile.clone(),
             table,
         )
     }
@@ -207,7 +229,81 @@ impl Database {
             self.cache.clone(),
             self.query_registry.clone(),
             self.table_id_map.clone(),
+            self.last_commit_profile.clone(),
         )
+    }
+
+    #[wasm_bindgen(js_name = takeLastCommitProfile)]
+    pub fn take_last_commit_profile(&self) -> JsValue {
+        let Some(profile) = self.last_commit_profile.borrow_mut().take() else {
+            return JsValue::NULL;
+        };
+
+        commit_profile_to_js_value(profile)
+    }
+
+    #[wasm_bindgen(js_name = takeLastDeltaFlushProfile)]
+    pub fn take_last_delta_flush_profile(&self) -> JsValue {
+        let Some(profile) = self.query_registry.borrow().take_last_delta_flush_profile() else {
+            return JsValue::NULL;
+        };
+
+        delta_flush_profile_to_js_value(profile)
+    }
+
+    #[wasm_bindgen(js_name = takeLastIvmBridgeProfile)]
+    pub fn take_last_ivm_bridge_profile(&self) -> JsValue {
+        let Some(profile) = self.query_registry.borrow().take_last_ivm_bridge_profile() else {
+            return JsValue::NULL;
+        };
+
+        ivm_bridge_profile_to_js_value(profile)
+    }
+
+    #[wasm_bindgen(js_name = takeLastTraceInitProfile)]
+    pub fn take_last_trace_init_profile(&self) -> JsValue {
+        let Some(profile) = self.query_registry.borrow().take_last_trace_init_profile() else {
+            return JsValue::NULL;
+        };
+
+        trace_init_profile_to_js_value(profile)
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[wasm_bindgen(js_name = takeLastSnapshotInitProfile)]
+    pub fn take_last_snapshot_init_profile(&self) -> JsValue {
+        let Some(profile) = self
+            .query_registry
+            .borrow()
+            .take_last_snapshot_init_profile()
+        else {
+            return JsValue::NULL;
+        };
+
+        snapshot_init_profile_to_js_value(profile)
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[wasm_bindgen(js_name = takeLastInsertProfile)]
+    pub fn take_last_insert_profile(&self) -> JsValue {
+        let Some(profile) = self.last_insert_profile.borrow_mut().take() else {
+            return JsValue::NULL;
+        };
+
+        storage_insert_profile_to_js_value(profile)
+    }
+
+    #[wasm_bindgen(js_name = takeLastSnapshotFlushProfile)]
+    pub fn take_last_snapshot_flush_profile(&self) -> JsValue {
+        let Some(profile) = self
+            .query_registry
+            .borrow()
+            .take_last_snapshot_flush_profile()
+        else {
+            return JsValue::NULL;
+        };
+
+        snapshot_flush_profile_to_js_value(profile)
     }
 
     /// Clears all data from all tables.
@@ -583,6 +679,822 @@ fn bind_graphql_operation(
     Ok((catalog, bound))
 }
 
+fn commit_profile_to_js_value(profile: CommitProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("storageCommitMs"),
+        &JsValue::from_f64(profile.storage_commit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("registryFlushMs"),
+        &JsValue::from_f64(profile.registry_flush_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalCommitMs"),
+        &JsValue::from_f64(profile.total_commit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("changedTableCount"),
+        &JsValue::from_f64(profile.changed_table_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("changedRowCount"),
+        &JsValue::from_f64(profile.changed_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("deltaRowCount"),
+        &JsValue::from_f64(profile.delta_row_count as f64),
+    )
+    .ok();
+    object.into()
+}
+
+fn delta_flush_profile_to_js_value(profile: DeltaFlushProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("deltaTableCount"),
+        &JsValue::from_f64(profile.delta_table_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("deltaQueryCount"),
+        &JsValue::from_f64(profile.delta_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowsQueryCount"),
+        &JsValue::from_f64(profile.rows_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlQueryCount"),
+        &JsValue::from_f64(profile.graphql_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("deltaRowCount"),
+        &JsValue::from_f64(profile.delta_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("cloneMs"),
+        &JsValue::from_f64(profile.clone_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("queryOnTableChangeMs"),
+        &JsValue::from_f64(profile.query_on_table_change_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceDispatchMs"),
+        &JsValue::from_f64(profile.source_dispatch_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("unaryExecuteMs"),
+        &JsValue::from_f64(profile.unary_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("joinExecuteMs"),
+        &JsValue::from_f64(profile.join_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("aggregateExecuteMs"),
+        &JsValue::from_f64(profile.aggregate_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("resultApplyMs"),
+        &JsValue::from_f64(profile.result_apply_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlViewUpdateMs"),
+        &JsValue::from_f64(profile.graphql_view_update_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlInvalidationMs"),
+        &JsValue::from_f64(profile.graphql_invalidation_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlRenderMs"),
+        &JsValue::from_f64(profile.graphql_render_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlEncodeMs"),
+        &JsValue::from_f64(profile.graphql_encode_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlEmitMs"),
+        &JsValue::from_f64(profile.graphql_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    object.into()
+}
+
+fn trace_init_profile_to_js_value(profile: TraceInitProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compilePlanMs"),
+        &JsValue::from_f64(profile.compile_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compileToDataflowMs"),
+        &JsValue::from_f64(profile.compile_to_dataflow_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compileIvmPlanMs"),
+        &JsValue::from_f64(profile.compile_ivm_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compileTraceProgramMs"),
+        &JsValue::from_f64(profile.compile_trace_program_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialQueryMs"),
+        &JsValue::from_f64(profile.initial_query_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceBootstrapMs"),
+        &JsValue::from_f64(profile.source_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceAccessMs"),
+        &JsValue::from_f64(profile.source_access_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceEmitMs"),
+        &JsValue::from_f64(profile.source_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceVisitMs"),
+        &JsValue::from_f64(profile.source_visit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceHandleWrapMs"),
+        &JsValue::from_f64(profile.source_handle_wrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("bootstrapScanMs"),
+        &JsValue::from_f64(profile.bootstrap_scan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("bootstrapExecuteMs"),
+        &JsValue::from_f64(profile.bootstrap_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("bootstrapRuntimeNodeMs"),
+        &JsValue::from_f64(profile.bootstrap_runtime_node_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("bootstrapSlotMs"),
+        &JsValue::from_f64(profile.bootstrap_slot_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("filterBootstrapMs"),
+        &JsValue::from_f64(profile.filter_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("projectBootstrapMs"),
+        &JsValue::from_f64(profile.project_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("mapBootstrapMs"),
+        &JsValue::from_f64(profile.map_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("joinBuildMs"),
+        &JsValue::from_f64(profile.join_build_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("joinFinalizeMs"),
+        &JsValue::from_f64(profile.join_finalize_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("joinEmitMs"),
+        &JsValue::from_f64(profile.join_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("joinBootstrapMs"),
+        &JsValue::from_f64(profile.join_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("aggregateBootstrapMs"),
+        &JsValue::from_f64(profile.aggregate_bootstrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSinkMs"),
+        &JsValue::from_f64(profile.root_sink_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("visibleStoreInitMs"),
+        &JsValue::from_f64(profile.visible_store_init_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("materializedViewInitMs"),
+        &JsValue::from_f64(profile.materialized_view_init_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceTableCount"),
+        &JsValue::from_f64(profile.source_table_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialRowCount"),
+        &JsValue::from_f64(profile.initial_row_count as f64),
+    )
+    .ok();
+    object.into()
+}
+
+#[cfg(feature = "benchmark")]
+fn snapshot_init_profile_to_js_value(profile: SnapshotInitProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("logicalPlanMs"),
+        &JsValue::from_f64(profile.logical_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("describeOutputMs"),
+        &JsValue::from_f64(profile.describe_output_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("binaryLayoutMs"),
+        &JsValue::from_f64(profile.binary_layout_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshPlanMs"),
+        &JsValue::from_f64(profile.partial_refresh_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("compileMainPlanMs"),
+        &JsValue::from_f64(profile.compile_main_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetPlanMs"),
+        &JsValue::from_f64(profile.root_subset_plan_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialQueryMs"),
+        &JsValue::from_f64(profile.initial_query_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("dependencyBindingsMs"),
+        &JsValue::from_f64(profile.dependency_bindings_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialResultAdaptMs"),
+        &JsValue::from_f64(profile.initial_result_adapt_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("observableInitMs"),
+        &JsValue::from_f64(profile.observable_init_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("initialRowCount"),
+        &JsValue::from_f64(profile.initial_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("visibleRowCount"),
+        &JsValue::from_f64(profile.visible_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshEnabled"),
+        &JsValue::from_bool(profile.partial_refresh_enabled),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetEnabled"),
+        &JsValue::from_bool(profile.root_subset_enabled),
+    )
+    .ok();
+    object.into()
+}
+
+fn snapshot_flush_profile_to_js_value(profile: SnapshotFlushProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("changedTableCount"),
+        &JsValue::from_f64(profile.changed_table_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowsQueryCount"),
+        &JsValue::from_f64(profile.rows_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlQueryCount"),
+        &JsValue::from_f64(profile.graphql_query_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("invalidationMergeMs"),
+        &JsValue::from_f64(profile.invalidation_merge_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowsQueryOnChangeMs"),
+        &JsValue::from_f64(profile.rows_query_on_change_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlQueryOnChangeMs"),
+        &JsValue::from_f64(profile.graphql_query_on_change_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlRootRefreshMs"),
+        &JsValue::from_f64(profile.graphql_root_refresh_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlBatchInvalidationMs"),
+        &JsValue::from_f64(profile.graphql_batch_invalidation_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlRenderMs"),
+        &JsValue::from_f64(profile.graphql_render_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlEncodeMs"),
+        &JsValue::from_f64(profile.graphql_encode_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("graphqlEmitMs"),
+        &JsValue::from_f64(profile.graphql_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("reactivePatchAttemptCount"),
+        &JsValue::from_f64(profile.reactive_patch_attempt_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("reactivePatchHitCount"),
+        &JsValue::from_f64(profile.reactive_patch_hit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("reactivePatchMs"),
+        &JsValue::from_f64(profile.reactive_patch_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshAttemptCount"),
+        &JsValue::from_f64(profile.partial_refresh_attempt_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshHitCount"),
+        &JsValue::from_f64(profile.partial_refresh_hit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshCollectMs"),
+        &JsValue::from_f64(profile.partial_refresh_collect_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshRequeryMs"),
+        &JsValue::from_f64(profile.partial_refresh_requery_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshApplyMs"),
+        &JsValue::from_f64(profile.partial_refresh_apply_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("partialRefreshCompareMs"),
+        &JsValue::from_f64(profile.partial_refresh_compare_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetAttemptCount"),
+        &JsValue::from_f64(profile.root_subset_attempt_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetHitCount"),
+        &JsValue::from_f64(profile.root_subset_hit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetCollectMs"),
+        &JsValue::from_f64(profile.root_subset_collect_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetRequeryMs"),
+        &JsValue::from_f64(profile.root_subset_requery_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetApplyMs"),
+        &JsValue::from_f64(profile.root_subset_apply_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rootSubsetCompareMs"),
+        &JsValue::from_f64(profile.root_subset_compare_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("fullRequeryCount"),
+        &JsValue::from_f64(profile.full_requery_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("fullRequeryMs"),
+        &JsValue::from_f64(profile.full_requery_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("fullRequeryCompareMs"),
+        &JsValue::from_f64(profile.full_requery_compare_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("callbackMs"),
+        &JsValue::from_f64(profile.callback_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    object.into()
+}
+
+fn ivm_bridge_profile_to_js_value(profile: IvmBridgeProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("callbackCount"),
+        &JsValue::from_f64(profile.callback_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("addedRowCount"),
+        &JsValue::from_f64(profile.added_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("removedRowCount"),
+        &JsValue::from_f64(profile.removed_row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("serializeAddedMs"),
+        &JsValue::from_f64(profile.serialize_added_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("serializeRemovedMs"),
+        &JsValue::from_f64(profile.serialize_removed_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("assembleDeltaMs"),
+        &JsValue::from_f64(profile.assemble_delta_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("callbackCallMs"),
+        &JsValue::from_f64(profile.callback_call_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+    object.into()
+}
+
+#[cfg(feature = "benchmark")]
+fn storage_insert_profile_to_js_value(profile: StorageInsertProfile) -> JsValue {
+    let object = js_sys::Object::new();
+    let gin = js_sys::Object::new();
+
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowCount"),
+        &JsValue::from_f64(profile.row_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("secondaryIndexCount"),
+        &JsValue::from_f64(profile.secondary_index_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("ginIndexCount"),
+        &JsValue::from_f64(profile.gin_index_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("validationMs"),
+        &JsValue::from_f64(profile.validation_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowIdIndexMs"),
+        &JsValue::from_f64(profile.row_id_index_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("primaryIndexMs"),
+        &JsValue::from_f64(profile.primary_index_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("secondaryIndexMs"),
+        &JsValue::from_f64(profile.secondary_index_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("ginCollectMs"),
+        &JsValue::from_f64(profile.gin_collect_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("ginFlushMs"),
+        &JsValue::from_f64(profile.gin_flush_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("rowSlotMs"),
+        &JsValue::from_f64(profile.row_slot_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("totalMs"),
+        &JsValue::from_f64(profile.total_ms),
+    )
+    .ok();
+
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("parseJsonMs"),
+        &JsValue::from_f64(profile.gin.parse_json_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("pathLookupMs"),
+        &JsValue::from_f64(profile.gin.path_lookup_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("scalarEmitMs"),
+        &JsValue::from_f64(profile.gin.scalar_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("containsStringifyMs"),
+        &JsValue::from_f64(profile.gin.contains_stringify_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("containsTrigramEmitMs"),
+        &JsValue::from_f64(profile.gin.contains_trigram_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("parseCallCount"),
+        &JsValue::from_f64(profile.gin.parse_call_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("selectedPathEvalCount"),
+        &JsValue::from_f64(profile.gin.selected_path_eval_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("selectedPathHitCount"),
+        &JsValue::from_f64(profile.gin.selected_path_hit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("pathKeyEmitCount"),
+        &JsValue::from_f64(profile.gin.path_key_emit_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("scalarValueCount"),
+        &JsValue::from_f64(profile.gin.scalar_value_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("containsValueCount"),
+        &JsValue::from_f64(profile.gin.contains_value_count as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &gin,
+        &JsValue::from_str("containsTrigramCount"),
+        &JsValue::from_f64(profile.gin.contains_trigram_count as f64),
+    )
+    .ok();
+
+    js_sys::Reflect::set(&object, &JsValue::from_str("gin"), &gin).ok();
+    object.into()
+}
+
 fn execute_graphql_bound_operation(
     cache: Rc<RefCell<TableCache>>,
     query_registry: Rc<RefCell<LiveRegistry>>,
@@ -695,8 +1607,15 @@ fn compile_graphql_live_plan(
     let compiled_plan = crate::query_engine::compile_cached_plan(
         &cache_borrow,
         &root_plan.table_name,
-        root_plan.logical_plan,
+        root_plan.logical_plan.clone(),
     );
+    let root_subset_refresh = build_graphql_root_subset_plan(
+        &cache_borrow,
+        &table_id_map.borrow(),
+        &field,
+        &root_plan,
+        &compiled_plan,
+    )?;
     let initial_output = crate::query_engine::execute_compiled_physical_plan_with_summary(
         &cache_borrow,
         &compiled_plan,
@@ -711,6 +1630,7 @@ fn compile_graphql_live_plan(
         catalog,
         field,
         dependency_table_bindings,
+        root_subset_refresh,
     ))
 }
 
@@ -761,6 +1681,336 @@ fn build_graphql_dependency_set(
     ))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GraphqlSnapshotJoinEdge {
+    left_table: String,
+    left_column: String,
+    right_table: String,
+    right_column: String,
+}
+
+fn graphql_snapshot_compiled_lookup_primitive(
+    schema: &Table,
+    column_name: &str,
+) -> RowsSnapshotLookupPrimitive {
+    if let Some(primary_key) = schema.primary_key() {
+        if primary_key.columns().len() == 1
+            && primary_key
+                .columns()
+                .first()
+                .map(|column| column.name.as_str())
+                == Some(column_name)
+        {
+            return RowsSnapshotLookupPrimitive::PrimaryKey;
+        }
+    }
+
+    if let Some(index_name) = schema
+        .indices()
+        .iter()
+        .find(|index| {
+            index.get_index_type() != IndexType::Gin
+                && index.columns().len() == 1
+                && index.columns().first().map(|column| column.name.as_str()) == Some(column_name)
+        })
+        .map(|index| index.name().to_string())
+    {
+        return RowsSnapshotLookupPrimitive::SingleColumnIndex { index_name };
+    }
+
+    RowsSnapshotLookupPrimitive::ScanFallback
+}
+
+fn graphql_snapshot_plan_allows_root_subset_refresh(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::TableScan { .. }
+        | PhysicalPlan::IndexScan { .. }
+        | PhysicalPlan::IndexGet { .. }
+        | PhysicalPlan::IndexInGet { .. }
+        | PhysicalPlan::GinIndexScan { .. }
+        | PhysicalPlan::GinIndexScanMulti { .. }
+        | PhysicalPlan::Empty => true,
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::NoOp { input } => graphql_snapshot_plan_allows_root_subset_refresh(input),
+        PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::SortMergeJoin { left, right, .. }
+        | PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+            graphql_snapshot_plan_allows_root_subset_refresh(left)
+                && graphql_snapshot_plan_allows_root_subset_refresh(right)
+        }
+        PhysicalPlan::IndexNestedLoopJoin { outer, .. } => {
+            graphql_snapshot_plan_allows_root_subset_refresh(outer)
+        }
+        PhysicalPlan::HashAggregate { .. }
+        | PhysicalPlan::Sort { .. }
+        | PhysicalPlan::TopN { .. }
+        | PhysicalPlan::Limit { .. }
+        | PhysicalPlan::CrossProduct { .. }
+        | PhysicalPlan::Union { .. } => false,
+    }
+}
+
+fn graphql_snapshot_plan_supports_root_subset_refresh(
+    plan: &PhysicalPlan,
+    root_table: &str,
+) -> bool {
+    plan.collect_tables()
+        .iter()
+        .any(|table| table == root_table)
+        && graphql_snapshot_plan_allows_root_subset_refresh(plan)
+}
+
+fn collect_graphql_filter_join_edges(
+    filter: &BoundFilter,
+    edges: &mut hashbrown::HashSet<GraphqlSnapshotJoinEdge>,
+) {
+    match filter {
+        BoundFilter::And(filters) | BoundFilter::Or(filters) => {
+            for child in filters {
+                collect_graphql_filter_join_edges(child, edges);
+            }
+        }
+        BoundFilter::Column(_) => {}
+        BoundFilter::Relation(predicate) => {
+            edges.insert(GraphqlSnapshotJoinEdge {
+                left_table: predicate.relation.child_table.clone(),
+                left_column: predicate.relation.child_column.clone(),
+                right_table: predicate.relation.parent_table.clone(),
+                right_column: predicate.relation.parent_column.clone(),
+            });
+            collect_graphql_filter_join_edges(predicate.filter.as_ref(), edges);
+        }
+    }
+}
+
+fn compile_graphql_snapshot_dependency_graph(
+    cache: &TableCache,
+    table_id_map: &hashbrown::HashMap<String, TableId>,
+    root_table: &str,
+    join_edges: &[GraphqlSnapshotJoinEdge],
+) -> Result<RowsSnapshotDependencyGraph, JsValue> {
+    let root_table_id = table_id_map
+        .get(root_table)
+        .copied()
+        .ok_or_else(|| JsValue::from_str(&alloc::format!("Table ID not found: {}", root_table)))?;
+    let mut table_names = hashbrown::HashMap::new();
+    table_names.insert(root_table_id, root_table.to_string());
+
+    let mut undirected_edges_by_source =
+        hashbrown::HashMap::<TableId, Vec<RowsSnapshotDirectedJoinEdge>>::new();
+    for edge in join_edges {
+        let left_table_id = table_id_map.get(&edge.left_table).copied().ok_or_else(|| {
+            JsValue::from_str(&alloc::format!("Table ID not found: {}", edge.left_table))
+        })?;
+        let right_table_id = table_id_map
+            .get(&edge.right_table)
+            .copied()
+            .ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Table ID not found: {}", edge.right_table))
+            })?;
+
+        let left_store = cache.get_table(&edge.left_table).ok_or_else(|| {
+            JsValue::from_str(&alloc::format!("Table not found: {}", edge.left_table))
+        })?;
+        let right_store = cache.get_table(&edge.right_table).ok_or_else(|| {
+            JsValue::from_str(&alloc::format!("Table not found: {}", edge.right_table))
+        })?;
+
+        let left_column_index = left_store
+            .schema()
+            .get_column_index(&edge.left_column)
+            .ok_or_else(|| {
+                JsValue::from_str(&alloc::format!(
+                    "Column not found: {}.{}",
+                    edge.left_table,
+                    edge.left_column
+                ))
+            })?;
+        let right_column_index = right_store
+            .schema()
+            .get_column_index(&edge.right_column)
+            .ok_or_else(|| {
+                JsValue::from_str(&alloc::format!(
+                    "Column not found: {}.{}",
+                    edge.right_table,
+                    edge.right_column
+                ))
+            })?;
+
+        table_names.insert(left_table_id, edge.left_table.clone());
+        table_names.insert(right_table_id, edge.right_table.clone());
+
+        undirected_edges_by_source
+            .entry(left_table_id)
+            .or_insert_with(Vec::new)
+            .push(RowsSnapshotDirectedJoinEdge {
+                source_column_index: left_column_index,
+                target_table_id: right_table_id,
+                target_table: edge.right_table.clone(),
+                target_column_index: right_column_index,
+                lookup: graphql_snapshot_compiled_lookup_primitive(
+                    right_store.schema(),
+                    &edge.right_column,
+                ),
+            });
+        undirected_edges_by_source
+            .entry(right_table_id)
+            .or_insert_with(Vec::new)
+            .push(RowsSnapshotDirectedJoinEdge {
+                source_column_index: right_column_index,
+                target_table_id: left_table_id,
+                target_table: edge.left_table.clone(),
+                target_column_index: left_column_index,
+                lookup: graphql_snapshot_compiled_lookup_primitive(
+                    left_store.schema(),
+                    &edge.left_column,
+                ),
+            });
+    }
+
+    let mut distance_to_root = hashbrown::HashMap::<TableId, usize>::new();
+    let mut queue = alloc::collections::VecDeque::new();
+    distance_to_root.insert(root_table_id, 0);
+    queue.push_back(root_table_id);
+
+    while let Some(table_id) = queue.pop_front() {
+        let next_distance = distance_to_root.get(&table_id).copied().unwrap_or(0) + 1;
+        for edge in undirected_edges_by_source
+            .get(&table_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            if distance_to_root.contains_key(&edge.target_table_id) {
+                continue;
+            }
+            distance_to_root.insert(edge.target_table_id, next_distance);
+            queue.push_back(edge.target_table_id);
+        }
+    }
+
+    if distance_to_root.len() != table_names.len() {
+        return Err(JsValue::from_str(
+            "graphql snapshot dependency graph is disconnected from the root table",
+        ));
+    }
+
+    let mut edges_by_source =
+        hashbrown::HashMap::<TableId, Vec<RowsSnapshotDirectedJoinEdge>>::new();
+    for (source_table_id, candidate_edges) in undirected_edges_by_source {
+        let Some(source_distance) = distance_to_root.get(&source_table_id).copied() else {
+            continue;
+        };
+        let directed_edges: Vec<_> = candidate_edges
+            .into_iter()
+            .filter(|edge| {
+                distance_to_root
+                    .get(&edge.target_table_id)
+                    .map(|target_distance| *target_distance < source_distance)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !directed_edges.is_empty() {
+            edges_by_source.insert(source_table_id, directed_edges);
+        }
+    }
+
+    Ok(RowsSnapshotDependencyGraph {
+        root_table_id,
+        table_names,
+        edges_by_source,
+    })
+}
+
+fn build_graphql_root_subset_plan(
+    cache: &TableCache,
+    table_id_map: &hashbrown::HashMap<String, TableId>,
+    field: &BoundRootField,
+    root_plan: &cynos_gql::RootFieldPlan,
+    compiled_plan: &crate::query_engine::CompiledPhysicalPlan,
+) -> Result<Option<RowsSnapshotRootSubsetPlan>, JsValue> {
+    let (root_table, query) = match &field.kind {
+        BoundRootFieldKind::Collection {
+            table_name, query, ..
+        } => (table_name.clone(), query),
+        _ => return Ok(None),
+    };
+
+    if !query.order_by.is_empty() || query.limit.is_some() || query.offset > 0 {
+        return Ok(None);
+    }
+
+    if !graphql_snapshot_plan_supports_root_subset_refresh(
+        compiled_plan.physical_plan(),
+        &root_table,
+    ) {
+        return Ok(None);
+    }
+
+    let root_store = cache
+        .get_table(&root_table)
+        .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", root_table)))?;
+    let root_pk = match root_store.schema().primary_key() {
+        Some(pk) if !pk.columns().is_empty() => pk,
+        _ => return Ok(None),
+    };
+
+    let mut root_pk_store_indices = Vec::with_capacity(root_pk.columns().len());
+    for pk_column in root_pk.columns() {
+        let Some(store_index) = root_store.schema().get_column_index(&pk_column.name) else {
+            return Ok(None);
+        };
+        root_pk_store_indices.push(store_index);
+    }
+    let root_pk_output_indices = root_pk_store_indices.clone();
+
+    let mut edge_set = hashbrown::HashSet::new();
+    if let Some(filter) = &query.filter {
+        collect_graphql_filter_join_edges(filter, &mut edge_set);
+    }
+    let mut join_edges: Vec<_> = edge_set.into_iter().collect();
+    join_edges.sort_unstable_by(|left, right| {
+        left.left_table
+            .cmp(&right.left_table)
+            .then_with(|| left.left_column.cmp(&right.left_column))
+            .then_with(|| left.right_table.cmp(&right.right_table))
+            .then_with(|| left.right_column.cmp(&right.right_column))
+    });
+
+    let dependency_graph =
+        compile_graphql_snapshot_dependency_graph(cache, table_id_map, &root_table, &join_edges)?;
+
+    let subset_compiled_plan_small = crate::query_engine::compile_cached_plan_with_profile(
+        cache,
+        &root_table,
+        root_plan.logical_plan.clone(),
+        crate::query_engine::CompilePlanProfile::RootSubset(
+            crate::query_engine::RootSubsetPlanningProfile::small(),
+        ),
+    );
+    let subset_compiled_plan_large = crate::query_engine::compile_cached_plan_with_profile(
+        cache,
+        &root_table,
+        root_plan.logical_plan.clone(),
+        crate::query_engine::CompilePlanProfile::RootSubset(
+            crate::query_engine::RootSubsetPlanningProfile::large(),
+        ),
+    );
+
+    Ok(Some(RowsSnapshotRootSubsetPlan {
+        metadata: RowsSnapshotRootSubsetMetadata {
+            root_table,
+            root_pk_store_indices,
+            root_pk_output_indices,
+            dependency_graph,
+        },
+        compiled_plans: RowsSnapshotRootSubsetVariants {
+            small: subset_compiled_plan_small,
+            large: subset_compiled_plan_large,
+        },
+    }))
+}
+
 fn build_graphql_delta_live_plan(
     cache: &TableCache,
     table_id_map: &hashbrown::HashMap<String, TableId>,
@@ -785,17 +2035,26 @@ fn build_graphql_delta_live_plan(
     else {
         return Ok(None);
     };
+    let compiled_ivm_plan = CompiledIvmPlan::compile(&compile_result.dataflow);
+    let compiled_bootstrap_plan = CompiledBootstrapPlan::compile(&compile_result.dataflow);
 
     let initial_rows =
         crate::query_engine::execute_physical_plan(cache, &physical_plan).map_err(|error| {
             JsValue::from_str(&alloc::format!("Query execution error: {:?}", error))
         })?;
-    let initial_owned = initial_rows.iter().map(|row| (**row).clone()).collect();
+    let source_bindings = collect_trace_bootstrap_source_bindings(
+        &physical_plan,
+        &compile_result.table_ids,
+        &table_schemas,
+    );
 
     Ok(Some(LivePlan::graphql_delta(
         dependency_set,
         compile_result.dataflow,
-        initial_owned,
+        compiled_ivm_plan,
+        compiled_bootstrap_plan,
+        initial_rows,
+        source_bindings,
         catalog,
         field,
         dependency_table_bindings,
@@ -923,6 +2182,117 @@ mod tests {
         db
     }
 
+    fn setup_graphql_users_profiles_db() -> Database {
+        let db = setup_graphql_users_db();
+        let profiles = db
+            .create_table("profiles")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column(
+                "user_id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_unique(true)),
+            )
+            .column("bio", JsDataType::String, None)
+            .foreign_key(
+                "fk_profiles_user",
+                "user_id",
+                "users",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("user")
+                        .set_reverse_field_name("profile"),
+                ),
+            );
+        db.register_table(&profiles).unwrap();
+        db
+    }
+
+    fn setup_graphql_issue_filter_db() -> Database {
+        let db = Database::new("graphql_issue_filter");
+
+        let projects = db
+            .create_table("projects")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("healthScore", JsDataType::Int32, None);
+        db.register_table(&projects).unwrap();
+
+        let project_counters = db
+            .create_table("projectCounters")
+            .column(
+                "projectId",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("openIssueCount", JsDataType::Int32, None)
+            .foreign_key(
+                "fk_project_counters_project",
+                "projectId",
+                "projects",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("project")
+                        .set_reverse_field_name("counter"),
+                ),
+            );
+        db.register_table(&project_counters).unwrap();
+
+        let project_snapshots = db
+            .create_table("projectSnapshots")
+            .column(
+                "projectId",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("velocity", JsDataType::Int32, None)
+            .foreign_key(
+                "fk_project_snapshots_project",
+                "projectId",
+                "projects",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("project")
+                        .set_reverse_field_name("snapshot"),
+                ),
+            );
+        db.register_table(&project_snapshots).unwrap();
+
+        let issues = db
+            .create_table("issues")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("projectId", JsDataType::Int64, None)
+            .column("title", JsDataType::String, None)
+            .column("status", JsDataType::String, None)
+            .foreign_key(
+                "fk_issues_project",
+                "projectId",
+                "projects",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("project")
+                        .set_reverse_field_name("issues"),
+                ),
+            );
+        db.register_table(&issues).unwrap();
+
+        db
+    }
+
     fn collect_titles(array: &js_sys::Array) -> Vec<String> {
         let mut titles = Vec::with_capacity(array.length() as usize);
         for index in 0..array.length() {
@@ -935,6 +2305,20 @@ mod tests {
         }
         titles.sort();
         titles
+    }
+
+    fn collect_ids(array: &js_sys::Array, field_name: &str) -> Vec<i64> {
+        let mut ids = Vec::with_capacity(array.length() as usize);
+        for index in 0..array.length() {
+            let item = array.get(index);
+            let id = js_sys::Reflect::get(&item, &JsValue::from_str(field_name))
+                .unwrap()
+                .as_f64()
+                .unwrap() as i64;
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids
     }
 
     fn compile_subscription_engine(db: &Database, query: &str) -> LiveEngineKind {
@@ -1348,6 +2732,36 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn test_graphql_live_selector_chooses_delta_for_unique_reverse_limit_one() {
+        let db = setup_graphql_users_profiles_db();
+        let engine = compile_subscription_engine(
+            &db,
+            "subscription UserCard { usersByPk(pk: { id: 1 }) { id name profile(limit: 1) { id bio } } }",
+        );
+        assert_eq!(engine, LiveEngineKind::Delta);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_graphql_live_selector_chooses_delta_for_relation_filtered_root_subscription() {
+        let db = setup_graphql_issue_filter_db();
+        let engine = compile_subscription_engine(
+            &db,
+            "subscription IssueFeed { issues(where: { AND: [{ status: { eq: \"open\" } }, { project: { AND: [{ healthScore: { gte: 45 } }, { counter: { openIssueCount: { gte: 5 } } }, { snapshot: { velocity: { gte: 18 } } }] } }] }) { id title project { id counter(limit: 1) { openIssueCount } snapshot(limit: 1) { velocity } } } }",
+        );
+        assert_eq!(engine, LiveEngineKind::Delta);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_graphql_live_selector_falls_back_to_snapshot_for_non_unique_reverse_limit_one() {
+        let db = setup_graphql_users_posts_db();
+        let engine = compile_subscription_engine(
+            &db,
+            "subscription UserCard { usersByPk(pk: { id: 1 }) { id name posts(limit: 1) { id title } } }",
+        );
+        assert_eq!(engine, LiveEngineKind::Snapshot);
+    }
+
+    #[wasm_bindgen_test]
     fn test_database_graphql_delta_subscription_tracks_scalar_root_updates() {
         let db = setup_graphql_users_db();
 
@@ -1693,6 +3107,257 @@ mod tests {
             .as_string()
             .unwrap();
         assert_eq!(title, "Updated");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_delta_subscription_tracks_unique_reverse_limit_one_updates() {
+        let db = setup_graphql_users_profiles_db();
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                1,
+                alloc::vec![Value::Int64(1), Value::String("Alice".into())],
+            ))
+            .unwrap();
+
+        let subscription = db
+            .subscribe_graphql(
+                "subscription UserCard { usersByPk(pk: { id: 1 }) { id name profile(limit: 1) { id bio } } }",
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            compile_subscription_engine(
+                &db,
+                "subscription UserCard { usersByPk(pk: { id: 1 }) { id name profile(limit: 1) { id bio } } }",
+            ),
+            LiveEngineKind::Delta
+        );
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_user =
+            js_sys::Reflect::get(&initial_data, &JsValue::from_str("usersByPk")).unwrap();
+        let initial_profile = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_user, &JsValue::from_str("profile")).unwrap(),
+        );
+        assert_eq!(initial_profile.length(), 0);
+
+        db.graphql(
+            "mutation { insertProfiles(input: [{ id: 10, user_id: 1, bio: \"First\" }]) { id bio } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let inserted = subscription.get_result();
+        let inserted_data = js_sys::Reflect::get(&inserted, &JsValue::from_str("data")).unwrap();
+        let inserted_user =
+            js_sys::Reflect::get(&inserted_data, &JsValue::from_str("usersByPk")).unwrap();
+        let inserted_profile = js_sys::Array::from(
+            &js_sys::Reflect::get(&inserted_user, &JsValue::from_str("profile")).unwrap(),
+        );
+        assert_eq!(inserted_profile.length(), 1);
+        let inserted_bio =
+            js_sys::Reflect::get(&inserted_profile.get(0), &JsValue::from_str("bio"))
+                .unwrap()
+                .as_string()
+                .unwrap();
+        assert_eq!(inserted_bio, "First");
+
+        db.graphql(
+            "mutation { updateProfiles(where: { id: { eq: 10 } }, set: { bio: \"Updated\" }) { id bio } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let updated = subscription.get_result();
+        let updated_data = js_sys::Reflect::get(&updated, &JsValue::from_str("data")).unwrap();
+        let updated_user =
+            js_sys::Reflect::get(&updated_data, &JsValue::from_str("usersByPk")).unwrap();
+        let updated_profile = js_sys::Array::from(
+            &js_sys::Reflect::get(&updated_user, &JsValue::from_str("profile")).unwrap(),
+        );
+        assert_eq!(updated_profile.length(), 1);
+        let updated_bio = js_sys::Reflect::get(&updated_profile.get(0), &JsValue::from_str("bio"))
+            .unwrap()
+            .as_string()
+            .unwrap();
+        assert_eq!(updated_bio, "Updated");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_delta_subscription_tracks_relation_filtered_root_membership() {
+        let db = setup_graphql_issue_filter_db();
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projects")
+            .unwrap()
+            .insert(Row::new(1, alloc::vec![Value::Int64(1), Value::Int32(30)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projectCounters")
+            .unwrap()
+            .insert(Row::new(10, alloc::vec![Value::Int64(1), Value::Int32(6)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projectSnapshots")
+            .unwrap()
+            .insert(Row::new(11, alloc::vec![Value::Int64(1), Value::Int32(20)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("issues")
+            .unwrap()
+            .insert(Row::new(
+                100,
+                alloc::vec![
+                    Value::Int64(100),
+                    Value::Int64(1),
+                    Value::String("Issue".into()),
+                    Value::String("open".into()),
+                ],
+            ))
+            .unwrap();
+
+        let query = "subscription IssueFeed { issues(where: { AND: [{ status: { eq: \"open\" } }, { project: { AND: [{ healthScore: { gte: 45 } }, { counter: { openIssueCount: { gte: 5 } } }, { snapshot: { velocity: { gte: 18 } } }] } }] }) { id title project { id counter(limit: 1) { openIssueCount } snapshot(limit: 1) { velocity } } } }";
+        assert_eq!(
+            compile_subscription_engine(&db, query),
+            LiveEngineKind::Delta
+        );
+
+        let subscription = db.subscribe_graphql(query, None, None).unwrap();
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(initial_issues.length(), 0);
+
+        db.graphql(
+            "mutation { updateProjects(where: { id: { eq: 1 } }, set: { healthScore: 50 }) { id } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let inserted = subscription.get_result();
+        let inserted_data = js_sys::Reflect::get(&inserted, &JsValue::from_str("data")).unwrap();
+        let inserted_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&inserted_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(collect_ids(&inserted_issues, "id"), vec![100]);
+
+        db.graphql(
+            "mutation { updateProjectSnapshots(where: { projectId: { eq: 1 } }, set: { velocity: 5 }) { projectId } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let removed = subscription.get_result();
+        let removed_data = js_sys::Reflect::get(&removed, &JsValue::from_str("data")).unwrap();
+        let removed_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&removed_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(removed_issues.length(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_snapshot_subscription_tracks_relation_filtered_root_membership() {
+        let db = setup_graphql_issue_filter_db();
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projects")
+            .unwrap()
+            .insert(Row::new(1, alloc::vec![Value::Int64(1), Value::Int32(30)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projectCounters")
+            .unwrap()
+            .insert(Row::new(10, alloc::vec![Value::Int64(1), Value::Int32(6)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("projectSnapshots")
+            .unwrap()
+            .insert(Row::new(11, alloc::vec![Value::Int64(1), Value::Int32(20)]))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("issues")
+            .unwrap()
+            .insert(Row::new(
+                100,
+                alloc::vec![
+                    Value::Int64(100),
+                    Value::Int64(1),
+                    Value::String("Issue".into()),
+                    Value::String("open".into()),
+                ],
+            ))
+            .unwrap();
+
+        let query = "subscription IssueFeedSnapshot { issues(where: { AND: [{ status: { eq: \"open\" } }, { project: { AND: [{ healthScore: { gte: 45 } }, { counter: { openIssueCount: { gte: 5 } } }, { snapshot: { velocity: { gte: 18 } } }] } }] }) { id title project { id counter(orderBy: [{ field: OPENISSUECOUNT, direction: DESC }], limit: 1) { openIssueCount } snapshot(limit: 1) { velocity } } } }";
+        assert_eq!(
+            compile_subscription_engine(&db, query),
+            LiveEngineKind::Snapshot
+        );
+
+        let subscription = db.subscribe_graphql(query, None, None).unwrap();
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(initial_issues.length(), 0);
+
+        db.graphql(
+            "mutation { updateProjects(where: { id: { eq: 1 } }, set: { healthScore: 50 }) { id } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let inserted = subscription.get_result();
+        let inserted_data = js_sys::Reflect::get(&inserted, &JsValue::from_str("data")).unwrap();
+        let inserted_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&inserted_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(collect_ids(&inserted_issues, "id"), vec![100]);
+
+        db.graphql(
+            "mutation { updateProjectSnapshots(where: { projectId: { eq: 1 } }, set: { velocity: 5 }) { projectId } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let removed = subscription.get_result();
+        let removed_data = js_sys::Reflect::get(&removed, &JsValue::from_str("data")).unwrap();
+        let removed_issues = js_sys::Array::from(
+            &js_sys::Reflect::get(&removed_data, &JsValue::from_str("issues")).unwrap(),
+        );
+        assert_eq!(removed_issues.length(), 0);
     }
 
     #[wasm_bindgen_test]

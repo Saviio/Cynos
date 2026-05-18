@@ -8,13 +8,14 @@ mod posting;
 pub use posting::PostingList;
 
 use crate::stats::IndexStats;
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use cynos_core::RowId;
+use hashbrown::{HashMap, HashSet};
 
 /// Synthetic key namespace used for JSONB_CONTAINS trigram prefilters.
 pub const CONTAINS_TRIGRAM_KEY_PREFIX: &str = "__cynos_contains3__:";
+const TRIGRAM_CACHE_CAPACITY: usize = 256;
 
 /// Builds the synthetic key used for path-scoped JSONB_CONTAINS trigrams.
 pub fn contains_trigram_key(path: &str) -> String {
@@ -23,20 +24,127 @@ pub fn contains_trigram_key(path: &str) -> String {
     key
 }
 
+const INLINE_TRIGRAM_DEDUP_CAPACITY: usize = 12;
+
+fn trigram_code(first: char, second: char, third: char) -> u128 {
+    ((first as u128) << 42) | ((second as u128) << 21) | (third as u128)
+}
+
+fn push_trigram_string(out: &mut String, first: char, second: char, third: char) {
+    out.clear();
+    out.push(first);
+    out.push(second);
+    out.push(third);
+}
+
+fn trigram_chars(code: u128) -> Option<(char, char, char)> {
+    let first = core::char::from_u32(((code >> 42) & 0x1f_ffff) as u32)?;
+    let second = core::char::from_u32(((code >> 21) & 0x1f_ffff) as u32)?;
+    let third = core::char::from_u32((code & 0x1f_ffff) as u32)?;
+    Some((first, second, third))
+}
+
+fn trigram_string_from_code(code: u128) -> String {
+    let Some((first, second, third)) = trigram_chars(code) else {
+        return String::new();
+    };
+
+    let mut gram = String::with_capacity(first.len_utf8() + second.len_utf8() + third.len_utf8());
+    gram.push(first);
+    gram.push(second);
+    gram.push(third);
+    gram
+}
+
+fn try_mark_trigram_seen(
+    code: u128,
+    inline_seen: &mut [u128; INLINE_TRIGRAM_DEDUP_CAPACITY],
+    inline_len: &mut usize,
+    spilled_seen: &mut Option<HashSet<u128>>,
+) -> bool {
+    if let Some(seen) = spilled_seen.as_mut() {
+        return seen.insert(code);
+    }
+
+    if inline_seen[..*inline_len].contains(&code) {
+        return false;
+    }
+
+    if *inline_len < INLINE_TRIGRAM_DEDUP_CAPACITY {
+        inline_seen[*inline_len] = code;
+        *inline_len += 1;
+        return true;
+    }
+
+    let mut seen = HashSet::with_capacity(*inline_len * 2);
+    seen.extend(inline_seen[..*inline_len].iter().copied());
+    let inserted = seen.insert(code);
+    *spilled_seen = Some(seen);
+    inserted
+}
+
+fn for_each_unique_trigram_code<F>(value: &str, mut visitor: F) -> usize
+where
+    F: FnMut(u128),
+{
+    let mut chars = value.chars();
+    let Some(mut first) = chars.next() else {
+        return 0;
+    };
+    let Some(mut second) = chars.next() else {
+        return 0;
+    };
+    let Some(mut third) = chars.next() else {
+        return 0;
+    };
+
+    let mut inline_seen = [0u128; INLINE_TRIGRAM_DEDUP_CAPACITY];
+    let mut inline_len = 0usize;
+    let mut spilled_seen = None;
+    let mut count = 0usize;
+
+    loop {
+        let code = trigram_code(first, second, third);
+        if try_mark_trigram_seen(code, &mut inline_seen, &mut inline_len, &mut spilled_seen) {
+            visitor(code);
+            count += 1;
+        }
+
+        let Some(next) = chars.next() else {
+            break;
+        };
+        first = second;
+        second = third;
+        third = next;
+    }
+
+    count
+}
+
+fn for_each_unique_trigram<F>(value: &str, mut visitor: F) -> usize
+where
+    F: FnMut(&str),
+{
+    let mut gram = String::new();
+    for_each_unique_trigram_code(value, |code| {
+        let Some((first, second, third)) = trigram_chars(code) else {
+            return;
+        };
+
+        if gram.capacity() < first.len_utf8() + second.len_utf8() + third.len_utf8() {
+            gram.reserve(first.len_utf8() + second.len_utf8() + third.len_utf8() - gram.capacity());
+        }
+        push_trigram_string(&mut gram, first, second, third);
+        visitor(gram.as_str());
+    })
+}
+
 /// Extracts unique trigrams from a string for substring prefiltering.
 pub fn contains_trigrams(value: &str) -> Vec<String> {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() < 3 {
-        return Vec::new();
-    }
-
-    let mut grams = BTreeSet::new();
-    for window in chars.windows(3) {
-        let gram: String = window.iter().collect();
-        grams.insert(gram);
-    }
-
-    grams.into_iter().collect()
+    let mut grams = Vec::new();
+    for_each_unique_trigram(value, |gram| grams.push(gram.into()));
+    grams.sort_unstable();
+    grams
 }
 
 /// Builds the synthetic (key, value) pairs used to prefilter JSONB_CONTAINS.
@@ -48,6 +156,254 @@ pub fn contains_trigram_pairs(path: &str, needle: &str) -> Vec<(String, String)>
         .collect()
 }
 
+fn extend_sorted_unique_rows(rows: &mut Vec<RowId>, incoming: &[RowId]) {
+    if incoming.is_empty() {
+        return;
+    }
+
+    if rows.is_empty() {
+        rows.extend_from_slice(incoming);
+        return;
+    }
+
+    let Some(&incoming_first) = incoming.first() else {
+        return;
+    };
+    if rows
+        .last()
+        .copied()
+        .is_some_and(|last| last < incoming_first)
+    {
+        rows.extend_from_slice(incoming);
+        return;
+    }
+
+    let original_len = rows.len();
+    let total_len = original_len + incoming.len();
+    rows.resize(total_len, 0);
+
+    let mut left = original_len;
+    let mut right = incoming.len();
+    let mut write = total_len;
+    let mut last_written = None;
+
+    while left > 0 || right > 0 {
+        let next = if right == 0 || (left > 0 && rows[left - 1].cmp(&incoming[right - 1]).is_gt()) {
+            left -= 1;
+            rows[left]
+        } else if left == 0 || incoming[right - 1].cmp(&rows[left - 1]).is_gt() {
+            right -= 1;
+            incoming[right]
+        } else {
+            left -= 1;
+            right -= 1;
+            rows[left]
+        };
+
+        if last_written != Some(next) {
+            write -= 1;
+            rows[write] = next;
+            last_written = Some(next);
+        }
+    }
+
+    let unique_len = total_len - write;
+    if write > 0 && unique_len > 0 {
+        rows.copy_within(write..total_len, 0);
+    }
+    rows.truncate(unique_len);
+}
+
+#[derive(Debug, Clone, Default)]
+struct GinBulkRows {
+    rows: Vec<RowId>,
+    sorted_unique: bool,
+}
+
+impl GinBulkRows {
+    fn push(&mut self, row_id: RowId) {
+        match self.rows.last().copied() {
+            None => {
+                self.rows.push(row_id);
+                self.sorted_unique = true;
+            }
+            Some(last) if row_id > last => self.rows.push(row_id),
+            Some(last) if row_id == last => {}
+            Some(_) => {
+                self.rows.push(row_id);
+                self.sorted_unique = false;
+            }
+        }
+    }
+
+    fn into_sorted_unique(mut self) -> Vec<RowId> {
+        if !self.sorted_unique {
+            self.rows.sort_unstable();
+            self.rows.dedup();
+        }
+        self.rows
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GinBulkBuilder {
+    key_index: HashMap<String, GinBulkRows>,
+    key_value_index: HashMap<String, HashMap<String, GinBulkRows>>,
+    contains_value_index: HashMap<String, HashMap<String, GinBulkRows>>,
+    trigram_cache: HashMap<String, Vec<u128>>,
+    key_add_count: usize,
+}
+
+impl GinBulkBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_key_ref(&mut self, key: &str, row_id: RowId) {
+        self.key_add_count += 1;
+        self.key_index.entry(key.into()).or_default().push(row_id);
+    }
+
+    pub fn add_key(&mut self, key: String, row_id: RowId) {
+        self.add_key_ref(&key, row_id);
+    }
+
+    pub fn add_key_value_ref(&mut self, key: &str, value: &str, row_id: RowId) {
+        self.key_value_index
+            .entry(key.into())
+            .or_default()
+            .entry(value.into())
+            .or_default()
+            .push(row_id);
+    }
+
+    pub fn add_key_value(&mut self, key: String, value: String, row_id: RowId) {
+        self.add_key_value_ref(&key, &value, row_id);
+    }
+
+    pub fn add_key_values(
+        &mut self,
+        pairs: impl IntoIterator<Item = (String, String)>,
+        row_id: RowId,
+    ) {
+        for (key, value) in pairs {
+            self.add_key_value(key, value, row_id);
+        }
+    }
+
+    pub fn add_contains_trigrams(&mut self, path: &str, needle: &str, row_id: RowId) -> usize {
+        let key = contains_trigram_key(path);
+        self.add_contains_trigrams_for_key(&key, needle, row_id)
+    }
+
+    pub fn add_contains_trigrams_for_key(
+        &mut self,
+        contains_key: &str,
+        needle: &str,
+        row_id: RowId,
+    ) -> usize {
+        self.add_contains_value_ref(contains_key, needle, row_id);
+        self.trigram_code_count_for_value(needle)
+    }
+
+    fn add_contains_value_ref(&mut self, contains_key: &str, value: &str, row_id: RowId) {
+        self.contains_value_index
+            .entry(contains_key.into())
+            .or_default()
+            .entry(value.into())
+            .or_default()
+            .push(row_id);
+    }
+
+    fn trigram_code_count_for_value(&mut self, needle: &str) -> usize {
+        if let Some(cached) = self.trigram_cache.get(needle) {
+            return cached.len();
+        }
+
+        let mut codes = Vec::new();
+        for_each_unique_trigram_code(needle, |code| codes.push(code));
+        let count = codes.len();
+        if self.trigram_cache.len() < TRIGRAM_CACHE_CAPACITY {
+            self.trigram_cache.insert(needle.into(), codes);
+        }
+        count
+    }
+
+    fn finish(self) -> GinBulkDelta {
+        let mut key_value_index: HashMap<String, HashMap<String, Vec<RowId>>> = self
+            .key_value_index
+            .into_iter()
+            .map(|(key, values)| {
+                (
+                    key,
+                    values
+                        .into_iter()
+                        .map(|(value, rows)| (value, rows.into_sorted_unique()))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let mut trigram_cache = self.trigram_cache;
+        for (contains_key, values) in self.contains_value_index {
+            let key_values = key_value_index.entry(contains_key).or_default();
+            for (value, rows) in values {
+                let rows = rows.into_sorted_unique();
+                if let Some(cached) = trigram_cache.get(&value) {
+                    for trigram_code in cached.iter().copied() {
+                        let trigram = trigram_string_from_code(trigram_code);
+                        let entry = key_values.entry(trigram).or_default();
+                        extend_sorted_unique_rows(entry, &rows);
+                    }
+                } else {
+                    let mut codes = Vec::new();
+                    for_each_unique_trigram_code(&value, |code| codes.push(code));
+                    for trigram_code in codes.iter().copied() {
+                        let trigram = trigram_string_from_code(trigram_code);
+                        let entry = key_values.entry(trigram).or_default();
+                        extend_sorted_unique_rows(entry, &rows);
+                    }
+                    if trigram_cache.len() < TRIGRAM_CACHE_CAPACITY {
+                        trigram_cache.insert(value.clone(), codes);
+                    }
+                }
+            }
+        }
+
+        GinBulkDelta {
+            key_index: self
+                .key_index
+                .into_iter()
+                .map(|(key, rows)| {
+                    (
+                        key,
+                        PostingList::from_sorted_unique_unchecked(rows.into_sorted_unique()),
+                    )
+                })
+                .collect(),
+            key_value_index: key_value_index
+                .into_iter()
+                .flat_map(|(key, values)| {
+                    values.into_iter().map(move |(value, rows)| {
+                        (
+                            (key.clone(), value),
+                            PostingList::from_sorted_unique_unchecked(rows),
+                        )
+                    })
+                })
+                .collect(),
+            key_add_count: self.key_add_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct GinBulkDelta {
+    key_index: HashMap<String, PostingList>,
+    key_value_index: HashMap<(String, String), PostingList>,
+    key_add_count: usize,
+}
+
 /// A GIN index for JSONB and other composite types.
 ///
 /// This index maintains two inverted indexes:
@@ -56,9 +412,9 @@ pub fn contains_trigram_pairs(path: &str, needle: &str) -> Vec<(String, String)>
 #[derive(Debug, Clone)]
 pub struct GinIndex {
     /// Key → Row IDs (for key existence queries)
-    key_index: BTreeMap<String, PostingList>,
+    key_index: HashMap<String, PostingList>,
     /// (Key, Value) → Row IDs (for containment queries)
-    key_value_index: BTreeMap<(String, String), PostingList>,
+    key_value_index: HashMap<(String, String), PostingList>,
     /// Statistics
     stats: IndexStats,
 }
@@ -67,8 +423,8 @@ impl GinIndex {
     /// Creates a new empty GIN index.
     pub fn new() -> Self {
         Self {
-            key_index: BTreeMap::new(),
-            key_value_index: BTreeMap::new(),
+            key_index: HashMap::new(),
+            key_value_index: HashMap::new(),
             stats: IndexStats::new(),
         }
     }
@@ -110,6 +466,35 @@ impl GinIndex {
     ) {
         for (key, value) in pairs {
             self.add_key_value(key, value, row_id);
+        }
+    }
+
+    pub fn add_contains_trigrams(&mut self, path: &str, needle: &str, row_id: RowId) -> usize {
+        let key = contains_trigram_key(path);
+        for_each_unique_trigram_code(needle, |code| {
+            self.add_key_value(key.clone(), trigram_string_from_code(code), row_id);
+        })
+    }
+
+    pub fn apply_bulk_builder(&mut self, builder: GinBulkBuilder) {
+        self.apply_bulk_delta(builder.finish());
+    }
+
+    fn apply_bulk_delta(&mut self, delta: GinBulkDelta) {
+        self.stats.add_rows(delta.key_add_count);
+
+        for (key, posting) in delta.key_index {
+            self.key_index
+                .entry(key)
+                .and_modify(|existing| existing.merge(&posting))
+                .or_insert(posting);
+        }
+
+        for (pair, posting) in delta.key_value_index {
+            self.key_value_index
+                .entry(pair)
+                .and_modify(|existing| existing.merge(&posting))
+                .or_insert(posting);
         }
     }
 
@@ -261,6 +646,20 @@ impl GinIndex {
         result
     }
 
+    /// Gets all row IDs that contain ANY of the given key-value pairs (OR query).
+    pub fn get_by_key_values_any(&self, pairs: &[(&str, &str)]) -> Vec<RowId> {
+        let mut result = PostingList::new();
+
+        for (key, value) in pairs {
+            let pair = ((*key).into(), (*value).into());
+            if let Some(posting) = self.key_value_index.get(&pair) {
+                result = result.union(posting);
+            }
+        }
+
+        result.to_vec()
+    }
+
     /// Visits row IDs that contain all of the given key-value pairs.
     /// Return `false` from the visitor to stop early.
     pub fn visit_by_key_values_all<F>(&self, pairs: &[(&str, &str)], mut visitor: F)
@@ -268,6 +667,19 @@ impl GinIndex {
         F: FnMut(RowId) -> bool,
     {
         for row_id in self.get_by_key_values_all(pairs) {
+            if !visitor(row_id) {
+                break;
+            }
+        }
+    }
+
+    /// Visits row IDs that contain any of the given key-value pairs.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_by_key_values_any<F>(&self, pairs: &[(&str, &str)], mut visitor: F)
+    where
+        F: FnMut(RowId) -> bool,
+    {
+        for row_id in self.get_by_key_values_any(pairs) {
             if !visitor(row_id) {
                 break;
             }
@@ -465,6 +877,26 @@ mod tests {
     }
 
     #[test]
+    fn test_gin_get_by_key_values_any() {
+        let mut gin = GinIndex::new();
+
+        gin.add_key_value("status".into(), "active".into(), 1);
+        gin.add_key_value("type".into(), "user".into(), 1);
+
+        gin.add_key_value("status".into(), "active".into(), 2);
+        gin.add_key_value("type".into(), "admin".into(), 2);
+
+        gin.add_key_value("status".into(), "inactive".into(), 3);
+        gin.add_key_value("type".into(), "user".into(), 3);
+
+        let result = gin.get_by_key_values_any(&[("status", "active"), ("type", "user")]);
+        assert_eq!(result, vec![1, 2, 3]);
+
+        let result = gin.get_by_key_values_any(&[("status", "active")]);
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[test]
     fn test_gin_get_by_key_values_all_order_independent() {
         let mut gin = GinIndex::new();
 
@@ -582,5 +1014,73 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn test_gin_bulk_builder_merges_into_existing_index() {
+        let mut gin = GinIndex::new();
+        gin.add_key("status".into(), 1);
+        gin.add_key_value("status".into(), "active".into(), 1);
+
+        let mut builder = GinBulkBuilder::new();
+        builder.add_key("status".into(), 2);
+        builder.add_key("status".into(), 3);
+        builder.add_key_value("status".into(), "active".into(), 2);
+        builder.add_key_value("status".into(), "active".into(), 3);
+
+        gin.apply_bulk_builder(builder);
+
+        assert_eq!(gin.get_by_key("status"), vec![1, 2, 3]);
+        assert_eq!(gin.get_by_key_value("status", "active"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_gin_bulk_builder_keeps_postings_sorted_for_out_of_order_rows() {
+        let mut gin = GinIndex::new();
+        let mut builder = GinBulkBuilder::new();
+        builder.add_key("status".into(), 3);
+        builder.add_key("status".into(), 1);
+        builder.add_key("status".into(), 2);
+        builder.add_key("status".into(), 2);
+        builder.add_key_value("status".into(), "active".into(), 3);
+        builder.add_key_value("status".into(), "active".into(), 1);
+        builder.add_key_value("status".into(), "active".into(), 2);
+        builder.add_key_value("status".into(), "active".into(), 2);
+
+        gin.apply_bulk_builder(builder);
+
+        assert_eq!(gin.get_by_key("status"), vec![1, 2, 3]);
+        assert_eq!(gin.get_by_key_value("status", "active"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_gin_bulk_builder_contains_trigrams_for_key() {
+        let mut gin = GinIndex::new();
+        let contains_key = contains_trigram_key("status");
+        let mut builder = GinBulkBuilder::new();
+        builder.add_contains_trigrams_for_key(&contains_key, "enterprise", 7);
+
+        gin.apply_bulk_builder(builder);
+
+        for gram in contains_trigrams("enterprise") {
+            assert_eq!(gin.get_by_key_value(&contains_key, &gram), vec![7]);
+        }
+    }
+
+    #[test]
+    fn test_gin_bulk_builder_reuses_repeated_trigram_needles_without_changing_postings() {
+        let mut gin = GinIndex::new();
+        let contains_key = contains_trigram_key("status");
+        let mut builder = GinBulkBuilder::new();
+
+        for row_id in [7, 8, 9] {
+            builder.add_contains_trigrams_for_key(&contains_key, "enterprise", row_id);
+        }
+
+        gin.apply_bulk_builder(builder);
+
+        for gram in contains_trigrams("enterprise") {
+            assert_eq!(gin.get_by_key_value(&contains_key, &gram), vec![7, 8, 9]);
+        }
     }
 }

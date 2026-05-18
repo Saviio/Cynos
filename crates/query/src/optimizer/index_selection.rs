@@ -1,9 +1,10 @@
 //! Index selection optimization pass.
 
 use crate::ast::{BinaryOp, Expr};
-use crate::context::{ExecutionContext, IndexInfo};
+use crate::context::{ExecutionContext, IndexInfo, RestrictedAccessMode};
 use crate::optimizer::OptimizerPass;
 use crate::planner::{IndexBounds, LogicalPlan};
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -193,6 +194,7 @@ struct GinPredicateInfo {
     path: String,
     value: Option<Value>,
     prefilter_pairs: Option<Vec<(String, Value)>>,
+    match_all: bool,
     query_type: String,
     original_predicate: Expr,
     requires_post_filter: bool,
@@ -297,8 +299,19 @@ impl IndexSelection {
         // Check if we have context with index information
         let ctx = self.context.as_ref()?;
 
-        // First, try to handle IN predicates
-        if let Some(in_info) = self.analyze_in_predicate(predicate) {
+        // For small restricted subsets, preserving a table scan lets the restricted
+        // datasource iterate only the affected row ids and recheck predicates in-place.
+        if ctx.is_restricted_relation(table)
+            && ctx.restricted_access_mode(table) == RestrictedAccessMode::SubsetDriven
+        {
+            return None;
+        }
+
+        // First, try to handle IN predicates and equivalent OR chains.
+        if let Some(in_info) = self
+            .analyze_in_predicate(predicate)
+            .or_else(|| self.analyze_or_in_predicate(predicate))
+        {
             // Find an index that covers the IN column
             if let Some(index) = ctx.find_index(table, &[in_info.column.as_str()]) {
                 // Use IndexInGet for IN queries with indexed columns
@@ -777,6 +790,26 @@ impl IndexSelection {
         }
     }
 
+    fn flatten_or_predicates(&self, predicate: &Expr) -> Vec<Expr> {
+        let mut predicates = Vec::new();
+        Self::flatten_or_predicates_into(predicate, &mut predicates);
+        predicates
+    }
+
+    fn flatten_or_predicates_into(predicate: &Expr, predicates: &mut Vec<Expr>) {
+        match predicate {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Or,
+                right,
+            } => {
+                Self::flatten_or_predicates_into(left, predicates);
+                Self::flatten_or_predicates_into(right, predicates);
+            }
+            _ => predicates.push(predicate.clone()),
+        }
+    }
+
     fn build_composite_bounds_for_index(
         &self,
         index_columns: &[String],
@@ -925,6 +958,46 @@ impl IndexSelection {
         }
     }
 
+    /// Analyzes an OR-of-equality predicate that is equivalent to IN.
+    fn analyze_or_in_predicate(&self, predicate: &Expr) -> Option<InPredicateInfo> {
+        let predicates = self.flatten_or_predicates(predicate);
+        if predicates.len() < 2 {
+            return None;
+        }
+
+        let mut table = None;
+        let mut column = None;
+        let mut values = Vec::with_capacity(predicates.len());
+
+        for predicate in predicates {
+            let info = self.analyze_predicate(&predicate)?;
+            if !info.is_point_lookup {
+                return None;
+            }
+
+            let value = info.value?;
+            match (&table, &column) {
+                (None, None) => {
+                    table = Some(info.table.clone());
+                    column = Some(info.column.clone());
+                }
+                (Some(existing_table), Some(existing_column))
+                    if *existing_table == info.table && *existing_column == info.column => {}
+                _ => return None,
+            }
+
+            if !values.iter().any(|existing| existing == &value) {
+                values.push(value);
+            }
+        }
+
+        Some(InPredicateInfo {
+            table: table?,
+            column: column?,
+            values,
+        })
+    }
+
     /// Attempts to use a GIN index for JSONB function queries.
     /// Supports both single predicates and AND combinations of multiple predicates.
     ///
@@ -970,10 +1043,11 @@ impl IndexSelection {
                 index: first.index.clone(),
                 column: first.column.clone(),
                 pairs,
+                match_all: true,
                 recheck: None,
             }
         } else {
-            let best_idx = self.choose_best_single_gin_predicate(&gin_predicates)?;
+            let best_idx = self.choose_best_single_gin_predicate(table, &gin_predicates, ctx)?;
             used_predicates[best_idx] = true;
             let info = &gin_predicates[best_idx];
             if let Some(pairs) = &info.prefilter_pairs {
@@ -982,6 +1056,7 @@ impl IndexSelection {
                     index: info.index.clone(),
                     column: info.column.clone(),
                     pairs: pairs.clone(),
+                    match_all: info.match_all,
                     recheck: None,
                 }
             } else {
@@ -1030,12 +1105,14 @@ impl IndexSelection {
                 index,
                 column,
                 pairs,
+                match_all,
                 ..
             } => LogicalPlan::GinIndexScanMulti {
                 table,
                 index,
                 column,
                 pairs,
+                match_all,
                 recheck,
             },
             _ => unreachable!("GIN selection must produce a GIN scan"),
@@ -1099,13 +1176,73 @@ impl IndexSelection {
 
     fn choose_best_single_gin_predicate(
         &self,
+        table: &str,
         gin_predicates: &[GinPredicateInfo],
+        ctx: &ExecutionContext,
     ) -> Option<usize> {
         gin_predicates
             .iter()
             .enumerate()
-            .max_by_key(|(_, info)| Self::gin_single_predicate_rank(info))
+            .min_by_key(|(_, info)| {
+                (
+                    Self::gin_predicate_cost(table, info, ctx),
+                    u8::MAX - Self::gin_single_predicate_rank(info),
+                )
+            })
             .map(|(idx, _)| idx)
+    }
+
+    fn gin_predicate_cost(table: &str, info: &GinPredicateInfo, ctx: &ExecutionContext) -> usize {
+        if let Some(value) = &info.value {
+            if let Some(literal) = Self::literal_to_gin_cost_value(value) {
+                if let Some(cost) =
+                    ctx.gin_key_value_cost(table, &info.index, &info.path, literal.as_ref())
+                {
+                    if cost > 0 {
+                        return cost;
+                    }
+                }
+            }
+        }
+
+        if let Some(pairs) = &info.prefilter_pairs {
+            if let Some(cost) = pairs
+                .iter()
+                .filter_map(|(key, value)| {
+                    let literal = Self::literal_to_gin_cost_value(value)?;
+                    ctx.gin_key_value_cost(table, &info.index, key, literal.as_ref())
+                })
+                .min()
+            {
+                if cost > 0 {
+                    return cost;
+                }
+            }
+        }
+
+        if let Some(cost) = ctx.gin_key_cost(table, &info.index, &info.path) {
+            if cost > 0 {
+                return cost;
+            }
+        }
+
+        match info.query_type.as_str() {
+            "eq" => 8,
+            "exists" => 64,
+            "contains" => 256,
+            _ => 1024,
+        }
+    }
+
+    fn literal_to_gin_cost_value(value: &Value) -> Option<Cow<'_, str>> {
+        match value {
+            Value::String(value) => Some(Cow::Borrowed(value.as_str())),
+            Value::Int32(value) => Some(Cow::Owned(value.to_string())),
+            Value::Int64(value) => Some(Cow::Owned(value.to_string())),
+            Value::Float64(value) => Some(Cow::Owned(value.to_string())),
+            Value::Boolean(value) => Some(Cow::Borrowed(if *value { "true" } else { "false" })),
+            _ => None,
+        }
     }
 
     fn gin_single_predicate_rank(info: &GinPredicateInfo) -> u8 {
@@ -1172,6 +1309,15 @@ impl IndexSelection {
                     remaining_result,
                 );
             }
+            Expr::BinaryOp {
+                op: BinaryOp::Or, ..
+            } => {
+                if let Some(info) = self.analyze_gin_or_predicate(predicate, table, ctx) {
+                    gin_result.push(info);
+                } else {
+                    remaining_result.push(predicate.clone());
+                }
+            }
             // Handle JSONB function calls - these can potentially use GIN index
             Expr::Function { name, args } => {
                 if let Some(info) = self.analyze_gin_function(predicate, name, args, table, ctx) {
@@ -1203,9 +1349,8 @@ impl IndexSelection {
                 if let Expr::Column(col) = &args[0] {
                     let column_name = &col.column;
                     let column_index = col.index;
-                    if let Some(index) = ctx.find_gin_index(table, column_name) {
-                        let path =
-                            self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    let path = self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    if let Some(index) = ctx.find_gin_index_for_path(table, column_name, &path) {
                         let value = self.extract_literal(&args[2])?;
                         return Some(GinPredicateInfo {
                             index: index.name.clone(),
@@ -1214,6 +1359,7 @@ impl IndexSelection {
                             path,
                             value: Some(value),
                             prefilter_pairs: None,
+                            match_all: true,
                             query_type: "eq".into(),
                             original_predicate: predicate.clone(),
                             requires_post_filter: false,
@@ -1226,9 +1372,8 @@ impl IndexSelection {
                 if let Expr::Column(col) = &args[0] {
                     let column_name = &col.column;
                     let column_index = col.index;
-                    if let Some(index) = ctx.find_gin_index(table, column_name) {
-                        let path =
-                            self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    let path = self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    if let Some(index) = ctx.find_gin_index_for_path(table, column_name, &path) {
                         let prefilter_pairs =
                             self.extract_string_literal(&args[2]).and_then(|needle| {
                                 let pairs = contains_trigram_pairs(&path, &needle);
@@ -1250,6 +1395,7 @@ impl IndexSelection {
                             path,
                             value: None,
                             prefilter_pairs,
+                            match_all: true,
                             query_type: "contains".into(),
                             original_predicate: predicate.clone(),
                             requires_post_filter: true,
@@ -1262,9 +1408,8 @@ impl IndexSelection {
                 if let Expr::Column(col) = &args[0] {
                     let column_name = &col.column;
                     let column_index = col.index;
-                    if let Some(index) = ctx.find_gin_index(table, column_name) {
-                        let path =
-                            self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    let path = self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                    if let Some(index) = ctx.find_gin_index_for_path(table, column_name, &path) {
                         return Some(GinPredicateInfo {
                             index: index.name.clone(),
                             column: column_name.clone(),
@@ -1272,6 +1417,7 @@ impl IndexSelection {
                             path,
                             value: None,
                             prefilter_pairs: None,
+                            match_all: true,
                             query_type: "exists".into(),
                             original_predicate: predicate.clone(),
                             requires_post_filter: false,
@@ -1283,6 +1429,67 @@ impl IndexSelection {
             _ => {}
         }
         None
+    }
+
+    fn analyze_gin_or_predicate(
+        &self,
+        predicate: &Expr,
+        table: &str,
+        ctx: &ExecutionContext,
+    ) -> Option<GinPredicateInfo> {
+        let terms = self.flatten_or_predicates(predicate);
+        if terms.len() < 2 {
+            return None;
+        }
+
+        let mut first: Option<GinPredicateInfo> = None;
+        let mut pairs = Vec::with_capacity(terms.len());
+
+        for term in terms {
+            let Expr::Function { name, args } = &term else {
+                return None;
+            };
+            let info = self.analyze_gin_function(&term, name, args, table, ctx)?;
+            if info.query_type != "eq"
+                || info.requires_post_filter
+                || info.prefilter_pairs.is_some()
+                || info.value.is_none()
+            {
+                return None;
+            }
+
+            if let Some(existing) = &first {
+                if existing.index != info.index
+                    || existing.column != info.column
+                    || existing.column_index != info.column_index
+                    || existing.path != info.path
+                {
+                    return None;
+                }
+            } else {
+                first = Some(info.clone());
+            }
+
+            let pair = (info.path.clone(), info.value.expect("checked above"));
+            if !pairs.iter().any(|existing| existing == &pair) {
+                pairs.push(pair);
+            }
+        }
+
+        let first = first?;
+        Some(GinPredicateInfo {
+            index: first.index,
+            column: first.column,
+            column_index: first.column_index,
+            path: first.path,
+            value: None,
+            prefilter_pairs: Some(pairs),
+            match_all: false,
+            query_type: "eq".into(),
+            original_predicate: predicate.clone(),
+            requires_post_filter: false,
+            supports_multi_scan: false,
+        })
     }
 
     fn normalize_gin_path(&self, path: &str) -> Option<String> {
@@ -1779,6 +1986,79 @@ mod tests {
         assert!(info.is_none());
     }
 
+    #[test]
+    fn test_or_equality_query_index_selection() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "users",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_status",
+                    alloc::vec!["status".into()],
+                    false
+                )],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+        let plan = LogicalPlan::filter(
+            LogicalPlan::scan("users"),
+            Expr::or(
+                Expr::eq(
+                    Expr::column("users", "status", 1),
+                    Expr::literal(Value::String("open".into())),
+                ),
+                Expr::eq(
+                    Expr::column("users", "status", 1),
+                    Expr::literal(Value::String("in_progress".into())),
+                ),
+            ),
+        );
+
+        let optimized = pass.optimize(plan);
+        assert!(matches!(optimized, LogicalPlan::IndexInGet { .. }));
+
+        if let LogicalPlan::IndexInGet { table, index, keys } = optimized {
+            assert_eq!(table, "users");
+            assert_eq!(index, "idx_status");
+            assert_eq!(
+                keys,
+                alloc::vec![
+                    Value::String("open".into()),
+                    Value::String("in_progress".into())
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn test_analyze_or_in_predicate() {
+        let pass = IndexSelection::new();
+        let pred = Expr::or(
+            Expr::eq(
+                Expr::column("users", "status", 1),
+                Expr::literal(Value::String("open".into())),
+            ),
+            Expr::eq(
+                Expr::column("users", "status", 1),
+                Expr::literal(Value::String("in_progress".into())),
+            ),
+        );
+
+        let info = pass.analyze_or_in_predicate(&pred).unwrap();
+        assert_eq!(info.table, "users");
+        assert_eq!(info.column, "status");
+        assert_eq!(
+            info.values,
+            alloc::vec![
+                Value::String("open".into()),
+                Value::String("in_progress".into())
+            ]
+        );
+    }
+
     /// Test case for bug: mixed GIN + non-GIN predicates should preserve non-GIN predicates
     ///
     /// Query: col('status').eq('published') AND col('tags').get('$.primary').eq('tech')
@@ -1921,6 +2201,130 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_jsonb_or_equality_uses_gin_any_scan() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "issues",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new_gin(
+                    "idx_metadata",
+                    alloc::vec!["metadata".into()]
+                ),],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+        let predicate = Expr::or(
+            Expr::Function {
+                name: "JSONB_PATH_EQ".into(),
+                args: alloc::vec![
+                    Expr::column("issues", "metadata", 2),
+                    Expr::literal(Value::String("$.customer.tier".into())),
+                    Expr::literal(Value::String("enterprise".into())),
+                ],
+            },
+            Expr::Function {
+                name: "JSONB_PATH_EQ".into(),
+                args: alloc::vec![
+                    Expr::column("issues", "metadata", 2),
+                    Expr::literal(Value::String("$.customer.tier".into())),
+                    Expr::literal(Value::String("mid_market".into())),
+                ],
+            },
+        );
+
+        let optimized = pass.optimize(LogicalPlan::filter(LogicalPlan::scan("issues"), predicate));
+        match optimized {
+            LogicalPlan::GinIndexScanMulti {
+                index,
+                column,
+                pairs,
+                match_all,
+                recheck,
+                ..
+            } => {
+                assert_eq!(index, "idx_metadata");
+                assert_eq!(column, "metadata");
+                assert!(!match_all);
+                assert_eq!(
+                    pairs,
+                    alloc::vec![
+                        ("customer.tier".into(), Value::String("enterprise".into())),
+                        ("customer.tier".into(), Value::String("mid_market".into())),
+                    ]
+                );
+                let recheck_debug =
+                    format!("{:?}", recheck.expect("recheck should be preserved")).to_lowercase();
+                assert!(recheck_debug.contains("jsonb_path_eq"));
+                assert!(recheck_debug.contains("or"));
+            }
+            other => panic!("Unexpected plan type: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_jsonb_or_equality_inside_and_preserves_remaining_predicates() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "issues",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![
+                    IndexInfo::new_gin("idx_metadata", alloc::vec!["metadata".into()]),
+                    IndexInfo::new("idx_estimate", alloc::vec!["estimate".into()], false),
+                ],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+        let predicate = Expr::and(
+            Expr::ge(
+                Expr::column("issues", "estimate", 1),
+                Expr::literal(Value::Int32(3)),
+            ),
+            Expr::or(
+                Expr::Function {
+                    name: "JSONB_PATH_EQ".into(),
+                    args: alloc::vec![
+                        Expr::column("issues", "metadata", 2),
+                        Expr::literal(Value::String("$.customer.tier".into())),
+                        Expr::literal(Value::String("enterprise".into())),
+                    ],
+                },
+                Expr::Function {
+                    name: "JSONB_PATH_EQ".into(),
+                    args: alloc::vec![
+                        Expr::column("issues", "metadata", 2),
+                        Expr::literal(Value::String("$.customer.tier".into())),
+                        Expr::literal(Value::String("mid_market".into())),
+                    ],
+                },
+            ),
+        );
+
+        let optimized = pass.optimize(LogicalPlan::filter(LogicalPlan::scan("issues"), predicate));
+        match optimized {
+            LogicalPlan::Filter { input, predicate } => {
+                let predicate_debug = format!("{:?}", predicate).to_lowercase();
+                assert!(predicate_debug.contains("estimate"));
+                match input.as_ref() {
+                    LogicalPlan::GinIndexScanMulti {
+                        pairs, match_all, ..
+                    } => {
+                        assert!(!match_all);
+                        assert_eq!(pairs.len(), 2);
+                    }
+                    other => panic!("Expected GIN ANY scan under Filter, got {:?}", other),
+                }
+            }
+            other => panic!("Unexpected plan type: {:?}", other),
+        }
+    }
+
     /// Test case for bug: a handled GIN equality predicate must not drop a second
     /// GIN predicate that currently cannot be merged into GinIndexScanMulti.
     #[test]
@@ -2020,8 +2424,8 @@ mod tests {
                 assert!(
                     matches!(
                         input.as_ref(),
-                        LogicalPlan::GinIndexScanMulti { pairs, .. }
-                            if pairs == &expected_pairs
+                        LogicalPlan::GinIndexScanMulti { pairs, match_all, .. }
+                            if *match_all && pairs == &expected_pairs
                     ),
                     "Expected GIN prefilter for JSONB_CONTAINS, got {:?}",
                     input

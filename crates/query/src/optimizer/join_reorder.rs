@@ -269,8 +269,10 @@ impl JoinReorder {
         // Sort nodes by cardinality (smallest first)
         nodes.sort_by_key(|n| n.cardinality);
 
-        // Build left-deep tree greedily
-        let mut result_node = nodes.remove(0);
+        // Build left-deep tree greedily. Under restricted-relation planning, keep the
+        // anchor table as the left-deep driver whenever it is present in an inner-join island.
+        let start_idx = self.anchor_start_index(&nodes).unwrap_or(0);
+        let mut result_node = nodes.remove(start_idx);
         let mut used_conditions: Vec<bool> = alloc::vec![false; conditions.len()];
 
         while !nodes.is_empty() {
@@ -454,6 +456,22 @@ impl JoinReorder {
         }
 
         (best_idx, best_condition_idx)
+    }
+
+    fn anchor_start_index(&self, nodes: &[JoinNode]) -> Option<usize> {
+        let anchor_table = self
+            .context
+            .as_ref()?
+            .planning_intent()
+            .anchor_table
+            .as_ref()?;
+
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.tables.iter().any(|table| table == anchor_table))
+            .min_by_key(|(_, node)| node.cardinality)
+            .map(|(idx, _)| idx)
     }
 
     /// Find a join condition that applies between two sets of tables.

@@ -39,6 +39,18 @@ export class BinaryResult {
         wasm.binaryresult_free(ptr);
     }
     /**
+     * Copy the buffer into a standalone Uint8Array suitable for `postMessage`
+     * transfer lists and other ownership-taking APIs.
+     *
+     * Unlike `asView()`, the returned bytes are no longer tied to WASM memory.
+     * @returns {Uint8Array}
+     */
+    intoTransferable() {
+        const ptr = this.__destroy_into_raw();
+        const ret = wasm.binaryresult_intoTransferable(ptr);
+        return takeObject(ret);
+    }
+    /**
      * Check if buffer is empty
      * @returns {boolean}
      */
@@ -818,6 +830,41 @@ export class Database {
         return takeObject(ret);
     }
     /**
+     * @returns {any}
+     */
+    takeLastCommitProfile() {
+        const ret = wasm.database_takeLastCommitProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * @returns {any}
+     */
+    takeLastDeltaFlushProfile() {
+        const ret = wasm.database_takeLastDeltaFlushProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * @returns {any}
+     */
+    takeLastIvmBridgeProfile() {
+        const ret = wasm.database_takeLastIvmBridgeProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * @returns {any}
+     */
+    takeLastSnapshotFlushProfile() {
+        const ret = wasm.database_takeLastSnapshotFlushProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * @returns {any}
+     */
+    takeLastTraceInitProfile() {
+        const ret = wasm.database_takeLastTraceInitProfile(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
      * Returns the total row count across all tables.
      * @returns {number}
      */
@@ -1105,6 +1152,21 @@ export class JsChangesStream {
         const ret = wasm.jschangesstream_subscribe(this.__wbg_ptr, addHeapObject(callback));
         return takeObject(ret);
     }
+    /**
+     * Subscribes to the changes stream using binary snapshots.
+     *
+     * The callback receives a `BinaryResult` for the full current result set.
+     * It is called immediately with the initial data, and again whenever data changes.
+     * Use `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+     *
+     * Returns an unsubscribe function.
+     * @param {Function} callback
+     * @returns {Function}
+     */
+    subscribeBinary(callback) {
+        const ret = wasm.jschangesstream_subscribeBinary(this.__wbg_ptr, addHeapObject(callback));
+        return takeObject(ret);
+    }
 }
 if (Symbol.dispose) JsChangesStream.prototype[Symbol.dispose] = JsChangesStream.prototype.free;
 
@@ -1341,6 +1403,22 @@ export class JsObservableQuery {
         return takeObject(ret);
     }
     /**
+     * Subscribes to query changes using binary snapshots.
+     *
+     * The callback receives a `BinaryResult` for the complete current result set.
+     * This avoids per-update JS object materialization inside the WASM bridge.
+     * Call `getSchemaLayout()` once and decode with `ResultSet` on the JS side.
+     *
+     * It is called whenever data changes (not immediately - use getResultBinary for initial data).
+     * Returns an unsubscribe function.
+     * @param {Function} callback
+     * @returns {Function}
+     */
+    subscribeBinary(callback) {
+        const ret = wasm.jsobservablequery_subscribeBinary(this.__wbg_ptr, addHeapObject(callback));
+        return takeObject(ret);
+    }
+    /**
      * Returns the number of active subscriptions.
      * @returns {number}
      */
@@ -1567,15 +1645,15 @@ export class JsTableBuilder {
     /**
      * Adds a JSONB index for specific paths.
      * @param {string} column
-     * @param {any} _paths
+     * @param {any} paths
      * @returns {JsTableBuilder}
      */
-    jsonbIndex(column, _paths) {
+    jsonbIndex(column, paths) {
         try {
             const ptr = this.__destroy_into_raw();
             const ptr0 = passStringToWasm0(column, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len0 = WASM_VECTOR_LEN;
-            const ret = wasm.jstablebuilder_jsonbIndex(ptr, ptr0, len0, addBorrowedObject(_paths));
+            const ret = wasm.jstablebuilder_jsonbIndex(ptr, ptr0, len0, addBorrowedObject(paths));
             return JsTableBuilder.__wrap(ret);
         } finally {
             heap[stack_pointer++] = undefined;
@@ -2633,6 +2711,10 @@ function __wbg_get_imports() {
         __wbg__wbg_cb_unref_d9b87ff7982e3b21: function(arg0) {
             getObject(arg0)._wbg_cb_unref();
         },
+        __wbg_apply_ada2ee1a60ac7b3c: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = getObject(arg0).apply(getObject(arg1), getObject(arg2));
+            return addHeapObject(ret);
+        }, arguments); },
         __wbg_binaryresult_new: function(arg0) {
             const ret = BinaryResult.__wrap(arg0);
             return addHeapObject(ret);
@@ -2744,7 +2826,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_6953(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_9185(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -2778,6 +2860,10 @@ function __wbg_get_imports() {
         __wbg_new_with_length_a2c39cbe88fd8ff1: function(arg0) {
             const ret = new Uint8Array(arg0 >>> 0);
             return addHeapObject(ret);
+        },
+        __wbg_now_a3af9a2f4bbaa4d1: function() {
+            const ret = Date.now();
+            return ret;
         },
         __wbg_ownKeys_c7100fb5fa376c6f: function() { return handleError(function (arg0) {
             const ret = Reflect.ownKeys(getObject(arg0));
@@ -2815,6 +2901,10 @@ function __wbg_get_imports() {
         __wbg_set_f43e577aea94465b: function(arg0, arg1, arg2) {
             getObject(arg0)[arg1 >>> 0] = takeObject(arg2);
         },
+        __wbg_slice_78ac081c3e25cc60: function(arg0, arg1, arg2) {
+            const ret = getObject(arg0).slice(arg1 >>> 0, arg2 >>> 0);
+            return addHeapObject(ret);
+        },
         __wbg_static_accessor_GLOBAL_12837167ad935116: function() {
             const ret = typeof global === 'undefined' ? null : global;
             return isLikeNone(ret) ? 0 : addHeapObject(ret);
@@ -2845,12 +2935,12 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [], shim_idx: 2, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_67, __wasm_bindgen_func_elem_1049);
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_90, __wasm_bindgen_func_elem_1563);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 243, function: Function { arguments: [Externref], shim_idx: 244, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_2513, __wasm_bindgen_func_elem_2520);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 294, function: Function { arguments: [Externref], shim_idx: 295, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_3723, __wasm_bindgen_func_elem_3730);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000003: function(arg0) {
@@ -2881,16 +2971,16 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1049(arg0, arg1) {
-    wasm.__wasm_bindgen_func_elem_1049(arg0, arg1);
+function __wasm_bindgen_func_elem_1563(arg0, arg1) {
+    wasm.__wasm_bindgen_func_elem_1563(arg0, arg1);
 }
 
-function __wasm_bindgen_func_elem_2520(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_2520(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_3730(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_3730(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_6953(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_6953(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_9185(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_9185(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const BinaryResultFinalization = (typeof FinalizationRegistry === 'undefined')

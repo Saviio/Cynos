@@ -12,19 +12,21 @@
 //! Otherwise, falls back to re-query.
 
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
-use crate::convert::{gql_response_to_js, row_to_js, value_to_js};
+use crate::live_runtime::{
+    RowsSnapshotDependencyGraph, RowsSnapshotPartialRefreshState, RowsSnapshotRootSubsetPlan,
+};
+use crate::profiling::{now_ms, SnapshotQueryProfile, SnapshotRefreshMode};
 use crate::query_engine::{
-    execute_compiled_physical_plan_with_summary, CompiledPhysicalPlan, QueryResultSummary,
+    execute_compiled_physical_plan_on_table_subset, execute_compiled_physical_plan_with_summary,
+    CompiledPhysicalPlan, QueryResultSummary,
 };
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use cynos_core::schema::Table;
-use cynos_core::{Row, Value};
-use cynos_incremental::{DataflowNode, Delta, MaterializedView, TableId};
-use cynos_reactive::ObservableQuery;
+use cynos_core::Row;
+use cynos_incremental::{Delta, TableId};
 use cynos_storage::TableCache;
 use hashbrown::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
@@ -62,199 +64,36 @@ fn query_results_equal(
     })
 }
 
-#[derive(Default)]
-struct GraphqlSubscribers {
-    callbacks: Vec<(usize, Box<dyn Fn(&cynos_gql::GraphqlResponse) + 'static>)>,
-    keepalive_ids: HashSet<usize>,
-    next_sub_id: usize,
+fn encode_rc_rows_to_binary(rows: &[Rc<Row>], binary_layout: &SchemaLayout) -> BinaryResult {
+    encode_rc_rows_iter_to_binary(rows.iter(), rows.len(), binary_layout)
 }
 
-impl GraphqlSubscribers {
-    fn add_keepalive(&mut self) -> usize {
-        let id = self.next_sub_id;
-        self.next_sub_id += 1;
-        self.keepalive_ids.insert(id);
-        id
-    }
-
-    fn add_callback<F>(&mut self, callback: F) -> usize
-    where
-        F: Fn(&cynos_gql::GraphqlResponse) + 'static,
-    {
-        let id = self.next_sub_id;
-        self.next_sub_id += 1;
-        self.callbacks.push((id, Box::new(callback)));
-        id
-    }
-
-    fn remove(&mut self, id: usize) -> bool {
-        if self.keepalive_ids.remove(&id) {
-            return true;
-        }
-
-        let len_before = self.callbacks.len();
-        self.callbacks.retain(|(sub_id, _)| *sub_id != id);
-        self.callbacks.len() < len_before
-    }
-
-    fn total_count(&self) -> usize {
-        self.keepalive_ids.len() + self.callbacks.len()
-    }
-
-    fn callback_count(&self) -> usize {
-        self.callbacks.len()
-    }
-
-    fn emit(&self, response: &cynos_gql::GraphqlResponse) {
-        for (_, callback) in &self.callbacks {
-            callback(response);
-        }
-    }
+fn encode_rc_rows_iter_to_binary<'a, I>(
+    rows: I,
+    row_count: usize,
+    binary_layout: &SchemaLayout,
+) -> BinaryResult
+where
+    I: IntoIterator<Item = &'a Rc<Row>>,
+{
+    let mut encoder = BinaryEncoder::new(binary_layout.clone(), row_count);
+    encoder.encode_rows_iter(rows);
+    BinaryResult::new(encoder.finish())
 }
 
-fn build_graphql_response(
-    cache: &TableCache,
-    catalog: &cynos_gql::GraphqlCatalog,
-    field: &cynos_gql::bind::BoundRootField,
-    rows: &[Rc<Row>],
-) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
-    let root_field = cynos_gql::execute::render_root_field_rows(cache, catalog, field, rows)?;
-    Ok(cynos_gql::GraphqlResponse::new(
-        cynos_gql::ResponseValue::object(alloc::vec![root_field]),
-    ))
+fn binary_result_to_js_value(result: BinaryResult) -> JsValue {
+    result.into()
 }
 
-fn build_graphql_response_batched(
-    cache: &TableCache,
-    catalog: &cynos_gql::GraphqlCatalog,
-    field: &cynos_gql::bind::BoundRootField,
-    plan: &cynos_gql::GraphqlBatchPlan,
-    state: &mut cynos_gql::GraphqlBatchState,
-    rows: &[Rc<Row>],
-) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
-    cynos_gql::batch_render::render_graphql_response(cache, catalog, field, plan, state, rows)
-}
+mod snapshot_refresh;
 
-fn build_graphql_response_from_owned_rows(
-    cache: &TableCache,
-    catalog: &cynos_gql::GraphqlCatalog,
-    field: &cynos_gql::bind::BoundRootField,
-    rows: &[Row],
-) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
-    let rows: Vec<Rc<Row>> = rows.iter().cloned().map(Rc::new).collect();
-    build_graphql_response(cache, catalog, field, &rows)
-}
+use snapshot_refresh::{
+    build_partial_refresh_candidate_rows, collect_join_values_by_row_ids_and_deltas,
+    compare_partial_refresh_rows, insert_row_ids_by_column_values, slice_partial_visible_rows,
+    PartialRefreshCandidateRow, RootSubsetRefreshRuntime, SnapshotPartialRefreshRuntime,
+};
 
-fn build_graphql_response_from_owned_rows_batched(
-    cache: &TableCache,
-    catalog: &cynos_gql::GraphqlCatalog,
-    field: &cynos_gql::bind::BoundRootField,
-    plan: &cynos_gql::GraphqlBatchPlan,
-    state: &mut cynos_gql::GraphqlBatchState,
-    rows: &[Row],
-) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
-    let rows: Vec<Rc<Row>> = rows.iter().cloned().map(Rc::new).collect();
-    build_graphql_response_batched(cache, catalog, field, plan, state, &rows)
-}
-
-fn root_field_has_relations(field: &cynos_gql::bind::BoundRootField) -> bool {
-    match &field.kind {
-        cynos_gql::bind::BoundRootFieldKind::Typename => false,
-        cynos_gql::bind::BoundRootFieldKind::Collection { selection, .. }
-        | cynos_gql::bind::BoundRootFieldKind::ByPk { selection, .. }
-        | cynos_gql::bind::BoundRootFieldKind::Insert { selection, .. }
-        | cynos_gql::bind::BoundRootFieldKind::Update { selection, .. }
-        | cynos_gql::bind::BoundRootFieldKind::Delete { selection, .. } => {
-            selection_has_relations(selection)
-        }
-    }
-}
-
-fn selection_has_relations(selection: &cynos_gql::bind::BoundSelectionSet) -> bool {
-    selection.fields.iter().any(field_has_relations)
-}
-
-fn field_has_relations(field: &cynos_gql::bind::BoundField) -> bool {
-    matches!(
-        field,
-        cynos_gql::bind::BoundField::ForwardRelation { .. }
-            | cynos_gql::bind::BoundField::ReverseRelation { .. }
-    )
-}
-
-fn build_snapshot_batch_invalidation(
-    table_names: &HashMap<TableId, String>,
-    changes: &HashMap<TableId, HashSet<u64>>,
-    root_changed: bool,
-) -> Result<cynos_gql::GraphqlInvalidation, ()> {
-    let mut changed_tables = Vec::with_capacity(changes.len());
-    let mut dirty_table_rows = HashMap::new();
-    for table_id in changes.keys() {
-        let Some(table_name) = table_names.get(table_id) else {
-            return Err(());
-        };
-        changed_tables.push(table_name.clone());
-        if let Some(changed_ids) = changes.get(table_id) {
-            dirty_table_rows.insert(table_name.clone(), changed_ids.clone());
-        }
-    }
-
-    Ok(cynos_gql::GraphqlInvalidation {
-        root_changed,
-        changed_tables,
-        dirty_edge_keys: HashMap::new(),
-        dirty_table_rows,
-    })
-}
-
-fn build_delta_batch_invalidation(
-    plan: &cynos_gql::GraphqlBatchPlan,
-    table_names: &HashMap<TableId, String>,
-    table_id: TableId,
-    deltas: &[Delta<Row>],
-    root_changed: bool,
-) -> Result<cynos_gql::GraphqlInvalidation, ()> {
-    let Some(table_name) = table_names.get(&table_id) else {
-        return Err(());
-    };
-    let dirty_row_ids: HashSet<u64> = deltas.iter().map(|delta| delta.data.id()).collect();
-
-    let mut invalidation = cynos_gql::GraphqlInvalidation {
-        root_changed,
-        changed_tables: alloc::vec![table_name.clone()],
-        dirty_edge_keys: HashMap::new(),
-        dirty_table_rows: HashMap::from([(table_name.clone(), dirty_row_ids)]),
-    };
-
-    for edge_id in plan.edges_for_table(table_name) {
-        let edge = plan.edge(*edge_id);
-        let key_column_index = match edge.kind {
-            cynos_gql::render_plan::RelationEdgeKind::Forward => edge.relation.parent_column_index,
-            cynos_gql::render_plan::RelationEdgeKind::Reverse => edge.relation.child_column_index,
-        };
-
-        let mut dirty_keys = HashSet::<Value>::new();
-        for delta in deltas {
-            let Some(value) = delta.data.get(key_column_index).cloned() else {
-                continue;
-            };
-            if value.is_null() {
-                continue;
-            }
-            dirty_keys.insert(value);
-        }
-
-        if !dirty_keys.is_empty() {
-            invalidation.dirty_edge_keys.insert(*edge_id, dirty_keys);
-        }
-    }
-
-    Ok(invalidation)
-}
-
-fn graphql_response_to_js_value(response: &cynos_gql::GraphqlResponse) -> JsValue {
-    gql_response_to_js(response).unwrap_or(JsValue::NULL)
-}
+mod graphql_payload;
 
 /// A re-query based observable that re-executes the query on each change.
 /// This leverages the query optimizer and indexes for optimal performance.
@@ -266,10 +105,16 @@ pub struct ReQueryObservable {
     compiled_plan: CompiledPhysicalPlan,
     /// Reference to the table cache
     cache: Rc<RefCell<TableCache>>,
+    /// Table ID -> table name bindings for dependency-aware invalidation.
+    dependency_table_names: HashMap<TableId, String>,
     /// Current result set
     result: Vec<Rc<Row>>,
     /// Summary of the current result set for fast equality checks
     result_summary: QueryResultSummary,
+    /// Optional runtime state for candidate-window partial requery.
+    partial_refresh: Option<SnapshotPartialRefreshRuntime>,
+    /// Optional runtime state for root-subset requery on no-blocking snapshot queries.
+    root_subset_refresh: Option<RootSubsetRefreshRuntime>,
     /// Subscription callbacks
     subscriptions: Vec<(usize, Box<dyn Fn(&[Rc<Row>]) + 'static>)>,
     /// Next subscription ID
@@ -282,23 +127,47 @@ impl ReQueryObservable {
         compiled_plan: CompiledPhysicalPlan,
         cache: Rc<RefCell<TableCache>>,
         initial_result: Vec<Rc<Row>>,
+        dependency_table_bindings: Vec<(TableId, String)>,
     ) -> Self {
         let result_summary = QueryResultSummary::from_rows(&initial_result);
-        Self::new_with_summary(compiled_plan, cache, initial_result, result_summary)
+        Self::new_with_summary(
+            compiled_plan,
+            cache,
+            initial_result,
+            result_summary,
+            dependency_table_bindings,
+            None,
+            None,
+        )
     }
 
     #[doc(hidden)]
-    pub fn new_with_summary(
+    pub(crate) fn new_with_summary(
         compiled_plan: CompiledPhysicalPlan,
         cache: Rc<RefCell<TableCache>>,
         initial_result: Vec<Rc<Row>>,
         result_summary: QueryResultSummary,
+        dependency_table_bindings: Vec<(TableId, String)>,
+        partial_refresh: Option<RowsSnapshotPartialRefreshState>,
+        root_subset_refresh: Option<RowsSnapshotRootSubsetPlan>,
     ) -> Self {
+        let (partial_refresh, root_subset_refresh) = {
+            let cache_ref = cache.borrow();
+            let partial_refresh =
+                partial_refresh.map(|state| SnapshotPartialRefreshRuntime::new(&cache_ref, state));
+            let root_subset_refresh = root_subset_refresh.and_then(|metadata| {
+                RootSubsetRefreshRuntime::new(&cache_ref, metadata, &initial_result)
+            });
+            (partial_refresh, root_subset_refresh)
+        };
         Self {
             compiled_plan,
             cache,
+            dependency_table_names: dependency_table_bindings.into_iter().collect(),
             result: initial_result,
             result_summary,
+            partial_refresh,
+            root_subset_refresh,
             subscriptions: Vec::new(),
             next_sub_id: 0,
         }
@@ -343,1061 +212,486 @@ impl ReQueryObservable {
     /// Only notifies subscribers if the result actually changed.
     /// Skips re-query entirely if there are no subscribers.
     ///
-    /// `changed_ids` contains the row IDs that were modified.
-    /// For simple single-table pipelines this enables a row-local fast path;
-    /// all other plans fall back to deterministic full-result comparison.
-    pub fn on_change(&mut self, changed_ids: &HashSet<u64>) {
+    /// `changes` contains row IDs grouped by the table that changed.
+    /// For simple single-table pipelines this enables a row-local fast path
+    /// only when the underlying patch table changed; all other plans fall back
+    /// to deterministic full-result comparison.
+    pub fn on_change(&mut self, changes: &HashMap<TableId, HashSet<u64>>) {
+        let _ = self.on_change_profiled_inner(changes, None);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn on_change_profiled(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+    ) -> SnapshotQueryProfile {
+        self.on_change_profiled_inner(changes, None)
+    }
+
+    pub(crate) fn on_change_with_deltas_profiled(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: &HashMap<TableId, Vec<Delta<Row>>>,
+    ) -> SnapshotQueryProfile {
+        self.on_change_profiled_inner(changes, Some(delta_changes))
+    }
+
+    fn on_change_profiled_inner(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
+    ) -> SnapshotQueryProfile {
+        let started_at = now_ms();
+        let mut profile = SnapshotQueryProfile::default();
+
         // Skip re-query if no subscribers - major optimization for unused observables
         if self.subscriptions.is_empty() {
-            return;
+            return profile;
         }
 
-        if let Some(changed_rows) =
-            collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
-        {
-            match self
-                .compiled_plan
-                .apply_reactive_patch(&mut self.result, &changed_rows)
+        if let Some(changed_ids) = self.patch_table_changed_ids(changes) {
+            if let Some(changed_rows) =
+                collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
             {
-                Some(true) => {
-                    self.result_summary = QueryResultSummary::from_rows(&self.result);
-                    for (_, callback) in &self.subscriptions {
-                        callback(&self.result);
+                profile.reactive_patch_attempted = true;
+                let patch_started_at = now_ms();
+                match self
+                    .compiled_plan
+                    .apply_reactive_patch(&mut self.result, &changed_rows)
+                {
+                    Some(true) => {
+                        profile.reactive_patch_hit = true;
+                        profile.reactive_patch_ms = now_ms() - patch_started_at;
+                        self.result_summary = QueryResultSummary::from_rows(&self.result);
+                        let callback_started_at = now_ms();
+                        for (_, callback) in &self.subscriptions {
+                            callback(&self.result);
+                        }
+                        profile.callback_ms += now_ms() - callback_started_at;
+                        profile.total_ms = now_ms() - started_at;
+                        return profile;
                     }
-                    return;
+                    Some(false) => {
+                        profile.reactive_patch_ms = now_ms() - patch_started_at;
+                        profile.total_ms = now_ms() - started_at;
+                        return profile;
+                    }
+                    None => {}
                 }
-                Some(false) => return,
-                None => {}
+                profile.reactive_patch_ms = now_ms() - patch_started_at;
             }
         }
 
-        // Re-execute the cached compiled plan (no optimization or lowering overhead)
-        let cache = self.cache.borrow();
+        if let Some(changed) =
+            self.try_partial_refresh_profiled(changes, delta_changes, &mut profile)
+        {
+            if changed {
+                let callback_started_at = now_ms();
+                for (_, callback) in &self.subscriptions {
+                    callback(&self.result);
+                }
+                profile.callback_ms += now_ms() - callback_started_at;
+            }
+            profile.total_ms = now_ms() - started_at;
+            return profile;
+        }
 
-        match execute_compiled_physical_plan_with_summary(&cache, &self.compiled_plan) {
+        if let Some(changed) =
+            self.try_root_subset_refresh_profiled(changes, delta_changes, &mut profile)
+        {
+            if changed {
+                let callback_started_at = now_ms();
+                for (_, callback) in &self.subscriptions {
+                    callback(&self.result);
+                }
+                profile.callback_ms += now_ms() - callback_started_at;
+            }
+            profile.total_ms = now_ms() - started_at;
+            return profile;
+        }
+
+        // Re-execute the cached compiled plan (no optimization or lowering overhead)
+        profile.refresh_mode = SnapshotRefreshMode::FullRequery;
+        let full_requery_started_at = now_ms();
+        let output = {
+            let cache = self.cache.borrow();
+            execute_compiled_physical_plan_with_summary(&cache, &self.compiled_plan)
+        };
+        profile.full_requery_ms = now_ms() - full_requery_started_at;
+
+        match output {
             Ok(output) => {
-                // Only notify if result changed
-                if !query_results_equal(
-                    &self.result_summary,
-                    &output.summary,
-                    &self.result,
-                    &output.rows,
+                if self.apply_full_requery_output_profiled(
+                    output.rows,
+                    output.summary,
+                    &mut profile.full_requery_compare_ms,
                 ) {
-                    self.result = output.rows;
-                    self.result_summary = output.summary;
                     // Notify all subscribers
+                    let callback_started_at = now_ms();
                     for (_, callback) in &self.subscriptions {
                         callback(&self.result);
                     }
+                    profile.callback_ms += now_ms() - callback_started_at;
                 }
             }
             Err(_) => {
                 // Query execution failed, keep old result
             }
         }
+
+        profile.total_ms = now_ms() - started_at;
+        profile
     }
-}
 
-pub struct GraphqlSubscriptionObservable {
-    compiled_plan: CompiledPhysicalPlan,
-    cache: Rc<RefCell<TableCache>>,
-    catalog: cynos_gql::GraphqlCatalog,
-    field: cynos_gql::bind::BoundRootField,
-    batch_plan: Option<cynos_gql::GraphqlBatchPlan>,
-    batch_state: cynos_gql::GraphqlBatchState,
-    dependency_table_names: HashMap<TableId, String>,
-    root_table_ids: HashSet<TableId>,
-    root_rows: Vec<Rc<Row>>,
-    root_summary: QueryResultSummary,
-    response: Option<cynos_gql::GraphqlResponse>,
-    response_dirty: bool,
-    subscribers: GraphqlSubscribers,
-}
+    fn patch_table_changed_ids<'a>(
+        &self,
+        changes: &'a HashMap<TableId, HashSet<u64>>,
+    ) -> Option<&'a HashSet<u64>> {
+        let patch_table = self.compiled_plan.reactive_patch_table()?;
+        if changes.len() != 1 {
+            return None;
+        }
 
-impl GraphqlSubscriptionObservable {
-    pub fn new(
-        compiled_plan: CompiledPhysicalPlan,
-        cache: Rc<RefCell<TableCache>>,
-        catalog: cynos_gql::GraphqlCatalog,
-        field: cynos_gql::bind::BoundRootField,
-        dependency_table_bindings: Vec<(TableId, String)>,
-        root_table_ids: HashSet<TableId>,
-        initial_rows: Vec<Rc<Row>>,
-        initial_summary: QueryResultSummary,
-    ) -> Self {
-        Self {
-            compiled_plan,
-            cache,
-            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
-                .ok()
-                .filter(|plan| plan.has_relations()),
-            batch_state: cynos_gql::GraphqlBatchState::default(),
-            dependency_table_names: dependency_table_bindings.into_iter().collect(),
-            catalog,
-            field,
-            root_table_ids,
-            root_rows: initial_rows,
-            root_summary: initial_summary,
-            response: None,
-            response_dirty: true,
-            subscribers: GraphqlSubscribers::default(),
+        let (&table_id, changed_ids) = changes.iter().next()?;
+        let table_name = self.dependency_table_names.get(&table_id)?;
+        if table_name == patch_table {
+            Some(changed_ids)
+        } else {
+            None
         }
     }
 
-    pub fn attach_keepalive(&mut self) -> usize {
-        self.subscribers.add_keepalive()
-    }
-
-    pub fn response_js_value(&mut self) -> JsValue {
-        if self.response.is_some() && !self.response_dirty {
-            return graphql_response_to_js_value(self.response.as_ref().unwrap());
-        }
-
-        if self.subscribers.callback_count() == 0 {
-            return self.render_response_js_value();
-        }
-
-        match self.current_response() {
-            Some(response) => graphql_response_to_js_value(response),
-            None => JsValue::NULL,
-        }
-    }
-
-    pub fn subscribe<F: Fn(&cynos_gql::GraphqlResponse) + 'static>(
+    fn apply_full_requery_output_profiled(
         &mut self,
-        callback: F,
-    ) -> usize {
-        self.subscribers.add_callback(callback)
-    }
-
-    pub fn unsubscribe(&mut self, id: usize) -> bool {
-        self.subscribers.remove(id)
-    }
-
-    pub fn subscription_count(&self) -> usize {
-        self.subscribers.total_count()
-    }
-
-    pub fn listener_count(&self) -> usize {
-        self.subscribers.callback_count()
-    }
-
-    pub fn on_change(&mut self, changes: &HashMap<TableId, HashSet<u64>>) {
-        if self.subscribers.total_count() == 0 {
-            return;
-        }
-
-        let mut root_changed_ids = HashSet::new();
-        let mut saw_nested_change = false;
-        for (table_id, changed_ids) in changes {
-            if self.root_table_ids.contains(table_id) {
-                root_changed_ids.extend(changed_ids.iter().copied());
-            } else {
-                saw_nested_change = true;
-            }
-        }
-
-        let mut root_changed = false;
-        if !root_changed_ids.is_empty() {
-            root_changed = match self.refresh_root_rows(&root_changed_ids) {
-                Some(changed) => changed,
-                None => return,
-            };
-        }
-
-        if !root_changed && !saw_nested_change {
-            return;
-        }
-
-        if let Some(plan) = self.batch_plan.as_ref() {
-            match build_snapshot_batch_invalidation(
-                &self.dependency_table_names,
-                changes,
-                root_changed,
-            ) {
-                Ok(invalidation) => self.batch_state.apply_invalidation(plan, &invalidation),
-                Err(()) => {
-                    self.batch_state = cynos_gql::GraphqlBatchState::default();
-                }
-            }
-        }
-        self.response_dirty = true;
-        if self.subscribers.callback_count() == 0 {
-            return;
-        }
-
-        if let Some(changed) = self.materialize_response_if_dirty() {
-            if changed {
-                if let Some(response) = self.response.as_ref() {
-                    self.subscribers.emit(response);
-                }
-            }
-        }
-    }
-
-    fn refresh_root_rows(&mut self, changed_ids: &HashSet<u64>) -> Option<bool> {
-        if let Some(changed_rows) =
-            collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
+        rows: Vec<Rc<Row>>,
+        summary: QueryResultSummary,
+        compare_ms: &mut f64,
+    ) -> bool {
+        if let Some(metadata) = self
+            .partial_refresh
+            .as_ref()
+            .map(|partial_refresh| partial_refresh.metadata.clone())
         {
-            match self
-                .compiled_plan
-                .apply_reactive_patch(&mut self.root_rows, &changed_rows)
-            {
-                Some(true) => {
-                    self.root_summary = QueryResultSummary::from_rows(&self.root_rows);
-                    return Some(true);
-                }
-                Some(false) => return Some(false),
-                None => {}
+            let candidate_rows = {
+                let cache = self.cache.borrow();
+                build_partial_refresh_candidate_rows(&cache, &metadata, &rows)
+            };
+            let Some(candidate_rows) = candidate_rows else {
+                return false;
+            };
+            let visible_rows = slice_partial_visible_rows(&candidate_rows, &metadata);
+            let visible_summary = QueryResultSummary::from_rows(&visible_rows);
+            let compare_started_at = now_ms();
+            let changed = !query_results_equal(
+                &self.result_summary,
+                &visible_summary,
+                &self.result,
+                &visible_rows,
+            );
+            *compare_ms += now_ms() - compare_started_at;
+
+            if let Some(partial_refresh) = &mut self.partial_refresh {
+                partial_refresh.candidate_rows = candidate_rows;
             }
+            self.result = visible_rows;
+            self.result_summary = visible_summary;
+            return changed;
         }
 
-        let cache = self.cache.borrow();
-        let output =
-            execute_compiled_physical_plan_with_summary(&cache, &self.compiled_plan).ok()?;
-        if query_results_equal(
-            &self.root_summary,
-            &output.summary,
-            &self.root_rows,
-            &output.rows,
-        ) {
-            return Some(false);
+        let compare_started_at = now_ms();
+        if query_results_equal(&self.result_summary, &summary, &self.result, &rows) {
+            *compare_ms += now_ms() - compare_started_at;
+            return false;
         }
+        *compare_ms += now_ms() - compare_started_at;
 
-        self.root_rows = output.rows;
-        self.root_summary = output.summary;
-        Some(true)
+        self.result = rows;
+        self.result_summary = summary;
+        true
     }
 
-    fn materialize_response_if_dirty(&mut self) -> Option<bool> {
-        if !self.response_dirty && self.response.is_some() {
-            return Some(false);
-        }
-
-        let cache = self.cache.borrow();
-        let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_batched(
-                &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &self.root_rows,
-            )
-            .ok()?,
-            None => {
-                build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows).ok()?
-            }
-        };
-        let changed = self
-            .response
-            .as_ref()
-            .map_or(true, |current| *current != response);
-        if changed {
-            self.response = Some(response);
-        }
-        self.response_dirty = false;
-        Some(changed)
-    }
-
-    fn current_response(&mut self) -> Option<&cynos_gql::GraphqlResponse> {
-        self.materialize_response_if_dirty()?;
-        self.response.as_ref()
-    }
-
-    fn render_response_js_value(&mut self) -> JsValue {
-        let cache = self.cache.borrow();
-        let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_batched(
-                &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &self.root_rows,
-            ),
-            None => build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows),
-        };
-        match response {
-            Ok(response) => graphql_response_to_js_value(&response),
-            Err(_) => JsValue::NULL,
-        }
-    }
-}
-
-pub struct GraphqlDeltaObservable {
-    view: MaterializedView,
-    cache: Rc<RefCell<TableCache>>,
-    catalog: cynos_gql::GraphqlCatalog,
-    field: cynos_gql::bind::BoundRootField,
-    batch_plan: Option<cynos_gql::GraphqlBatchPlan>,
-    batch_state: cynos_gql::GraphqlBatchState,
-    dependency_table_names: HashMap<TableId, String>,
-    has_nested_relations: bool,
-    response: Option<cynos_gql::GraphqlResponse>,
-    response_dirty: bool,
-    subscribers: GraphqlSubscribers,
-}
-
-impl GraphqlDeltaObservable {
-    pub fn new(
-        dataflow: DataflowNode,
-        cache: Rc<RefCell<TableCache>>,
-        catalog: cynos_gql::GraphqlCatalog,
-        field: cynos_gql::bind::BoundRootField,
-        dependency_table_bindings: Vec<(TableId, String)>,
-        initial_rows: Vec<Row>,
-    ) -> Self {
-        Self {
-            view: MaterializedView::with_initial(dataflow, initial_rows),
-            cache,
-            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
-                .ok()
-                .filter(|plan| plan.has_relations()),
-            batch_state: cynos_gql::GraphqlBatchState::default(),
-            dependency_table_names: dependency_table_bindings.into_iter().collect(),
-            catalog,
-            has_nested_relations: root_field_has_relations(&field),
-            field,
-            response: None,
-            response_dirty: true,
-            subscribers: GraphqlSubscribers::default(),
-        }
-    }
-
-    pub fn attach_keepalive(&mut self) -> usize {
-        self.subscribers.add_keepalive()
-    }
-
-    pub fn response_js_value(&mut self) -> JsValue {
-        if self.response.is_some() && !self.response_dirty {
-            return graphql_response_to_js_value(self.response.as_ref().unwrap());
-        }
-
-        if self.subscribers.callback_count() == 0 {
-            return self.render_response_js_value();
-        }
-
-        match self.current_response() {
-            Some(response) => graphql_response_to_js_value(response),
-            None => JsValue::NULL,
-        }
-    }
-
-    pub fn dependencies(&self) -> &[TableId] {
-        self.view.dependencies()
-    }
-
-    pub fn subscribe<F: Fn(&cynos_gql::GraphqlResponse) + 'static>(
+    fn try_partial_refresh_profiled(
         &mut self,
-        callback: F,
-    ) -> usize {
-        self.subscribers.add_callback(callback)
-    }
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
+        profile: &mut SnapshotQueryProfile,
+    ) -> Option<bool> {
+        profile.partial_refresh_attempted = self.partial_refresh.is_some();
+        let collect_started_at = now_ms();
+        let (affected_root_ids, affected_candidate_rows, partial_metadata) = {
+            let partial_refresh = self.partial_refresh.as_ref()?;
+            let affected_root_ids = Self::collect_affected_root_row_ids(
+                &self.cache,
+                changes,
+                delta_changes,
+                &partial_refresh.metadata.dependency_graph,
+            )?;
+            if affected_root_ids.is_empty() {
+                return Some(false);
+            }
 
-    pub fn unsubscribe(&mut self, id: usize) -> bool {
-        self.subscribers.remove(id)
-    }
-
-    pub fn subscription_count(&self) -> usize {
-        self.subscribers.total_count()
-    }
-
-    pub fn listener_count(&self) -> usize {
-        self.subscribers.callback_count()
-    }
-
-    pub fn on_table_change(&mut self, table_id: TableId, deltas: Vec<Delta<Row>>) {
-        if self.subscribers.total_count() == 0 {
-            return;
-        }
-
-        let batch_invalidation = self.batch_plan.as_ref().map(|plan| {
-            build_delta_batch_invalidation(
-                plan,
-                &self.dependency_table_names,
-                table_id,
-                &deltas,
-                false,
+            let affected_candidate_rows = partial_refresh
+                .candidate_rows
+                .iter()
+                .filter(|entry| affected_root_ids.contains(&entry.root_row_id))
+                .count();
+            (
+                affected_root_ids,
+                affected_candidate_rows,
+                partial_refresh.metadata.clone(),
             )
-        });
-        let output_deltas = self.view.on_table_change(table_id, deltas);
-        if output_deltas.is_empty() && !self.has_nested_relations {
-            return;
-        }
-
-        if let Some(plan) = self.batch_plan.as_ref() {
-            match batch_invalidation {
-                Some(Ok(mut invalidation)) => {
-                    invalidation.root_changed = !output_deltas.is_empty();
-                    self.batch_state.apply_invalidation(plan, &invalidation);
-                }
-                Some(Err(())) => {
-                    self.batch_state = cynos_gql::GraphqlBatchState::default();
-                }
-                None => {}
-            }
-        }
-        self.response_dirty = true;
-        if self.subscribers.callback_count() == 0 {
-            return;
-        }
-
-        if let Some(changed) = self.materialize_response_if_dirty() {
-            if changed {
-                if let Some(response) = self.response.as_ref() {
-                    self.subscribers.emit(response);
-                }
-            }
-        }
-    }
-
-    fn materialize_response_if_dirty(&mut self) -> Option<bool> {
-        if !self.response_dirty && self.response.is_some() {
-            return Some(false);
-        }
-
-        let rows = self.view.result();
-        let cache = self.cache.borrow();
-        let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_from_owned_rows_batched(
-                &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &rows,
-            )
-            .ok()?,
-            None => {
-                build_graphql_response_from_owned_rows(&cache, &self.catalog, &self.field, &rows)
-                    .ok()?
-            }
         };
-        let changed = self
-            .response
-            .as_ref()
-            .map_or(true, |current| *current != response);
-        if changed {
-            self.response = Some(response);
+        profile.partial_refresh_collect_ms += now_ms() - collect_started_at;
+        if affected_candidate_rows > partial_metadata.overscan {
+            return None;
         }
-        self.response_dirty = false;
+
+        let requery_started_at = now_ms();
+        let recomputed_rows = {
+            let cache = self.cache.borrow();
+            let rows = execute_compiled_physical_plan_on_table_subset(
+                &cache,
+                &self.compiled_plan,
+                &partial_metadata.root_table,
+                &affected_root_ids,
+            )
+            .ok()?;
+            build_partial_refresh_candidate_rows(&cache, &partial_metadata, &rows)?
+        };
+        profile.partial_refresh_requery_ms += now_ms() - requery_started_at;
+
+        let apply_started_at = now_ms();
+        let mut merged_rows: Vec<PartialRefreshCandidateRow> = {
+            let current_candidate_rows = &self.partial_refresh.as_ref()?.candidate_rows;
+            current_candidate_rows
+                .iter()
+                .filter(|entry| !affected_root_ids.contains(&entry.root_row_id))
+                .cloned()
+                .chain(recomputed_rows.into_iter())
+                .collect()
+        };
+        merged_rows.sort_by(|left, right| {
+            compare_partial_refresh_rows(left, right, &partial_metadata.order_keys)
+        });
+        merged_rows.truncate(partial_metadata.candidate_limit);
+        let min_shadow_window = partial_metadata
+            .visible_offset
+            .saturating_add(partial_metadata.visible_limit)
+            .saturating_add(partial_metadata.overscan);
+        let current_candidate_len = self.partial_refresh.as_ref()?.candidate_rows.len();
+        if merged_rows.len() < min_shadow_window && current_candidate_len >= min_shadow_window {
+            return None;
+        }
+
+        let visible_rows = slice_partial_visible_rows(&merged_rows, &partial_metadata);
+        let visible_summary = QueryResultSummary::from_rows(&visible_rows);
+        let compare_started_at = now_ms();
+        let changed = !query_results_equal(
+            &self.result_summary,
+            &visible_summary,
+            &self.result,
+            &visible_rows,
+        );
+        profile.partial_refresh_compare_ms += now_ms() - compare_started_at;
+
+        if let Some(partial_refresh) = &mut self.partial_refresh {
+            partial_refresh.candidate_rows = merged_rows;
+        }
+        self.result = visible_rows;
+        self.result_summary = visible_summary;
+        profile.partial_refresh_hit = true;
+        profile.refresh_mode = SnapshotRefreshMode::CandidateWindowPartialRefresh;
+        profile.partial_refresh_apply_ms += now_ms() - apply_started_at;
         Some(changed)
     }
 
-    fn current_response(&mut self) -> Option<&cynos_gql::GraphqlResponse> {
-        self.materialize_response_if_dirty()?;
-        self.response.as_ref()
-    }
+    fn try_root_subset_refresh_profiled(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
+        profile: &mut SnapshotQueryProfile,
+    ) -> Option<bool> {
+        profile.root_subset_attempted = self.root_subset_refresh.is_some();
+        let collect_started_at = now_ms();
+        let (affected_root_ids, affected_root_keys) = {
+            let root_subset_refresh = self.root_subset_refresh.as_mut()?;
+            let affected_root_ids = Self::collect_affected_root_row_ids(
+                &self.cache,
+                changes,
+                delta_changes,
+                &root_subset_refresh.metadata.dependency_graph,
+            )?;
+            if affected_root_ids.is_empty() {
+                return Some(false);
+            }
 
-    fn render_response_js_value(&mut self) -> JsValue {
-        let rows = self.view.result();
-        let cache = self.cache.borrow();
-        let response = match self.batch_plan.as_ref() {
-            Some(plan) => build_graphql_response_from_owned_rows_batched(
+            let cache = self.cache.borrow();
+            let refresh_existing_root_keys =
+                changes.contains_key(&root_subset_refresh.metadata.dependency_graph.root_table_id);
+            let affected_root_keys = root_subset_refresh.collect_affected_root_keys(
                 &cache,
-                &self.catalog,
-                &self.field,
-                plan,
-                &mut self.batch_state,
-                &rows,
-            ),
-            None => {
-                build_graphql_response_from_owned_rows(&cache, &self.catalog, &self.field, &rows)
-            }
+                &affected_root_ids,
+                refresh_existing_root_keys,
+            )?;
+            (affected_root_ids, affected_root_keys)
         };
-        match response {
-            Ok(response) => graphql_response_to_js_value(&response),
-            Err(_) => JsValue::NULL,
+        profile.root_subset_collect_ms += now_ms() - collect_started_at;
+
+        if affected_root_keys.is_empty() {
+            return Some(false);
         }
-    }
-}
 
-#[derive(Clone)]
-enum GraphqlSubscriptionInner {
-    Snapshot(Rc<RefCell<GraphqlSubscriptionObservable>>),
-    Delta(Rc<RefCell<GraphqlDeltaObservable>>),
-}
-
-impl GraphqlSubscriptionInner {
-    fn attach_keepalive(&self) -> usize {
-        match self {
-            Self::Snapshot(inner) => inner.borrow_mut().attach_keepalive(),
-            Self::Delta(inner) => inner.borrow_mut().attach_keepalive(),
-        }
-    }
-
-    fn response_js_value(&self) -> JsValue {
-        match self {
-            Self::Snapshot(inner) => inner.borrow_mut().response_js_value(),
-            Self::Delta(inner) => inner.borrow_mut().response_js_value(),
-        }
-    }
-
-    fn subscribe<F: Fn(&cynos_gql::GraphqlResponse) + 'static>(&self, callback: F) -> usize {
-        match self {
-            Self::Snapshot(inner) => inner.borrow_mut().subscribe(callback),
-            Self::Delta(inner) => inner.borrow_mut().subscribe(callback),
-        }
-    }
-
-    fn unsubscribe(&self, id: usize) -> bool {
-        match self {
-            Self::Snapshot(inner) => inner.borrow_mut().unsubscribe(id),
-            Self::Delta(inner) => inner.borrow_mut().unsubscribe(id),
-        }
-    }
-
-    fn listener_count(&self) -> usize {
-        match self {
-            Self::Snapshot(inner) => inner.borrow().listener_count(),
-            Self::Delta(inner) => inner.borrow().listener_count(),
-        }
-    }
-}
-
-/// JavaScript-friendly observable query wrapper.
-/// Uses re-query strategy for optimal performance with indexes.
-#[wasm_bindgen]
-pub struct JsObservableQuery {
-    inner: Rc<RefCell<ReQueryObservable>>,
-    schema: Table,
-    /// Optional projected column names. If Some, only these columns are returned.
-    projected_columns: Option<Vec<String>>,
-    /// Pre-computed binary layout for getResultBinary().
-    binary_layout: SchemaLayout,
-    /// Optional aggregate column names. If Some, this is an aggregate query.
-    aggregate_columns: Option<Vec<String>>,
-}
-
-impl JsObservableQuery {
-    pub(crate) fn new(
-        inner: Rc<RefCell<ReQueryObservable>>,
-        schema: Table,
-        binary_layout: SchemaLayout,
-    ) -> Self {
-        Self {
-            inner,
-            schema,
-            projected_columns: None,
-            binary_layout,
-            aggregate_columns: None,
-        }
-    }
-
-    pub(crate) fn new_with_projection(
-        inner: Rc<RefCell<ReQueryObservable>>,
-        schema: Table,
-        projected_columns: Vec<String>,
-        binary_layout: SchemaLayout,
-    ) -> Self {
-        Self {
-            inner,
-            schema,
-            projected_columns: Some(projected_columns),
-            binary_layout,
-            aggregate_columns: None,
-        }
-    }
-
-    /// Get the inner observable for creating JsChangesStream.
-    pub(crate) fn inner(&self) -> Rc<RefCell<ReQueryObservable>> {
-        self.inner.clone()
-    }
-
-    /// Get the schema.
-    pub(crate) fn schema(&self) -> &Table {
-        &self.schema
-    }
-
-    /// Get the projected columns.
-    pub(crate) fn projected_columns(&self) -> Option<&Vec<String>> {
-        self.projected_columns.as_ref()
-    }
-
-    /// Get the aggregate columns.
-    #[allow(dead_code)]
-    pub(crate) fn aggregate_columns(&self) -> Option<&Vec<String>> {
-        self.aggregate_columns.as_ref()
-    }
-}
-
-#[wasm_bindgen]
-impl JsObservableQuery {
-    /// Subscribes to query changes.
-    ///
-    /// The callback receives the complete current result set as a JavaScript array.
-    /// It is called whenever data changes (not immediately - use getResult for initial data).
-    /// Returns an unsubscribe function.
-    pub fn subscribe(&mut self, callback: js_sys::Function) -> js_sys::Function {
-        let schema = self.schema.clone();
-        let projected_columns = self.projected_columns.clone();
-        let aggregate_columns = self.aggregate_columns.clone();
-
-        let sub_id = self.inner.borrow_mut().subscribe(move |rows| {
-            let current_data = if let Some(ref cols) = aggregate_columns {
-                projected_rows_to_js_array(rows, cols)
-            } else if let Some(ref cols) = projected_columns {
-                projected_rows_to_js_array(rows, cols)
-            } else {
-                rows_to_js_array(rows, &schema)
-            };
-            callback.call1(&JsValue::NULL, &current_data).ok();
-        });
-
-        // Create unsubscribe function
-        let inner_unsub = self.inner.clone();
-        let called = Rc::new(RefCell::new(false));
-        let called_c = called.clone();
-        let unsubscribe = Closure::wrap(Box::new(move || {
-            let mut c = called_c.borrow_mut();
-            if !*c {
-                *c = true;
-                inner_unsub.borrow_mut().unsubscribe(sub_id);
-            }
-        }) as Box<dyn FnMut()>);
-        unsubscribe.into_js_value().unchecked_into()
-    }
-
-    /// Returns the current result as a JavaScript array.
-    #[wasm_bindgen(js_name = getResult)]
-    pub fn get_result(&self) -> JsValue {
-        let inner = self.inner.borrow();
-        if let Some(ref cols) = self.aggregate_columns {
-            projected_rows_to_js_array(inner.result(), cols)
-        } else if let Some(ref cols) = self.projected_columns {
-            projected_rows_to_js_array(inner.result(), cols)
-        } else {
-            rows_to_js_array(inner.result(), &self.schema)
-        }
-    }
-
-    /// Returns the current result as a binary buffer for zero-copy access.
-    #[wasm_bindgen(js_name = getResultBinary)]
-    pub fn get_result_binary(&self) -> BinaryResult {
-        let inner = self.inner.borrow();
-        let rows = inner.result();
-        let mut encoder = BinaryEncoder::new(self.binary_layout.clone(), rows.len());
-        encoder.encode_rows(rows);
-        BinaryResult::new(encoder.finish())
-    }
-
-    /// Returns the schema layout for decoding binary results.
-    #[wasm_bindgen(js_name = getSchemaLayout)]
-    pub fn get_schema_layout(&self) -> SchemaLayout {
-        self.binary_layout.clone()
-    }
-
-    /// Returns the number of rows in the result.
-    #[wasm_bindgen(getter)]
-    pub fn length(&self) -> usize {
-        self.inner.borrow().len()
-    }
-
-    /// Returns whether the result is empty.
-    #[wasm_bindgen(js_name = isEmpty)]
-    pub fn is_empty(&self) -> bool {
-        self.inner.borrow().is_empty()
-    }
-
-    /// Returns the number of active subscriptions.
-    #[wasm_bindgen(js_name = subscriptionCount)]
-    pub fn subscription_count(&self) -> usize {
-        self.inner.borrow().subscription_count()
-    }
-}
-
-/// JavaScript-friendly IVM observable query wrapper.
-/// Uses DBSP-based incremental view maintenance for O(delta) updates.
-#[wasm_bindgen]
-pub struct JsIvmObservableQuery {
-    inner: Rc<RefCell<ObservableQuery>>,
-    schema: Table,
-    /// Optional projected column names.
-    projected_columns: Option<Vec<String>>,
-    /// Pre-computed binary layout for getResultBinary().
-    binary_layout: SchemaLayout,
-    /// Optional aggregate column names.
-    aggregate_columns: Option<Vec<String>>,
-}
-
-impl JsIvmObservableQuery {
-    pub(crate) fn new(
-        inner: Rc<RefCell<ObservableQuery>>,
-        schema: Table,
-        binary_layout: SchemaLayout,
-    ) -> Self {
-        Self {
-            inner,
-            schema,
-            projected_columns: None,
-            binary_layout,
-            aggregate_columns: None,
-        }
-    }
-
-    pub(crate) fn new_with_projection(
-        inner: Rc<RefCell<ObservableQuery>>,
-        schema: Table,
-        projected_columns: Vec<String>,
-        binary_layout: SchemaLayout,
-    ) -> Self {
-        Self {
-            inner,
-            schema,
-            projected_columns: Some(projected_columns),
-            binary_layout,
-            aggregate_columns: None,
-        }
-    }
-}
-
-#[wasm_bindgen]
-impl JsIvmObservableQuery {
-    /// Subscribes to IVM query changes.
-    ///
-    /// The callback receives a delta object `{ added: Row[], removed: Row[] }`
-    /// instead of the full result set. This is the true O(delta) path —
-    /// the UI side should apply the delta to its own state.
-    ///
-    /// Use `getResult()` to get the initial full result before subscribing.
-    /// Returns an unsubscribe function.
-    pub fn subscribe(&mut self, callback: js_sys::Function) -> js_sys::Function {
-        let schema = self.schema.clone();
-        let projected_columns = self.projected_columns.clone();
-        let aggregate_columns = self.aggregate_columns.clone();
-
-        let sub_id = self.inner.borrow_mut().subscribe(move |change_set| {
-            let delta_obj = js_sys::Object::new();
-
-            // Serialize only added rows
-            let added = if let Some(ref cols) = aggregate_columns {
-                ivm_rows_to_js_array(&change_set.added, cols)
-            } else if let Some(ref cols) = projected_columns {
-                ivm_rows_to_js_array(&change_set.added, cols)
-            } else {
-                ivm_full_rows_to_js_array(&change_set.added, &schema)
-            };
-
-            // Serialize only removed rows
-            let removed = if let Some(ref cols) = aggregate_columns {
-                ivm_rows_to_js_array(&change_set.removed, cols)
-            } else if let Some(ref cols) = projected_columns {
-                ivm_rows_to_js_array(&change_set.removed, cols)
-            } else {
-                ivm_full_rows_to_js_array(&change_set.removed, &schema)
-            };
-
-            js_sys::Reflect::set(&delta_obj, &JsValue::from_str("added"), &added).ok();
-            js_sys::Reflect::set(&delta_obj, &JsValue::from_str("removed"), &removed).ok();
-
-            callback.call1(&JsValue::NULL, &delta_obj).ok();
-        });
-
-        let inner_unsub = self.inner.clone();
-        let called = Rc::new(RefCell::new(false));
-        let called_c = called.clone();
-        let unsubscribe = Closure::wrap(Box::new(move || {
-            let mut c = called_c.borrow_mut();
-            if !*c {
-                *c = true;
-                inner_unsub.borrow_mut().unsubscribe(sub_id);
-            }
-        }) as Box<dyn FnMut()>);
-        unsubscribe.into_js_value().unchecked_into()
-    }
-
-    /// Returns the current result as a JavaScript array.
-    #[wasm_bindgen(js_name = getResult)]
-    pub fn get_result(&self) -> JsValue {
-        let inner = self.inner.borrow();
-        let rows = inner.result();
-        if let Some(ref cols) = self.aggregate_columns {
-            ivm_rows_to_js_array(&rows, cols)
-        } else if let Some(ref cols) = self.projected_columns {
-            ivm_rows_to_js_array(&rows, cols)
-        } else {
-            ivm_full_rows_to_js_array(&rows, &self.schema)
-        }
-    }
-
-    /// Returns the current result as a binary buffer for zero-copy access.
-    #[wasm_bindgen(js_name = getResultBinary)]
-    pub fn get_result_binary(&self) -> BinaryResult {
-        let inner = self.inner.borrow();
-        let rows = inner.result();
-        let rc_rows: Vec<Rc<Row>> = rows.into_iter().map(Rc::new).collect();
-        let mut encoder = BinaryEncoder::new(self.binary_layout.clone(), rc_rows.len());
-        encoder.encode_rows(&rc_rows);
-        BinaryResult::new(encoder.finish())
-    }
-
-    /// Returns the schema layout for decoding binary results.
-    #[wasm_bindgen(js_name = getSchemaLayout)]
-    pub fn get_schema_layout(&self) -> SchemaLayout {
-        self.binary_layout.clone()
-    }
-
-    /// Returns the number of rows in the result.
-    #[wasm_bindgen(getter)]
-    pub fn length(&self) -> usize {
-        self.inner.borrow().len()
-    }
-
-    /// Returns whether the result is empty.
-    #[wasm_bindgen(js_name = isEmpty)]
-    pub fn is_empty(&self) -> bool {
-        self.inner.borrow().is_empty()
-    }
-
-    /// Returns the number of active subscriptions.
-    #[wasm_bindgen(js_name = subscriptionCount)]
-    pub fn subscription_count(&self) -> usize {
-        self.inner.borrow().subscription_count()
-    }
-}
-
-/// Converts IVM rows (owned Row, not Rc<Row>) to a JavaScript array using projected columns.
-fn ivm_rows_to_js_array(rows: &[Row], column_names: &[String]) -> JsValue {
-    let arr = js_sys::Array::new_with_length(rows.len() as u32);
-    for (i, row) in rows.iter().enumerate() {
-        let obj = js_sys::Object::new();
-        for (col_idx, col_name) in column_names.iter().enumerate() {
-            if let Some(value) = row.get(col_idx) {
-                let js_val = value_to_js(value);
-                js_sys::Reflect::set(&obj, &JsValue::from_str(col_name), &js_val).ok();
-            }
-        }
-        arr.set(i as u32, obj.into());
-    }
-    arr.into()
-}
-
-/// Converts IVM rows (owned Row, not Rc<Row>) to a JavaScript array using full schema.
-fn ivm_full_rows_to_js_array(rows: &[Row], schema: &Table) -> JsValue {
-    let arr = js_sys::Array::new_with_length(rows.len() as u32);
-    for (i, row) in rows.iter().enumerate() {
-        let obj = js_sys::Object::new();
-        for col in schema.columns() {
-            if let Some(value) = row.get(col.index()) {
-                let js_val = value_to_js(value);
-                js_sys::Reflect::set(&obj, &JsValue::from_str(col.name()), &js_val).ok();
-            }
-        }
-        arr.set(i as u32, obj.into());
-    }
-    arr.into()
-}
-
-/// JavaScript-friendly GraphQL subscription wrapper.
-///
-/// The callback receives a standard GraphQL payload object with a single `data`
-/// property. The payload is emitted immediately on subscribe and again whenever
-/// the rendered GraphQL response changes.
-#[wasm_bindgen]
-pub struct JsGraphqlSubscription {
-    inner: GraphqlSubscriptionInner,
-    keepalive_sub_id: usize,
-}
-
-impl JsGraphqlSubscription {
-    pub(crate) fn new_snapshot(inner: Rc<RefCell<GraphqlSubscriptionObservable>>) -> Self {
-        Self::new(GraphqlSubscriptionInner::Snapshot(inner))
-    }
-
-    pub(crate) fn new_delta(inner: Rc<RefCell<GraphqlDeltaObservable>>) -> Self {
-        Self::new(GraphqlSubscriptionInner::Delta(inner))
-    }
-
-    fn new(inner: GraphqlSubscriptionInner) -> Self {
-        let keepalive_sub_id = inner.attach_keepalive();
-        Self {
-            inner,
-            keepalive_sub_id,
-        }
-    }
-}
-
-impl Drop for JsGraphqlSubscription {
-    fn drop(&mut self) {
-        self.inner.unsubscribe(self.keepalive_sub_id);
-    }
-}
-
-#[wasm_bindgen]
-impl JsGraphqlSubscription {
-    /// Returns the current GraphQL payload.
-    #[wasm_bindgen(js_name = getResult)]
-    pub fn get_result(&self) -> JsValue {
-        self.inner.response_js_value()
-    }
-
-    /// Subscribes to GraphQL payload changes and emits the initial value immediately.
-    pub fn subscribe(&self, callback: js_sys::Function) -> js_sys::Function {
-        let inner = self.inner.clone();
-        let initial_callback = callback.clone();
-        let sub_id = inner.subscribe(move |response| {
-            let payload = graphql_response_to_js_value(response);
-            callback.call1(&JsValue::NULL, &payload).ok();
-        });
-        let initial = inner.response_js_value();
-        initial_callback.call1(&JsValue::NULL, &initial).ok();
-
-        let called = Rc::new(RefCell::new(false));
-        let called_c = called.clone();
-        let unsubscribe = Closure::wrap(Box::new(move || {
-            let mut c = called_c.borrow_mut();
-            if !*c {
-                *c = true;
-                inner.unsubscribe(sub_id);
-            }
-        }) as Box<dyn FnMut()>);
-        unsubscribe.into_js_value().unchecked_into()
-    }
-
-    /// Returns the number of active subscriptions.
-    #[wasm_bindgen(js_name = subscriptionCount)]
-    pub fn subscription_count(&self) -> usize {
-        self.inner.listener_count()
-    }
-}
-
-/// JavaScript-friendly changes stream.
-///
-/// This provides the `changes()` API that yields the complete result set
-/// whenever data changes. The callback receives the full current data,
-/// not incremental changes - perfect for React's setState pattern.
-#[wasm_bindgen]
-pub struct JsChangesStream {
-    inner: Rc<RefCell<ReQueryObservable>>,
-    schema: Table,
-    /// Optional projected column names. If Some, only these columns are returned.
-    projected_columns: Option<Vec<String>>,
-    /// Pre-computed binary layout for getResultBinary().
-    binary_layout: SchemaLayout,
-}
-
-impl JsChangesStream {
-    pub(crate) fn from_observable(observable: JsObservableQuery) -> Self {
-        Self {
-            inner: observable.inner(),
-            schema: observable.schema().clone(),
-            projected_columns: observable.projected_columns().cloned(),
-            binary_layout: observable.binary_layout.clone(),
-        }
-    }
-}
-
-#[wasm_bindgen]
-impl JsChangesStream {
-    /// Subscribes to the changes stream.
-    ///
-    /// The callback receives the complete current result set as a JavaScript array.
-    /// It is called immediately with the initial data, and again whenever data changes.
-    /// Perfect for React: `stream.subscribe(data => setUsers(data))`
-    ///
-    /// Returns an unsubscribe function.
-    pub fn subscribe(&self, callback: js_sys::Function) -> js_sys::Function {
-        let schema = self.schema.clone();
-        let inner = self.inner.clone();
-        let projected_columns = self.projected_columns.clone();
-
-        // Emit initial value immediately
-        let initial_data = if let Some(ref cols) = projected_columns {
-            projected_rows_to_js_array(inner.borrow().result(), cols)
-        } else {
-            rows_to_js_array(inner.borrow().result(), &schema)
+        let root_table = self
+            .root_subset_refresh
+            .as_ref()
+            .map(|runtime| runtime.metadata.root_table.clone())?;
+        let requery_started_at = now_ms();
+        let rows = {
+            let cache = self.cache.borrow();
+            let subset_plan = self
+                .root_subset_refresh
+                .as_ref()
+                .map(|runtime| runtime.select_compiled_plan(&cache, &affected_root_ids))?;
+            execute_compiled_physical_plan_on_table_subset(
+                &cache,
+                subset_plan,
+                &root_table,
+                &affected_root_ids,
+            )
+            .ok()?
         };
-        callback.call1(&JsValue::NULL, &initial_data).ok();
+        profile.root_subset_requery_ms += now_ms() - requery_started_at;
 
-        // Subscribe to subsequent changes
-        let schema_clone = schema.clone();
-        let projected_columns_clone = projected_columns.clone();
-        let sub_id = inner.borrow_mut().subscribe(move |rows| {
-            let current_data = if let Some(ref cols) = projected_columns_clone {
-                projected_rows_to_js_array(rows, cols)
-            } else {
-                rows_to_js_array(rows, &schema_clone)
+        let apply_started_at = now_ms();
+        let rows = {
+            let root_subset_refresh = self.root_subset_refresh.as_mut()?;
+            root_subset_refresh.apply_subset_rows(&affected_root_keys, rows)?
+        };
+        let summary = QueryResultSummary::from_rows(&rows);
+        let compare_started_at = now_ms();
+        let changed = !query_results_equal(&self.result_summary, &summary, &self.result, &rows);
+        profile.root_subset_compare_ms += now_ms() - compare_started_at;
+        self.result = rows;
+        self.result_summary = summary;
+        profile.root_subset_apply_ms += now_ms() - apply_started_at;
+        profile.root_subset_hit = true;
+        profile.refresh_mode = SnapshotRefreshMode::RootSubsetRefresh;
+        Some(changed)
+    }
+
+    fn collect_affected_root_row_ids(
+        cache_ref: &Rc<RefCell<TableCache>>,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
+        dependency_graph: &RowsSnapshotDependencyGraph,
+    ) -> Option<HashSet<u64>> {
+        let cache = cache_ref.borrow();
+        let mut dirty_rows_by_table: HashMap<TableId, HashSet<u64>> = HashMap::new();
+        for (table_id, row_ids) in changes {
+            if dependency_graph.table_name(*table_id).is_none() {
+                continue;
+            }
+            dirty_rows_by_table
+                .entry(*table_id)
+                .or_insert_with(HashSet::new)
+                .extend(row_ids.iter().copied());
+        }
+
+        let mut queue: Vec<TableId> = dirty_rows_by_table.keys().copied().collect();
+        let mut queued_tables: HashSet<TableId> = queue.iter().copied().collect();
+        let mut dirty_row_ids = Vec::new();
+        let mut join_values = HashSet::new();
+
+        while let Some(table_id) = queue.pop() {
+            queued_tables.remove(&table_id);
+            let dirty_row_set = dirty_rows_by_table.get(&table_id)?;
+            if dirty_row_set.is_empty() {
+                continue;
+            }
+
+            dirty_row_ids.clear();
+            dirty_row_ids.extend(dirty_row_set.iter().copied());
+
+            let Some(table_name) = dependency_graph.table_name(table_id) else {
+                continue;
             };
-            callback.call1(&JsValue::NULL, &current_data).ok();
-        });
-
-        // Create unsubscribe function
-        let called = Rc::new(RefCell::new(false));
-        let called_c = called.clone();
-        let unsubscribe = Closure::wrap(Box::new(move || {
-            let mut c = called_c.borrow_mut();
-            if !*c {
-                *c = true;
-                inner.borrow_mut().unsubscribe(sub_id);
+            let store = cache.get_table(table_name)?;
+            let table_deltas = delta_changes.and_then(|changes| changes.get(&table_id));
+            if table_id != dependency_graph.root_table_id
+                && store.count_existing_rows_by_ids(&dirty_row_ids) != dirty_row_ids.len()
+                && table_deltas.is_none_or(Vec::is_empty)
+            {
+                return None;
             }
-        }) as Box<dyn FnMut()>);
-        unsubscribe.into_js_value().unchecked_into()
-    }
 
-    /// Returns the current result.
-    #[wasm_bindgen(js_name = getResult)]
-    pub fn get_result(&self) -> JsValue {
-        let inner = self.inner.borrow();
-        if let Some(ref cols) = self.projected_columns {
-            projected_rows_to_js_array(inner.result(), cols)
-        } else {
-            rows_to_js_array(inner.result(), &self.schema)
-        }
-    }
+            for edge in dependency_graph.edges_from(table_id) {
+                collect_join_values_by_row_ids_and_deltas(
+                    store,
+                    &dirty_row_ids,
+                    table_deltas,
+                    edge.source_column_index,
+                    &mut join_values,
+                );
+                if join_values.is_empty() {
+                    continue;
+                }
 
-    /// Returns the current result as a binary buffer for zero-copy access.
-    #[wasm_bindgen(js_name = getResultBinary)]
-    pub fn get_result_binary(&self) -> BinaryResult {
-        let inner = self.inner.borrow();
-        let rows = inner.result();
-        let mut encoder = BinaryEncoder::new(self.binary_layout.clone(), rows.len());
-        encoder.encode_rows(rows);
-        BinaryResult::new(encoder.finish())
-    }
-
-    /// Returns the schema layout for decoding binary results.
-    #[wasm_bindgen(js_name = getSchemaLayout)]
-    pub fn get_schema_layout(&self) -> SchemaLayout {
-        self.binary_layout.clone()
-    }
-}
-
-/// Converts rows to a JavaScript array.
-fn rows_to_js_array(rows: &[Rc<Row>], schema: &Table) -> JsValue {
-    let arr = js_sys::Array::new_with_length(rows.len() as u32);
-    for (i, row) in rows.iter().enumerate() {
-        arr.set(i as u32, row_to_js(row, schema));
-    }
-    arr.into()
-}
-
-/// Converts projected rows to a JavaScript array.
-/// Only includes the specified columns in the output.
-fn projected_rows_to_js_array(rows: &[Rc<Row>], column_names: &[String]) -> JsValue {
-    let arr = js_sys::Array::new_with_length(rows.len() as u32);
-    for (i, row) in rows.iter().enumerate() {
-        let obj = js_sys::Object::new();
-        for (col_idx, col_name) in column_names.iter().enumerate() {
-            if let Some(value) = row.get(col_idx) {
-                let js_val = value_to_js(value);
-                js_sys::Reflect::set(&obj, &JsValue::from_str(col_name), &js_val).ok();
+                let target_store = cache.get_table(&edge.target_table)?;
+                let target_entry = dirty_rows_by_table
+                    .entry(edge.target_table_id)
+                    .or_insert_with(HashSet::new);
+                let added = insert_row_ids_by_column_values(
+                    target_store,
+                    edge.target_column_index,
+                    &edge.lookup,
+                    &join_values,
+                    target_entry,
+                );
+                if added && !queued_tables.contains(&edge.target_table_id) {
+                    queued_tables.insert(edge.target_table_id);
+                    queue.push(edge.target_table_id);
+                }
             }
         }
-        arr.set(i as u32, obj.into());
+
+        Some(
+            dirty_rows_by_table
+                .remove(&dependency_graph.root_table_id)
+                .unwrap_or_default(),
+        )
     }
-    arr.into()
 }
+
+mod graphql_observable;
+
+pub use graphql_observable::{GraphqlDeltaObservable, GraphqlSubscriptionObservable};
+
+mod js_surface;
+
+pub use js_surface::{
+    JsChangesStream, JsGraphqlSubscription, JsIvmObservableQuery, JsObservableQuery,
+};
 
 #[cfg(test)]
 mod tests {
+    use super::graphql_payload::{build_snapshot_batch_invalidation, GraphqlPayloadChange};
+    use super::js_surface::{rows_to_js_array, CachedSnapshotRowJs, JsSnapshotRowsCache};
     use super::*;
-    use crate::live_runtime::LiveRegistry;
-    use cynos_core::schema::TableBuilder;
+    use crate::live_runtime::{
+        LiveRegistry, RowsSnapshotDependencyGraph, RowsSnapshotDirectedJoinEdge,
+        RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey, RowsSnapshotPartialRefreshMetadata,
+        RowsSnapshotRootSubsetMetadata, RowsSnapshotRootSubsetPlan,
+    };
+    use crate::query_engine::QueryResultSummary;
+    use crate::query_engine::{compile_cached_plan, execute_compiled_physical_plan_with_summary};
+    use cynos_core::schema::{Table, TableBuilder};
     use cynos_core::{DataType, Value};
-    use cynos_query::ast::Expr;
+    use cynos_gql::render_plan::compile_batch_plan;
+    use cynos_gql::{GraphqlCatalog, PreparedQuery};
+    use cynos_query::ast::{Expr, SortOrder};
     use cynos_query::executor::{InMemoryDataSource, PhysicalPlanRunner};
-    use cynos_query::planner::PhysicalPlan;
+    use cynos_query::planner::{LogicalPlan, PhysicalPlan};
+    use cynos_storage::TableCache;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -1428,6 +722,535 @@ mod tests {
         )
     }
 
+    fn partial_refresh_dependency_graph() -> RowsSnapshotDependencyGraph {
+        RowsSnapshotDependencyGraph {
+            root_table_id: 1,
+            table_names: HashMap::from([
+                (1, "issues".into()),
+                (2, "projects".into()),
+                (3, "counters".into()),
+            ]),
+            edges_by_source: HashMap::from([
+                (
+                    1,
+                    alloc::vec![RowsSnapshotDirectedJoinEdge {
+                        source_column_index: 1,
+                        target_table_id: 2,
+                        target_table: "projects".into(),
+                        target_column_index: 0,
+                        lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                    }],
+                ),
+                (
+                    2,
+                    alloc::vec![
+                        RowsSnapshotDirectedJoinEdge {
+                            source_column_index: 0,
+                            target_table_id: 1,
+                            target_table: "issues".into(),
+                            target_column_index: 1,
+                            lookup: RowsSnapshotLookupPrimitive::SingleColumnIndex {
+                                index_name: "idx_issues_project_id".into(),
+                            },
+                        },
+                        RowsSnapshotDirectedJoinEdge {
+                            source_column_index: 0,
+                            target_table_id: 3,
+                            target_table: "counters".into(),
+                            target_column_index: 0,
+                            lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                        },
+                    ],
+                ),
+                (
+                    3,
+                    alloc::vec![RowsSnapshotDirectedJoinEdge {
+                        source_column_index: 0,
+                        target_table_id: 2,
+                        target_table: "projects".into(),
+                        target_column_index: 0,
+                        lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                    }],
+                ),
+            ]),
+        }
+    }
+
+    fn root_subset_dependency_graph() -> RowsSnapshotDependencyGraph {
+        RowsSnapshotDependencyGraph {
+            root_table_id: 1,
+            table_names: HashMap::from([
+                (1, "issues".into()),
+                (2, "projects".into()),
+                (3, "counters".into()),
+            ]),
+            edges_by_source: HashMap::from([
+                (
+                    1,
+                    alloc::vec![RowsSnapshotDirectedJoinEdge {
+                        source_column_index: 1,
+                        target_table_id: 2,
+                        target_table: "projects".into(),
+                        target_column_index: 0,
+                        lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                    }],
+                ),
+                (
+                    2,
+                    alloc::vec![
+                        RowsSnapshotDirectedJoinEdge {
+                            source_column_index: 0,
+                            target_table_id: 1,
+                            target_table: "issues".into(),
+                            target_column_index: 1,
+                            lookup: RowsSnapshotLookupPrimitive::ScanFallback,
+                        },
+                        RowsSnapshotDirectedJoinEdge {
+                            source_column_index: 0,
+                            target_table_id: 3,
+                            target_table: "counters".into(),
+                            target_column_index: 0,
+                            lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                        },
+                    ],
+                ),
+                (
+                    3,
+                    alloc::vec![RowsSnapshotDirectedJoinEdge {
+                        source_column_index: 0,
+                        target_table_id: 2,
+                        target_table: "projects".into(),
+                        target_column_index: 0,
+                        lookup: RowsSnapshotLookupPrimitive::PrimaryKey,
+                    }],
+                ),
+            ]),
+        }
+    }
+
+    fn graphql_users_posts_batch_plan() -> (cynos_gql::GraphqlBatchPlan, HashMap<TableId, String>) {
+        let mut cache = TableCache::new();
+        let users = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let posts = TableBuilder::new("posts")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("author_id", DataType::Int64)
+            .unwrap()
+            .add_column("title", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_foreign_key_with_graphql_names(
+                "fk_posts_author",
+                "author_id",
+                "users",
+                "id",
+                Some("author"),
+                Some("posts"),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        cache.create_table(users).unwrap();
+        cache.create_table(posts).unwrap();
+
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let prepared =
+            PreparedQuery::parse("subscription { users { id posts { id title } } }").unwrap();
+        let bound = prepared.bind(&catalog, None).unwrap();
+        let field = bound.fields.into_iter().next().unwrap();
+        let plan = compile_batch_plan(&catalog, &field).unwrap();
+        let table_names = HashMap::from([(1, "users".into()), (2, "posts".into())]);
+        (plan, table_names)
+    }
+
+    fn patch_test_observable() -> ReQueryObservable {
+        let users = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("age", DataType::Int32)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let orders = TableBuilder::new("orders")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("amount", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(users).unwrap();
+        cache.create_table(orders).unwrap();
+        cache
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(1, alloc::vec![Value::Int64(1), Value::Int32(42)]))
+            .unwrap();
+        cache
+            .get_table_mut("orders")
+            .unwrap()
+            .insert(Row::new(1, alloc::vec![Value::Int64(1), Value::Int64(100)]))
+            .unwrap();
+
+        let cache = Rc::new(RefCell::new(cache));
+        let compiled_plan = CompiledPhysicalPlan::new(PhysicalPlan::filter(
+            PhysicalPlan::table_scan("users"),
+            Expr::gt(
+                Expr::column("users", "age", 1),
+                Expr::literal(Value::Int32(30)),
+            ),
+        ));
+        let initial_output = {
+            let cache_ref = cache.borrow();
+            execute_compiled_physical_plan_with_summary(&cache_ref, &compiled_plan).unwrap()
+        };
+
+        ReQueryObservable::new_with_summary(
+            compiled_plan,
+            cache,
+            initial_output.rows,
+            initial_output.summary,
+            alloc::vec![(1, "users".into()), (2, "orders".into())],
+            None,
+            None,
+        )
+    }
+
+    fn partial_refresh_test_observable() -> (Rc<RefCell<TableCache>>, ReQueryObservable) {
+        let issues = TableBuilder::new("issues")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("project_id", DataType::Int64)
+            .unwrap()
+            .add_column("updated_at", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_issues_project_id", &["project_id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let projects = TableBuilder::new("projects")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("state", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let counters = TableBuilder::new("counters")
+            .unwrap()
+            .add_column("project_id", DataType::Int64)
+            .unwrap()
+            .add_column("open_count", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["project_id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(issues).unwrap();
+        cache.create_table(projects).unwrap();
+        cache.create_table(counters).unwrap();
+
+        {
+            let store = cache.get_table_mut("issues").unwrap();
+            for (id, updated_at) in [(1u64, 500i64), (2, 400), (3, 300), (4, 200), (5, 100)] {
+                store
+                    .insert(Row::new(
+                        id,
+                        alloc::vec![
+                            Value::Int64(id as i64),
+                            Value::Int64(id as i64),
+                            Value::Int64(updated_at),
+                        ],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        {
+            let store = cache.get_table_mut("projects").unwrap();
+            for id in 1..=5u64 {
+                store
+                    .insert(Row::new(
+                        id,
+                        alloc::vec![Value::Int64(id as i64), Value::String("active".into()),],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        {
+            let store = cache.get_table_mut("counters").unwrap();
+            for (project_id, open_count) in [(1u64, 10i64), (2, 20), (3, 30), (4, 40), (5, 50)] {
+                store
+                    .insert(Row::new(
+                        project_id,
+                        alloc::vec![Value::Int64(project_id as i64), Value::Int64(open_count)],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let cache = Rc::new(RefCell::new(cache));
+        let logical_plan = LogicalPlan::project(
+            LogicalPlan::limit(
+                LogicalPlan::sort(
+                    LogicalPlan::filter(
+                        LogicalPlan::left_join(
+                            LogicalPlan::left_join(
+                                LogicalPlan::scan("issues"),
+                                LogicalPlan::scan("projects"),
+                                Expr::eq(
+                                    Expr::column("issues", "project_id", 1),
+                                    Expr::column("projects", "id", 0),
+                                ),
+                            ),
+                            LogicalPlan::scan("counters"),
+                            Expr::eq(
+                                Expr::column("projects", "id", 0),
+                                Expr::column("counters", "project_id", 0),
+                            ),
+                        ),
+                        Expr::eq(
+                            Expr::column("projects", "state", 1),
+                            Expr::literal(Value::String("active".into())),
+                        ),
+                    ),
+                    alloc::vec![(Expr::column("issues", "updated_at", 2), SortOrder::Desc)],
+                ),
+                4,
+                0,
+            ),
+            alloc::vec![
+                Expr::column("issues", "id", 0),
+                Expr::column("issues", "updated_at", 2),
+                Expr::column("projects", "state", 1),
+                Expr::column("counters", "open_count", 1),
+            ],
+        );
+        let compiled_plan = {
+            let cache_ref = cache.borrow();
+            compile_cached_plan(&cache_ref, "issues", logical_plan.clone())
+        };
+        let initial_output = {
+            let cache_ref = cache.borrow();
+            execute_compiled_physical_plan_with_summary(&cache_ref, &compiled_plan).unwrap()
+        };
+        let visible_rows: Vec<Rc<Row>> = initial_output.rows.iter().take(2).cloned().collect();
+        let visible_summary = QueryResultSummary::from_rows(&visible_rows);
+        let observable = ReQueryObservable::new_with_summary(
+            compiled_plan,
+            cache.clone(),
+            visible_rows,
+            visible_summary,
+            alloc::vec![
+                (1, "issues".into()),
+                (2, "projects".into()),
+                (3, "counters".into()),
+            ],
+            Some(RowsSnapshotPartialRefreshState {
+                metadata: RowsSnapshotPartialRefreshMetadata {
+                    root_table: "issues".into(),
+                    root_pk_output_indices: alloc::vec![0],
+                    order_keys: alloc::vec![RowsSnapshotOrderKey {
+                        output_index: 1,
+                        order: SortOrder::Desc,
+                    }],
+                    visible_offset: 0,
+                    visible_limit: 2,
+                    overscan: 1,
+                    candidate_limit: 4,
+                    dependency_graph: partial_refresh_dependency_graph(),
+                },
+                initial_candidate_rows: initial_output.rows,
+            }),
+            None,
+        );
+        (cache, observable)
+    }
+
+    fn root_subset_test_observable() -> (Rc<RefCell<TableCache>>, ReQueryObservable) {
+        let issues = TableBuilder::new("issues")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("project_id", DataType::Int64)
+            .unwrap()
+            .add_column("updated_at", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let projects = TableBuilder::new("projects")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("state", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let counters = TableBuilder::new("counters")
+            .unwrap()
+            .add_column("project_id", DataType::Int64)
+            .unwrap()
+            .add_column("open_count", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["project_id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(issues).unwrap();
+        cache.create_table(projects).unwrap();
+        cache.create_table(counters).unwrap();
+
+        {
+            let store = cache.get_table_mut("issues").unwrap();
+            for (id, updated_at) in [(1u64, 500i64), (2, 400), (3, 300), (4, 200), (5, 100)] {
+                store
+                    .insert(Row::new(
+                        id,
+                        alloc::vec![
+                            Value::Int64(id as i64),
+                            Value::Int64(id as i64),
+                            Value::Int64(updated_at),
+                        ],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        {
+            let store = cache.get_table_mut("projects").unwrap();
+            for id in 1..=5u64 {
+                store
+                    .insert(Row::new(
+                        id,
+                        alloc::vec![Value::Int64(id as i64), Value::String("active".into())],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        {
+            let store = cache.get_table_mut("counters").unwrap();
+            for (project_id, open_count) in [(1u64, 10i64), (2, 20), (3, 30), (4, 40), (5, 50)] {
+                store
+                    .insert(Row::new(
+                        project_id,
+                        alloc::vec![Value::Int64(project_id as i64), Value::Int64(open_count)],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let cache = Rc::new(RefCell::new(cache));
+        let logical_plan = LogicalPlan::project(
+            LogicalPlan::filter(
+                LogicalPlan::left_join(
+                    LogicalPlan::left_join(
+                        LogicalPlan::scan("issues"),
+                        LogicalPlan::scan("projects"),
+                        Expr::eq(
+                            Expr::column("issues", "project_id", 1),
+                            Expr::column("projects", "id", 0),
+                        ),
+                    ),
+                    LogicalPlan::scan("counters"),
+                    Expr::eq(
+                        Expr::column("projects", "id", 0),
+                        Expr::column("counters", "project_id", 0),
+                    ),
+                ),
+                Expr::eq(
+                    Expr::column("projects", "state", 1),
+                    Expr::literal(Value::String("active".into())),
+                ),
+            ),
+            alloc::vec![
+                Expr::column("issues", "id", 0),
+                Expr::column("issues", "updated_at", 2),
+                Expr::column("projects", "state", 1),
+                Expr::column("counters", "open_count", 1),
+            ],
+        );
+        let compiled_plan = {
+            let cache_ref = cache.borrow();
+            compile_cached_plan(&cache_ref, "issues", logical_plan.clone())
+        };
+        let root_subset_plan = {
+            let cache_ref = cache.borrow();
+            compile_cached_plan(&cache_ref, "issues", logical_plan)
+        };
+        let initial_output = {
+            let cache_ref = cache.borrow();
+            execute_compiled_physical_plan_with_summary(&cache_ref, &compiled_plan).unwrap()
+        };
+
+        let observable = ReQueryObservable::new_with_summary(
+            compiled_plan,
+            cache.clone(),
+            initial_output.rows,
+            initial_output.summary,
+            alloc::vec![
+                (1, "issues".into()),
+                (2, "projects".into()),
+                (3, "counters".into()),
+            ],
+            None,
+            Some(RowsSnapshotRootSubsetPlan {
+                metadata: RowsSnapshotRootSubsetMetadata {
+                    root_table: "issues".into(),
+                    root_pk_store_indices: alloc::vec![0],
+                    root_pk_output_indices: alloc::vec![0],
+                    dependency_graph: root_subset_dependency_graph(),
+                },
+                compiled_plans: crate::live_runtime::RowsSnapshotRootSubsetVariants {
+                    small: root_subset_plan.clone(),
+                    large: root_subset_plan,
+                },
+            }),
+        );
+        (cache, observable)
+    }
+
+    fn visible_issue_ids(observable: &ReQueryObservable) -> Vec<i64> {
+        observable
+            .result()
+            .iter()
+            .filter_map(|row| row.get(0))
+            .filter_map(Value::as_i64)
+            .collect()
+    }
+
     #[wasm_bindgen_test]
     fn test_live_registry_new() {
         let registry = LiveRegistry::new();
@@ -1445,6 +1268,300 @@ mod tests {
         let js = rows_to_js_array(&rows, &schema);
         let arr = js_sys::Array::from(&js);
         assert_eq!(arr.length(), 2);
+    }
+
+    #[test]
+    fn test_snapshot_rows_cache_prunes_jsonb_entries_incrementally() {
+        let mut cache = JsSnapshotRowsCache::default();
+        let policy = crate::convert::JsonbJsCachePolicy::DEFAULT;
+        for index in 0..policy.target_entries() + 2_112 {
+            let mut key = alloc::vec![(index % 251) as u8; 1024];
+            key.extend_from_slice(&(index as u64).to_le_bytes());
+            cache.jsonb_cache_bytes += key.len();
+            cache.jsonb_cache.insert(key, JsValue::NULL);
+        }
+
+        cache.prune_jsonb_cache_if_needed();
+
+        assert!(cache.jsonb_cache.len() <= policy.target_entries());
+        assert!(cache.jsonb_cache_bytes <= policy.target_bytes());
+    }
+
+    #[test]
+    fn test_snapshot_rows_cache_prunes_stale_rows_before_current_epoch() {
+        let mut cache = JsSnapshotRowsCache {
+            epoch: 7,
+            ..JsSnapshotRowsCache::default()
+        };
+        for row_id in 0..4u64 {
+            cache.rows.insert(
+                row_id,
+                CachedSnapshotRowJs {
+                    version: 1,
+                    epoch: if row_id == 0 { 7 } else { 6 },
+                    value: JsValue::NULL,
+                },
+            );
+        }
+
+        cache.prune_rows_with_limits(3, 2);
+
+        assert!(cache.rows.len() <= 2);
+        assert!(cache.rows.contains_key(&0));
+    }
+
+    #[test]
+    fn test_graphql_payload_change_describes_root_list_deltas() {
+        let unknown = GraphqlPayloadChange::from_root_list_patch(None);
+        assert_eq!(unknown.changed_hint(), None);
+        assert!(unknown.as_root_list_patch(None).is_none());
+
+        let stable_empty = cynos_gql::GraphqlRootListPatch::StablePositions(Vec::new());
+        let stable_change = GraphqlPayloadChange::from_root_list_patch(Some(&stable_empty));
+        assert_eq!(stable_change.changed_hint(), Some(false));
+        assert_eq!(
+            stable_change.as_root_list_patch(Some(&stable_empty)),
+            Some(&stable_empty)
+        );
+
+        let stable_updated = cynos_gql::GraphqlRootListPatch::StablePositions(alloc::vec![2]);
+        assert_eq!(
+            GraphqlPayloadChange::from_root_list_patch(Some(&stable_updated)).changed_hint(),
+            Some(true)
+        );
+
+        let splice_empty = cynos_gql::GraphqlRootListPatch::Splice {
+            removed_positions: Vec::new(),
+            inserted_positions: Vec::new(),
+            updated_positions: Vec::new(),
+        };
+        assert_eq!(
+            GraphqlPayloadChange::from_root_list_patch(Some(&splice_empty)).changed_hint(),
+            Some(false)
+        );
+
+        let splice_changed = cynos_gql::GraphqlRootListPatch::Splice {
+            removed_positions: alloc::vec![1],
+            inserted_positions: Vec::new(),
+            updated_positions: Vec::new(),
+        };
+        assert_eq!(
+            GraphqlPayloadChange::from_root_list_patch(Some(&splice_changed)).changed_hint(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_snapshot_batch_invalidation_uses_delta_relation_keys() {
+        let (plan, table_names) = graphql_users_posts_batch_plan();
+        let old_post = Row::new(
+            10,
+            alloc::vec![
+                Value::Int64(10),
+                Value::Int64(1),
+                Value::String("old".into()),
+            ],
+        );
+        let new_post = Row::new(
+            10,
+            alloc::vec![
+                Value::Int64(10),
+                Value::Int64(2),
+                Value::String("new".into()),
+            ],
+        );
+        let changes = HashMap::from([(2, HashSet::from([10]))]);
+        let deltas = HashMap::from([(
+            2,
+            alloc::vec![Delta::delete(old_post), Delta::insert(new_post)],
+        )]);
+
+        let invalidation = build_snapshot_batch_invalidation(
+            &plan,
+            &table_names,
+            &changes,
+            Some(&deltas),
+            false,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let edge_id = *plan.edges_for_table("posts").first().unwrap();
+        assert!(
+            invalidation.changed_tables.is_empty(),
+            "delta-backed snapshot invalidation should not fall back to coarse edge clearing"
+        );
+        assert_eq!(
+            invalidation.dirty_edge_keys.get(&edge_id),
+            Some(&HashSet::from([Value::Int64(1), Value::Int64(2)]))
+        );
+        assert_eq!(
+            invalidation.dirty_table_rows.get("posts"),
+            Some(&HashSet::from([10]))
+        );
+    }
+
+    #[test]
+    fn test_patch_table_changed_ids_accepts_exact_patch_table_changes() {
+        let observable = patch_test_observable();
+        let changes = HashMap::from([(1, HashSet::from([1u64]))]);
+
+        let changed_ids = observable
+            .patch_table_changed_ids(&changes)
+            .expect("patch table change should be eligible for reactive patching");
+        assert!(changed_ids.contains(&1));
+    }
+
+    #[test]
+    fn test_patch_table_changed_ids_rejects_unrelated_or_mixed_table_changes() {
+        let observable = patch_test_observable();
+
+        let unrelated = HashMap::from([(2, HashSet::from([1u64]))]);
+        assert!(
+            observable.patch_table_changed_ids(&unrelated).is_none(),
+            "unrelated table changes must not be routed into the patch fast-path",
+        );
+
+        let mixed = HashMap::from([(1, HashSet::from([1u64])), (2, HashSet::from([1u64]))]);
+        assert!(
+            observable.patch_table_changed_ids(&mixed).is_none(),
+            "mixed-table changes must fall back to full requery so we keep table provenance intact",
+        );
+    }
+
+    #[test]
+    fn test_partial_refresh_propagates_multi_hop_join_changes() {
+        let (cache, mut observable) = partial_refresh_test_observable();
+        observable.subscribe(|_| {});
+
+        {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("counters").unwrap();
+            let old_row = store.get(1).unwrap();
+            store
+                .update(
+                    1,
+                    Row::new_with_version(
+                        1,
+                        old_row.version().wrapping_add(1),
+                        alloc::vec![Value::Int64(1), Value::Int64(99)],
+                    ),
+                )
+                .unwrap();
+        }
+
+        observable.on_change(&HashMap::from([(3, HashSet::from([1u64]))]));
+
+        let first_row = observable.result().first().expect("visible row");
+        assert_eq!(first_row.get(0), Some(&Value::Int64(1)));
+        assert_eq!(first_row.get(3), Some(&Value::Int64(99)));
+    }
+
+    #[test]
+    fn test_partial_refresh_falls_back_when_shadow_window_is_depleted() {
+        let (cache, mut observable) = partial_refresh_test_observable();
+        observable.subscribe(|_| {});
+
+        {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("projects").unwrap();
+            let old_row = store.get(1).unwrap();
+            store
+                .update(
+                    1,
+                    Row::new_with_version(
+                        1,
+                        old_row.version().wrapping_add(1),
+                        alloc::vec![Value::Int64(1), Value::String("paused".into())],
+                    ),
+                )
+                .unwrap();
+        }
+        observable.on_change(&HashMap::from([(2, HashSet::from([1u64]))]));
+        assert_eq!(visible_issue_ids(&observable), alloc::vec![2, 3]);
+
+        {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("projects").unwrap();
+            let old_row = store.get(2).unwrap();
+            store
+                .update(
+                    2,
+                    Row::new_with_version(
+                        2,
+                        old_row.version().wrapping_add(1),
+                        alloc::vec![Value::Int64(2), Value::String("paused".into())],
+                    ),
+                )
+                .unwrap();
+        }
+        observable.on_change(&HashMap::from([(2, HashSet::from([2u64]))]));
+
+        assert_eq!(visible_issue_ids(&observable), alloc::vec![3, 4]);
+        let partial_refresh = observable
+            .partial_refresh
+            .as_ref()
+            .expect("partial refresh runtime");
+        let candidate_issue_ids: Vec<i64> = partial_refresh
+            .candidate_rows
+            .iter()
+            .filter_map(|entry| entry.row.get(0))
+            .filter_map(Value::as_i64)
+            .collect();
+        assert_eq!(candidate_issue_ids, alloc::vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn test_root_subset_refresh_updates_multi_hop_join_without_full_requery() {
+        let (cache, mut observable) = root_subset_test_observable();
+        observable.subscribe(|_| {});
+
+        {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("counters").unwrap();
+            let old_row = store.get(3).unwrap();
+            store
+                .update(
+                    3,
+                    Row::new_with_version(
+                        3,
+                        old_row.version().wrapping_add(1),
+                        alloc::vec![Value::Int64(3), Value::Int64(300)],
+                    ),
+                )
+                .unwrap();
+        }
+
+        let profile = observable.on_change_profiled(&HashMap::from([(3, HashSet::from([3u64]))]));
+
+        assert_eq!(profile.refresh_mode, SnapshotRefreshMode::RootSubsetRefresh);
+        assert!(profile.root_subset_hit);
+        let updated_row = observable
+            .result()
+            .iter()
+            .find(|row| row.get(0) == Some(&Value::Int64(3)))
+            .expect("issue 3 should still be visible");
+        assert_eq!(updated_row.get(3), Some(&Value::Int64(300)));
+    }
+
+    #[test]
+    fn test_root_subset_refresh_keeps_fast_path_for_deleted_intermediate_rows() {
+        let (cache, mut observable) = root_subset_test_observable();
+        observable.subscribe(|_| {});
+
+        let project_delete = {
+            let mut cache_ref = cache.borrow_mut();
+            let store = cache_ref.get_table_mut("projects").unwrap();
+            store.delete_with_delta(3).unwrap()
+        };
+
+        let changes = HashMap::from([(2, HashSet::from([3u64]))]);
+        let deltas = HashMap::from([(2, alloc::vec![project_delete])]);
+        let profile = observable.on_change_with_deltas_profiled(&changes, &deltas);
+
+        assert_eq!(profile.refresh_mode, SnapshotRefreshMode::RootSubsetRefresh);
+        assert!(profile.root_subset_hit);
+        assert_eq!(visible_issue_ids(&observable), alloc::vec![1, 2, 4, 5]);
     }
 
     #[test]

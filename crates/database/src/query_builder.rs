@@ -7,26 +7,40 @@ use crate::binary_protocol::{SchemaLayout, SchemaLayoutCache};
 use crate::convert::{js_array_to_rows, js_to_value, projected_rows_to_js_array, rows_to_js_array};
 use crate::dataflow_compiler::compile_to_dataflow;
 use crate::expr::{Expr, ExprInner};
-use crate::live_runtime::{LiveDependencySet, LivePlan, LiveRegistry, RowsProjection};
+use crate::live_runtime::{
+    collect_trace_bootstrap_source_bindings, LiveDependencySet, LivePlan, LiveRegistry,
+    RowsProjection, RowsSnapshotDependencyGraph, RowsSnapshotDirectedJoinEdge,
+    RowsSnapshotJoinEdge, RowsSnapshotLookupPrimitive, RowsSnapshotOrderKey,
+    RowsSnapshotPartialRefreshMetadata, RowsSnapshotPartialRefreshState,
+    RowsSnapshotRootSubsetMetadata, RowsSnapshotRootSubsetPlan, RowsSnapshotRootSubsetVariants,
+};
+#[cfg(feature = "benchmark")]
+use crate::profiling::SnapshotInitProfile;
+use crate::profiling::{now_ms, TraceInitProfile};
 use crate::query_engine::{
-    compile_cached_plan, compile_plan, execute_compiled_physical_plan,
-    execute_compiled_physical_plan_with_summary, execute_physical_plan, execute_plan, explain_plan,
-    CompiledPhysicalPlan,
+    compile_cached_plan_with_profile, execute_compiled_physical_plan,
+    execute_compiled_physical_plan_with_summary, execute_plan, explain_plan,
+    partial_refresh_overscan_for_limit, CompilePlanProfile, CompiledPhysicalPlan,
+    QueryResultSummary, RootSubsetPlanningProfile,
 };
 use crate::reactive_bridge::{JsChangesStream, JsIvmObservableQuery, JsObservableQuery};
 use crate::JsSortOrder;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use cynos_core::schema::Table;
 use cynos_core::{reserve_row_ids, DataType, Row, Value};
-use cynos_incremental::Delta;
+use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, Delta};
+use cynos_jsonb::path::{raw_json_contains_value, raw_json_eq_value, SimpleJsonPath};
 use cynos_query::ast::{AggregateFunc, SortOrder};
 use cynos_query::plan_cache::{compute_plan_fingerprint, PlanCache};
-use cynos_query::planner::LogicalPlan;
+use cynos_query::planner::{LogicalPlan, PhysicalPlan};
 use cynos_reactive::TableId;
+#[cfg(feature = "benchmark")]
+use cynos_storage::StorageInsertProfile;
 use cynos_storage::TableCache;
 use wasm_bindgen::prelude::*;
 
@@ -185,6 +199,41 @@ enum JoinType {
 }
 
 impl SelectBuilder {
+    fn partial_refresh_overscan(limit: usize) -> usize {
+        partial_refresh_overscan_for_limit(limit)
+    }
+
+    fn plan_cache_fingerprint(plan: &LogicalPlan, profile: CompilePlanProfile) -> u64 {
+        let fingerprint = compute_plan_fingerprint(plan);
+        match profile {
+            CompilePlanProfile::Default => fingerprint,
+            CompilePlanProfile::RootSubset(root_subset_profile) => {
+                const ROOT_SUBSET_TAG: u64 = 0xD8A4_81F2_5B39_C6E7;
+                let variant_tag = match root_subset_profile.variant {
+                    crate::query_engine::RootSubsetPlanVariant::Small => 0x91u64,
+                    crate::query_engine::RootSubsetPlanVariant::Large => 0xE3u64,
+                };
+                fingerprint.rotate_left(17) ^ ROOT_SUBSET_TAG ^ variant_tag
+            }
+        }
+    }
+
+    fn get_or_compile_cached_plan(
+        &self,
+        cache: &TableCache,
+        table_name: &str,
+        plan: LogicalPlan,
+        profile: CompilePlanProfile,
+    ) -> CompiledPhysicalPlan {
+        let fingerprint = Self::plan_cache_fingerprint(&plan, profile);
+        let mut plan_cache = self.plan_cache.borrow_mut();
+        plan_cache
+            .get_or_insert_compiled_with(fingerprint, || {
+                compile_cached_plan_with_profile(cache, table_name, plan, profile)
+            })
+            .clone()
+    }
+
     pub(crate) fn new(
         cache: Rc<RefCell<TableCache>>,
         query_registry: Rc<RefCell<LiveRegistry>>,
@@ -239,10 +288,8 @@ impl SelectBuilder {
     fn get_modifier_column_info(&self, col_name: &str) -> Option<(String, usize, DataType)> {
         if self.frozen_base.is_some() {
             self.get_frozen_output_column_info(col_name)
-        } else if !self.joins.is_empty() {
-            self.get_join_output_column_info(col_name)
         } else {
-            self.get_column_info_any_table(col_name)
+            self.get_plan_column_info_any_table(col_name)
         }
     }
 
@@ -284,6 +331,22 @@ impl SelectBuilder {
         }
 
         None
+    }
+
+    fn can_preserve_projection_table_identity(&self) -> bool {
+        let mut seen_tables = hashbrown::HashSet::new();
+
+        if let Some(main_table) = &self.from_table {
+            seen_tables.insert(main_table.clone());
+        }
+
+        for join in &self.joins {
+            if !seen_tables.insert(join.table.clone()) {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Gets column info for any table (main table or joined tables).
@@ -350,6 +413,76 @@ impl SelectBuilder {
                         .schema()
                         .get_column(col_name)
                         .map(|c| (join.reference_name().to_string(), c.index(), c.data_type()))
+                })
+            {
+                return Some(info);
+            }
+        }
+
+        None
+    }
+
+    /// Gets column info for plan construction while preserving the real table
+    /// identity for optimizer passes like predicate pushdown and outer-join
+    /// simplification.
+    ///
+    /// Unlike `get_column_info_any_table`, this resolves aliases back to the
+    /// underlying table name so filters and order-by expressions on join queries
+    /// are still attributable to their source tables.
+    fn get_plan_column_info_any_table(&self, col_name: &str) -> Option<(String, usize, DataType)> {
+        if let Some(dot_pos) = col_name.find('.') {
+            let table_part = &col_name[..dot_pos];
+            let col_part = &col_name[dot_pos + 1..];
+
+            if let Some(main_table) = &self.from_table {
+                if main_table == table_part {
+                    if let Some(schema) = self.get_schema() {
+                        if let Some(col) = schema.get_column(col_part) {
+                            return Some((main_table.clone(), col.index(), col.data_type()));
+                        }
+                    }
+                }
+            }
+
+            for join in &self.joins {
+                let ref_name = join.reference_name();
+                if ref_name == table_part || join.table == table_part {
+                    if let Some(store) = self.cache.borrow().get_table(&join.table) {
+                        if let Some(col) = store.schema().get_column(col_part) {
+                            return Some((join.table.clone(), col.index(), col.data_type()));
+                        }
+                    }
+                }
+            }
+
+            if let Some(info) = self.cache.borrow().get_table(table_part).and_then(|store| {
+                store
+                    .schema()
+                    .get_column(col_part)
+                    .map(|c| (table_part.to_string(), c.index(), c.data_type()))
+            }) {
+                return Some(info);
+            }
+        }
+
+        if let Some(table_name) = &self.from_table {
+            if let Some(schema) = self.get_schema() {
+                if let Some(col) = schema.get_column(col_name) {
+                    return Some((table_name.clone(), col.index(), col.data_type()));
+                }
+            }
+        }
+
+        for join in &self.joins {
+            if let Some(info) = self
+                .cache
+                .borrow()
+                .get_table(&join.table)
+                .and_then(|store| {
+                    store
+                        .schema()
+                        .get_column(col_name)
+                        .map(|c| (join.table.clone(), c.index(), c.data_type()))
                 })
             {
                 return Some(info);
@@ -581,6 +714,540 @@ impl SelectBuilder {
         self.apply_query_modifiers(root)
     }
 
+    fn rewrite_limit_for_candidate_window(
+        plan: LogicalPlan,
+        candidate_limit: usize,
+    ) -> LogicalPlan {
+        match plan {
+            LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+                input: Box::new(Self::rewrite_limit_for_candidate_window(
+                    *input,
+                    candidate_limit,
+                )),
+                predicate,
+            },
+            LogicalPlan::Project { input, columns } => LogicalPlan::Project {
+                input: Box::new(Self::rewrite_limit_for_candidate_window(
+                    *input,
+                    candidate_limit,
+                )),
+                columns,
+            },
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => LogicalPlan::Aggregate {
+                input: Box::new(Self::rewrite_limit_for_candidate_window(
+                    *input,
+                    candidate_limit,
+                )),
+                group_by,
+                aggregates,
+            },
+            LogicalPlan::Sort { input, order_by } => LogicalPlan::Sort {
+                input: Box::new(Self::rewrite_limit_for_candidate_window(
+                    *input,
+                    candidate_limit,
+                )),
+                order_by,
+            },
+            LogicalPlan::Limit { input, .. } => LogicalPlan::Limit {
+                input,
+                limit: candidate_limit,
+                offset: 0,
+            },
+            other => other,
+        }
+    }
+
+    fn resolve_partial_output_index(output: &QueryOutput, name: &str) -> Option<usize> {
+        output.resolve_column(name).map(|(index, _)| index)
+    }
+
+    fn resolve_partial_column_ref(
+        &self,
+        lookup: &str,
+        explicit_name: Option<&str>,
+    ) -> Option<(String, String, usize)> {
+        let (table, index, _) = self.get_plan_column_info_any_table(lookup)?;
+        let column = explicit_name
+            .map(ToString::to_string)
+            .unwrap_or_else(|| lookup.rsplit('.').next().unwrap_or(lookup).to_string());
+        Some((table, column, index))
+    }
+
+    fn resolve_partial_expr_column(
+        &self,
+        column: &crate::expr::Column,
+    ) -> Option<(String, String, usize)> {
+        let name = column.name();
+        if let Some(table_name) = column.table_name() {
+            self.resolve_partial_column_ref(&alloc::format!("{}.{}", table_name, name), Some(&name))
+        } else {
+            self.resolve_partial_column_ref(&name, Some(&name))
+        }
+    }
+
+    fn resolve_partial_value_column(&self, value: &JsValue) -> Option<(String, String, usize)> {
+        if let Some(lookup) = value.as_string() {
+            let explicit_name = lookup.rsplit('.').next().unwrap_or(lookup.as_str());
+            return self.resolve_partial_column_ref(&lookup, Some(explicit_name));
+        }
+
+        if !value.is_object() {
+            return None;
+        }
+
+        let name = js_sys::Reflect::get(value, &JsValue::from_str("name"))
+            .ok()
+            .and_then(|v| v.as_string())?;
+        let lookup = js_sys::Reflect::get(value, &JsValue::from_str("tableName"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .map(|table| alloc::format!("{}.{}", table, name))
+            .unwrap_or_else(|| name.clone());
+        self.resolve_partial_column_ref(&lookup, Some(&name))
+    }
+
+    fn collect_partial_join_edges(
+        &self,
+        expr: &Expr,
+        edges: &mut Vec<RowsSnapshotJoinEdge>,
+    ) -> bool {
+        match expr.inner() {
+            ExprInner::And { left, right } => {
+                self.collect_partial_join_edges(left, edges)
+                    && self.collect_partial_join_edges(right, edges)
+            }
+            ExprInner::Comparison { column, op, value } if *op == crate::expr::ComparisonOp::Eq => {
+                let Some((left_table, left_column, _)) = self.resolve_partial_expr_column(column)
+                else {
+                    return false;
+                };
+                let Some((right_table, right_column, _)) = self.resolve_partial_value_column(value)
+                else {
+                    return false;
+                };
+                if left_table == right_table {
+                    return false;
+                }
+                edges.push(RowsSnapshotJoinEdge {
+                    left_table,
+                    left_column,
+                    right_table,
+                    right_column,
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn resolve_table_id(&self, table_name: &str) -> Result<TableId, JsValue> {
+        self.table_id_map
+            .borrow()
+            .get(table_name)
+            .copied()
+            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table ID not found: {}", table_name)))
+    }
+
+    fn compiled_lookup_primitive(schema: &Table, column_name: &str) -> RowsSnapshotLookupPrimitive {
+        if let Some(primary_key) = schema.primary_key() {
+            if primary_key.columns().len() == 1
+                && primary_key
+                    .columns()
+                    .first()
+                    .map(|column| column.name.as_str())
+                    == Some(column_name)
+            {
+                return RowsSnapshotLookupPrimitive::PrimaryKey;
+            }
+        }
+
+        if let Some(index_name) = schema
+            .indices()
+            .iter()
+            .find(|index| {
+                index.get_index_type() != cynos_core::schema::IndexType::Gin
+                    && index.columns().len() == 1
+                    && index.columns().first().map(|column| column.name.as_str())
+                        == Some(column_name)
+            })
+            .map(|index| index.name().to_string())
+        {
+            return RowsSnapshotLookupPrimitive::SingleColumnIndex { index_name };
+        }
+
+        RowsSnapshotLookupPrimitive::ScanFallback
+    }
+
+    fn compile_rows_snapshot_dependency_graph(
+        &self,
+        root_table: &str,
+        join_edges: &[RowsSnapshotJoinEdge],
+    ) -> Result<RowsSnapshotDependencyGraph, JsValue> {
+        let root_table_id = self.resolve_table_id(root_table)?;
+        let mut table_names = hashbrown::HashMap::new();
+        table_names.insert(root_table_id, root_table.to_string());
+
+        let mut undirected_edges_by_source =
+            hashbrown::HashMap::<TableId, Vec<RowsSnapshotDirectedJoinEdge>>::new();
+        let cache = self.cache.borrow();
+
+        for edge in join_edges {
+            let left_table_id = self.resolve_table_id(&edge.left_table)?;
+            let right_table_id = self.resolve_table_id(&edge.right_table)?;
+
+            let left_store = cache.get_table(&edge.left_table).ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Table not found: {}", edge.left_table))
+            })?;
+            let right_store = cache.get_table(&edge.right_table).ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Table not found: {}", edge.right_table))
+            })?;
+
+            let left_column_index = left_store
+                .schema()
+                .get_column_index(&edge.left_column)
+                .ok_or_else(|| {
+                    JsValue::from_str(&alloc::format!(
+                        "Column not found: {}.{}",
+                        edge.left_table,
+                        edge.left_column
+                    ))
+                })?;
+            let right_column_index = right_store
+                .schema()
+                .get_column_index(&edge.right_column)
+                .ok_or_else(|| {
+                    JsValue::from_str(&alloc::format!(
+                        "Column not found: {}.{}",
+                        edge.right_table,
+                        edge.right_column
+                    ))
+                })?;
+
+            table_names.insert(left_table_id, edge.left_table.clone());
+            table_names.insert(right_table_id, edge.right_table.clone());
+
+            undirected_edges_by_source
+                .entry(left_table_id)
+                .or_insert_with(Vec::new)
+                .push(RowsSnapshotDirectedJoinEdge {
+                    source_column_index: left_column_index,
+                    target_table_id: right_table_id,
+                    target_table: edge.right_table.clone(),
+                    target_column_index: right_column_index,
+                    lookup: Self::compiled_lookup_primitive(
+                        right_store.schema(),
+                        &edge.right_column,
+                    ),
+                });
+            undirected_edges_by_source
+                .entry(right_table_id)
+                .or_insert_with(Vec::new)
+                .push(RowsSnapshotDirectedJoinEdge {
+                    source_column_index: right_column_index,
+                    target_table_id: left_table_id,
+                    target_table: edge.left_table.clone(),
+                    target_column_index: left_column_index,
+                    lookup: Self::compiled_lookup_primitive(left_store.schema(), &edge.left_column),
+                });
+        }
+
+        let mut distance_to_root = hashbrown::HashMap::<TableId, usize>::new();
+        let mut queue = VecDeque::new();
+        distance_to_root.insert(root_table_id, 0);
+        queue.push_back(root_table_id);
+
+        while let Some(table_id) = queue.pop_front() {
+            let next_distance = distance_to_root
+                .get(&table_id)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            for edge in undirected_edges_by_source
+                .get(&table_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                if distance_to_root.contains_key(&edge.target_table_id) {
+                    continue;
+                }
+                distance_to_root.insert(edge.target_table_id, next_distance);
+                queue.push_back(edge.target_table_id);
+            }
+        }
+
+        if distance_to_root.len() != table_names.len() {
+            return Err(JsValue::from_str(
+                "rows snapshot dependency graph is disconnected from the root table",
+            ));
+        }
+
+        let mut edges_by_source =
+            hashbrown::HashMap::<TableId, Vec<RowsSnapshotDirectedJoinEdge>>::new();
+        for (source_table_id, candidate_edges) in undirected_edges_by_source {
+            let Some(source_distance) = distance_to_root.get(&source_table_id).copied() else {
+                continue;
+            };
+            let directed_edges: Vec<_> = candidate_edges
+                .into_iter()
+                .filter(|edge| {
+                    distance_to_root
+                        .get(&edge.target_table_id)
+                        .map(|target_distance| *target_distance < source_distance)
+                        .unwrap_or(false)
+                })
+                .collect();
+            if !directed_edges.is_empty() {
+                edges_by_source.insert(source_table_id, directed_edges);
+            }
+        }
+
+        Ok(RowsSnapshotDependencyGraph {
+            root_table_id,
+            table_names,
+            edges_by_source,
+        })
+    }
+
+    fn build_rows_snapshot_partial_refresh_plan(
+        &self,
+        output: &QueryOutput,
+    ) -> Result<Option<RowsSnapshotPartialRefreshMetadata>, JsValue> {
+        if self.frozen_base.is_some()
+            || !self.aggregates.is_empty()
+            || !self.group_by_cols.is_empty()
+            || self.order_by.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let visible_limit = match self.limit_val {
+            Some(limit) if limit > 0 => limit,
+            _ => return Ok(None),
+        };
+        let visible_offset = self.offset_val.unwrap_or(0);
+
+        if self
+            .joins
+            .iter()
+            .any(|join| join.join_type == JoinType::Right)
+        {
+            return Ok(None);
+        }
+
+        let root_table = self
+            .from_table
+            .clone()
+            .ok_or_else(|| JsValue::from_str("FROM table not specified"))?;
+
+        let mut seen_tables = hashbrown::HashSet::new();
+        if !seen_tables.insert(root_table.clone()) {
+            return Ok(None);
+        }
+        for join in &self.joins {
+            if !seen_tables.insert(join.table.clone()) {
+                return Ok(None);
+            }
+        }
+
+        let cache = self.cache.borrow();
+        let root_store = cache
+            .get_table(&root_table)
+            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", root_table)))?;
+        let root_pk = match root_store.schema().primary_key() {
+            Some(pk) if !pk.columns().is_empty() => pk,
+            _ => return Ok(None),
+        };
+        let mut root_pk_output_indices = Vec::with_capacity(root_pk.columns().len());
+        for pk_column in root_pk.columns() {
+            let qualified = alloc::format!("{}.{}", root_table, pk_column.name);
+            let Some(output_index) = Self::resolve_partial_output_index(output, &qualified)
+                .or_else(|| Self::resolve_partial_output_index(output, &pk_column.name))
+            else {
+                return Ok(None);
+            };
+            root_pk_output_indices.push(output_index);
+        }
+
+        let mut order_keys = Vec::with_capacity(self.order_by.len());
+        for (column_name, order) in &self.order_by {
+            let Some(output_index) = Self::resolve_partial_output_index(output, column_name) else {
+                return Ok(None);
+            };
+            order_keys.push(RowsSnapshotOrderKey {
+                output_index,
+                order: *order,
+            });
+        }
+
+        let mut join_edges = Vec::new();
+        for join in &self.joins {
+            if !self.collect_partial_join_edges(&join.condition, &mut join_edges) {
+                return Ok(None);
+            }
+        }
+        let dependency_graph =
+            self.compile_rows_snapshot_dependency_graph(&root_table, &join_edges)?;
+
+        let overscan = Self::partial_refresh_overscan(visible_limit);
+        let candidate_limit = visible_offset
+            .saturating_add(visible_limit)
+            .saturating_add(overscan.saturating_mul(2));
+
+        Ok(Some(RowsSnapshotPartialRefreshMetadata {
+            root_table,
+            root_pk_output_indices,
+            order_keys,
+            visible_offset,
+            visible_limit,
+            overscan,
+            candidate_limit,
+            dependency_graph,
+        }))
+    }
+
+    fn plan_supports_root_subset_refresh(plan: &PhysicalPlan, root_table: &str) -> bool {
+        plan.collect_tables()
+            .iter()
+            .any(|table| table == root_table)
+            && Self::plan_allows_root_subset_refresh(plan)
+    }
+
+    fn plan_allows_root_subset_refresh(plan: &PhysicalPlan) -> bool {
+        match plan {
+            PhysicalPlan::TableScan { .. }
+            | PhysicalPlan::IndexScan { .. }
+            | PhysicalPlan::IndexGet { .. }
+            | PhysicalPlan::IndexInGet { .. }
+            | PhysicalPlan::GinIndexScan { .. }
+            | PhysicalPlan::GinIndexScanMulti { .. }
+            | PhysicalPlan::Empty => true,
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::NoOp { input } => Self::plan_allows_root_subset_refresh(input),
+            PhysicalPlan::HashJoin { left, right, .. }
+            | PhysicalPlan::SortMergeJoin { left, right, .. }
+            | PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+                Self::plan_allows_root_subset_refresh(left)
+                    && Self::plan_allows_root_subset_refresh(right)
+            }
+            PhysicalPlan::IndexNestedLoopJoin { outer, .. } => {
+                Self::plan_allows_root_subset_refresh(outer)
+            }
+            PhysicalPlan::HashAggregate { .. }
+            | PhysicalPlan::Sort { .. }
+            | PhysicalPlan::TopN { .. }
+            | PhysicalPlan::Limit { .. }
+            | PhysicalPlan::CrossProduct { .. }
+            | PhysicalPlan::Union { .. } => false,
+        }
+    }
+
+    fn build_rows_snapshot_root_subset_plan(
+        &self,
+        cache: &TableCache,
+        output: &QueryOutput,
+        logical_plan: &LogicalPlan,
+        compiled_plan: &CompiledPhysicalPlan,
+    ) -> Result<Option<RowsSnapshotRootSubsetPlan>, JsValue> {
+        if self.frozen_base.is_some()
+            || !self.aggregates.is_empty()
+            || !self.group_by_cols.is_empty()
+            || !self.order_by.is_empty()
+            || self.limit_val.is_some()
+            || self.offset_val.unwrap_or(0) > 0
+        {
+            return Ok(None);
+        }
+
+        if self
+            .joins
+            .iter()
+            .any(|join| join.join_type == JoinType::Right)
+        {
+            return Ok(None);
+        }
+
+        let root_table = self
+            .from_table
+            .clone()
+            .ok_or_else(|| JsValue::from_str("FROM table not specified"))?;
+        if !Self::plan_supports_root_subset_refresh(compiled_plan.physical_plan(), &root_table) {
+            return Ok(None);
+        }
+
+        let mut seen_tables = hashbrown::HashSet::new();
+        if !seen_tables.insert(root_table.clone()) {
+            return Ok(None);
+        }
+        for join in &self.joins {
+            if !seen_tables.insert(join.table.clone()) {
+                return Ok(None);
+            }
+        }
+
+        let root_store = cache
+            .get_table(&root_table)
+            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", root_table)))?;
+        let root_pk = match root_store.schema().primary_key() {
+            Some(pk) if !pk.columns().is_empty() => pk,
+            _ => return Ok(None),
+        };
+        let mut root_pk_output_indices = Vec::with_capacity(root_pk.columns().len());
+        let mut root_pk_store_indices = Vec::with_capacity(root_pk.columns().len());
+        for pk_column in root_pk.columns() {
+            let qualified = alloc::format!("{}.{}", root_table, pk_column.name);
+            let Some(output_index) = Self::resolve_partial_output_index(output, &qualified)
+                .or_else(|| Self::resolve_partial_output_index(output, &pk_column.name))
+            else {
+                return Ok(None);
+            };
+            let Some(store_index) = root_store.schema().get_column_index(&pk_column.name) else {
+                return Ok(None);
+            };
+            root_pk_store_indices.push(store_index);
+            root_pk_output_indices.push(output_index);
+        }
+
+        let mut join_edges = Vec::new();
+        for join in &self.joins {
+            if !self.collect_partial_join_edges(&join.condition, &mut join_edges) {
+                return Ok(None);
+            }
+        }
+        let dependency_graph =
+            self.compile_rows_snapshot_dependency_graph(&root_table, &join_edges)?;
+
+        let subset_compiled_plan_small = self.get_or_compile_cached_plan(
+            cache,
+            &root_table,
+            logical_plan.clone(),
+            CompilePlanProfile::RootSubset(RootSubsetPlanningProfile::small()),
+        );
+        let subset_compiled_plan_large = self.get_or_compile_cached_plan(
+            cache,
+            &root_table,
+            logical_plan.clone(),
+            CompilePlanProfile::RootSubset(RootSubsetPlanningProfile::large()),
+        );
+
+        Ok(Some(RowsSnapshotRootSubsetPlan {
+            metadata: RowsSnapshotRootSubsetMetadata {
+                root_table,
+                root_pk_store_indices,
+                root_pk_output_indices,
+                dependency_graph,
+            },
+            compiled_plans: RowsSnapshotRootSubsetVariants {
+                small: subset_compiled_plan_small,
+                large: subset_compiled_plan_large,
+            },
+        }))
+    }
+
     /// Gets column info for projection, calculating the correct index for JOIN queries.
     /// For JOIN queries, returns the table-relative index (not the absolute offset).
     /// The absolute index will be computed at runtime based on actual table order.
@@ -591,6 +1258,9 @@ impl SelectBuilder {
         }
 
         if !self.joins.is_empty() {
+            if self.can_preserve_projection_table_identity() {
+                return self.get_plan_column_info_any_table(col_name);
+            }
             return self.get_join_output_column_info(col_name);
         }
 
@@ -645,7 +1315,7 @@ impl SelectBuilder {
                 .map(|(index, column)| (String::new(), index, column.data_type));
         }
 
-        self.get_column_info_for_projection(col_name)
+        self.get_plan_column_info_any_table(col_name)
     }
 
     fn representative_schema(&self) -> Result<Table, JsValue> {
@@ -1364,17 +2034,10 @@ impl SelectBuilder {
             .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
 
         let plan = self.build_logical_plan(table_name);
-        let fingerprint = compute_plan_fingerprint(&plan);
         let result_mapper = self.build_result_mapper(store.schema())?;
         let binary_layout = self.binary_output_layout(table_name, store.schema())?;
-        let compiled_plan = {
-            let mut plan_cache = self.plan_cache.borrow_mut();
-            plan_cache
-                .get_or_insert_compiled_with(fingerprint, || {
-                    compile_cached_plan(&cache, table_name, plan)
-                })
-                .clone()
-        };
+        let compiled_plan =
+            self.get_or_compile_cached_plan(&cache, table_name, plan, CompilePlanProfile::Default);
 
         Ok(PreparedSelectQuery {
             cache: self.cache.clone(),
@@ -1421,6 +2084,10 @@ impl SelectBuilder {
     /// row-local patches for simple single-table pipelines instead of always
     /// re-executing the full query.
     pub fn observe(&self) -> Result<JsObservableQuery, JsValue> {
+        #[cfg(feature = "benchmark")]
+        let observe_started_at = now_ms();
+        #[cfg(feature = "benchmark")]
+        let mut snapshot_init_profile = SnapshotInitProfile::default();
         let table_name = self
             .from_table
             .as_ref()
@@ -1433,10 +2100,24 @@ impl SelectBuilder {
             .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
 
         // Build logical plan and compile to a cached execution artifact for re-execution.
+        #[cfg(feature = "benchmark")]
+        let logical_plan_started_at = now_ms();
         let logical_plan = self.build_logical_plan(table_name);
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.logical_plan_ms = now_ms() - logical_plan_started_at;
+        }
+        #[cfg(feature = "benchmark")]
+        let describe_output_started_at = now_ms();
         let output = self.describe_output()?;
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.describe_output_ms = now_ms() - describe_output_started_at;
+        }
         let output_columns = output.column_names();
         let schema = store.schema().clone();
+        #[cfg(feature = "benchmark")]
+        let binary_layout_started_at = now_ms();
         let binary_layout = if self.frozen_base.is_some() {
             output.layout()
         } else if self.joins.is_empty() {
@@ -1456,25 +2137,95 @@ impl SelectBuilder {
             }
             SchemaLayout::from_schemas(&schemas)
         };
-        let compiled_plan = compile_cached_plan(&cache, table_name, logical_plan.clone());
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.binary_layout_ms = now_ms() - binary_layout_started_at;
+        }
+        #[cfg(feature = "benchmark")]
+        let partial_refresh_started_at = now_ms();
+        let partial_refresh = self.build_rows_snapshot_partial_refresh_plan(&output)?;
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.partial_refresh_plan_ms = now_ms() - partial_refresh_started_at;
+            snapshot_init_profile.partial_refresh_enabled = partial_refresh.is_some();
+        }
+        let compiled_logical_plan = if let Some(partial) = &partial_refresh {
+            Self::rewrite_limit_for_candidate_window(logical_plan.clone(), partial.candidate_limit)
+        } else {
+            logical_plan.clone()
+        };
+        #[cfg(feature = "benchmark")]
+        let compile_main_plan_started_at = now_ms();
+        let compiled_plan = self.get_or_compile_cached_plan(
+            &cache,
+            table_name,
+            compiled_logical_plan,
+            CompilePlanProfile::Default,
+        );
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.compile_main_plan_ms = now_ms() - compile_main_plan_started_at;
+        }
+        #[cfg(feature = "benchmark")]
+        let root_subset_started_at = now_ms();
+        let root_subset_refresh = if partial_refresh.is_none() {
+            self.build_rows_snapshot_root_subset_plan(
+                &cache,
+                &output,
+                &logical_plan,
+                &compiled_plan,
+            )?
+        } else {
+            None
+        };
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.root_subset_plan_ms = now_ms() - root_subset_started_at;
+            snapshot_init_profile.root_subset_enabled = root_subset_refresh.is_some();
+        }
 
         // Get initial result using the compiled plan artifact.
+        #[cfg(feature = "benchmark")]
+        let initial_query_started_at = now_ms();
         let initial_output = execute_compiled_physical_plan_with_summary(&cache, &compiled_plan)
             .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.initial_query_ms = now_ms() - initial_query_started_at;
+            snapshot_init_profile.initial_row_count = initial_output.rows.len();
+        }
 
-        let dependencies = {
+        #[cfg(feature = "benchmark")]
+        let dependency_bindings_started_at = now_ms();
+        let (dependencies, dependency_table_bindings) = {
             let table_id_map = self.table_id_map.borrow();
-            let table_ids = logical_plan
+            let mut bindings = logical_plan
                 .collect_tables()
                 .into_iter()
                 .map(|table| {
-                    table_id_map.get(&table).copied().ok_or_else(|| {
-                        JsValue::from_str(&alloc::format!("Table ID not found: {}", table))
-                    })
+                    table_id_map
+                        .get(&table)
+                        .copied()
+                        .map(|table_id| (table_id, table.clone()))
+                        .ok_or_else(|| {
+                            JsValue::from_str(&alloc::format!("Table ID not found: {}", table))
+                        })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            LiveDependencySet::snapshot(table_ids)
+            bindings.sort_unstable_by(|(left_id, left_name), (right_id, right_name)| {
+                left_id
+                    .cmp(right_id)
+                    .then_with(|| left_name.cmp(right_name))
+            });
+            bindings.dedup_by(|left, right| left.0 == right.0);
+            let table_ids = bindings.iter().map(|(table_id, _)| *table_id).collect();
+            (LiveDependencySet::snapshot(table_ids), bindings)
         };
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.dependency_bindings_ms =
+                now_ms() - dependency_bindings_started_at;
+        }
 
         let projection = if self.frozen_base.is_some()
             || !self.aggregates.is_empty()
@@ -1495,16 +2246,62 @@ impl SelectBuilder {
 
         drop(cache); // Release borrow
 
+        #[cfg(feature = "benchmark")]
+        let initial_result_adapt_started_at = now_ms();
+        let (initial_rows, initial_summary, partial_refresh) =
+            if let Some(partial) = partial_refresh {
+                let visible_rows: Vec<Rc<Row>> = initial_output
+                    .rows
+                    .iter()
+                    .skip(partial.visible_offset)
+                    .take(partial.visible_limit)
+                    .cloned()
+                    .collect();
+                let visible_summary = QueryResultSummary::from_rows(&visible_rows);
+                (
+                    visible_rows,
+                    visible_summary,
+                    Some(RowsSnapshotPartialRefreshState {
+                        metadata: partial,
+                        initial_candidate_rows: initial_output.rows,
+                    }),
+                )
+            } else {
+                (initial_output.rows, initial_output.summary, None)
+            };
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.initial_result_adapt_ms =
+                now_ms() - initial_result_adapt_started_at;
+            snapshot_init_profile.visible_row_count = initial_rows.len();
+        }
+
         let live_plan = LivePlan::rows_snapshot(
             dependencies,
             compiled_plan,
-            initial_output.rows,
-            initial_output.summary,
+            initial_rows,
+            initial_summary,
             projection,
             binary_layout,
+            dependency_table_bindings,
+            partial_refresh,
+            root_subset_refresh,
         );
 
-        Ok(live_plan.materialize_rows_snapshot(cache_ref.clone(), self.query_registry.clone()))
+        #[cfg(feature = "benchmark")]
+        let observable_init_started_at = now_ms();
+        let observable =
+            live_plan.materialize_rows_snapshot(cache_ref.clone(), self.query_registry.clone());
+        #[cfg(feature = "benchmark")]
+        {
+            snapshot_init_profile.observable_init_ms = now_ms() - observable_init_started_at;
+            snapshot_init_profile.total_ms = now_ms() - observe_started_at;
+            self.query_registry
+                .borrow()
+                .record_snapshot_init_profile(snapshot_init_profile);
+        }
+
+        Ok(observable)
     }
 
     /// Creates a changes stream (initial + incremental).
@@ -1520,6 +2317,8 @@ impl SelectBuilder {
     ///
     /// Returns an error if the query is not incrementalizable (e.g. contains ORDER BY / LIMIT).
     pub fn trace(&self) -> Result<JsIvmObservableQuery, JsValue> {
+        let trace_started_at = now_ms();
+        let mut trace_init_profile = TraceInitProfile::default();
         let table_name = self
             .from_table
             .as_ref()
@@ -1555,7 +2354,15 @@ impl SelectBuilder {
             }
             SchemaLayout::from_schemas(&schemas)
         };
-        let physical_plan = compile_plan(&cache, table_name, logical_plan);
+        let compile_plan_started_at = now_ms();
+        let compiled_initial_plan = self.get_or_compile_cached_plan(
+            &cache,
+            table_name,
+            logical_plan,
+            CompilePlanProfile::Default,
+        );
+        let physical_plan = compiled_initial_plan.physical_plan().clone();
+        trace_init_profile.compile_plan_ms = now_ms() - compile_plan_started_at;
         let mut table_schemas = hashbrown::HashMap::new();
         table_schemas.insert(table_name.clone(), store.schema().clone());
         for join in &self.joins {
@@ -1567,21 +2374,41 @@ impl SelectBuilder {
 
         // Compile physical plan to dataflow — errors if not incrementalizable
         let table_id_map = self.table_id_map.borrow();
+        let compile_to_dataflow_started_at = now_ms();
         let compile_result = compile_to_dataflow(&physical_plan, &table_id_map, &table_schemas)
             .ok_or_else(|| JsValue::from_str(
                 "Query is not incrementalizable (contains ORDER BY, LIMIT, or other non-streamable operators). Use observe() instead."
             ))?;
+        trace_init_profile.compile_to_dataflow_ms = now_ms() - compile_to_dataflow_started_at;
+
+        let compile_trace_program_started_at = now_ms();
+        let compiled_ivm_plan =
+            CompiledIvmPlan::compile_with_trace_program(&compile_result.dataflow);
+        let compile_ivm_finished_at = now_ms();
+        trace_init_profile.compile_ivm_plan_ms =
+            compile_ivm_finished_at - compile_trace_program_started_at;
+        let compiled_bootstrap_plan = CompiledBootstrapPlan::compile(&compile_result.dataflow);
+        trace_init_profile.compile_trace_program_ms = now_ms() - compile_trace_program_started_at;
 
         // Get initial result using the compiled physical plan
-        let initial_rows = execute_physical_plan(&cache, &physical_plan)
-            .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
+        let initial_query_started_at = now_ms();
+        let initial_rows =
+            execute_compiled_physical_plan_with_summary(&cache, &compiled_initial_plan).map_err(
+                |e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)),
+            )?;
+        let initial_rows = initial_rows.rows;
+        trace_init_profile.initial_query_ms = now_ms() - initial_query_started_at;
 
         let dependencies =
             LiveDependencySet::snapshot(compile_result.table_ids.values().copied().collect());
+        let source_bindings = collect_trace_bootstrap_source_bindings(
+            &physical_plan,
+            &compile_result.table_ids,
+            &table_schemas,
+        );
         drop(cache);
         drop(table_id_map);
 
-        let initial_owned: Vec<Row> = initial_rows.iter().map(|rc| (**rc).clone()).collect();
         let projection = if self.frozen_base.is_some()
             || !self.aggregates.is_empty()
             || !self.group_by_cols.is_empty()
@@ -1599,15 +2426,24 @@ impl SelectBuilder {
             RowsProjection::Full { schema }
         };
 
+        let initial_row_count = initial_rows.len();
         let live_plan = LivePlan::rows_delta(
             dependencies,
             compile_result.dataflow,
-            initial_owned,
+            compiled_ivm_plan,
+            compiled_bootstrap_plan,
+            initial_rows,
+            source_bindings,
             projection,
             binary_layout,
+            TraceInitProfile {
+                total_ms: now_ms() - trace_started_at,
+                initial_row_count,
+                ..trace_init_profile
+            },
         );
 
-        Ok(live_plan.materialize_rows_delta(self.query_registry.clone()))
+        Ok(live_plan.materialize_rows_delta(self.cache.clone(), self.query_registry.clone()))
     }
 
     /// Gets the schema layout for binary decoding.
@@ -1647,20 +2483,10 @@ impl SelectBuilder {
         let schema = store.schema();
         let layout = self.binary_output_layout(table_name, schema)?;
 
-        // Compute plan fingerprint for caching
-        let fingerprint = compute_plan_fingerprint(&plan);
-
-        // Get or compile physical plan + execution artifact (cached)
-        let rows = {
-            let mut plan_cache = self.plan_cache.borrow_mut();
-            let compiled_plan = plan_cache.get_or_insert_compiled_with(fingerprint, || {
-                compile_cached_plan(&cache, table_name, plan)
-            });
-
-            // Execute the cached compiled plan
-            execute_compiled_physical_plan(&cache, compiled_plan)
-                .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?
-        };
+        let compiled_plan =
+            self.get_or_compile_cached_plan(&cache, table_name, plan, CompilePlanProfile::Default);
+        let rows = execute_compiled_physical_plan(&cache, &compiled_plan)
+            .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
 
         // Encode to binary
         let mut encoder = crate::binary_protocol::BinaryEncoder::new(layout, rows.len());
@@ -1707,6 +2533,8 @@ pub struct InsertBuilder {
     cache: Rc<RefCell<TableCache>>,
     query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    #[cfg(feature = "benchmark")]
+    last_insert_profile: Rc<RefCell<Option<StorageInsertProfile>>>,
     table_name: String,
     values_data: Option<JsValue>,
 }
@@ -1716,16 +2544,105 @@ impl InsertBuilder {
         cache: Rc<RefCell<TableCache>>,
         query_registry: Rc<RefCell<LiveRegistry>>,
         table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+        #[cfg(feature = "benchmark")] last_insert_profile: Rc<
+            RefCell<Option<StorageInsertProfile>>,
+        >,
         table: &str,
     ) -> Self {
         Self {
             cache,
             query_registry,
             table_id_map,
+            #[cfg(feature = "benchmark")]
+            last_insert_profile,
             table_name: table.to_string(),
             values_data: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InsertExecutionStats {
+    row_count: usize,
+}
+
+fn execute_insert_values(
+    cache: &Rc<RefCell<TableCache>>,
+    query_registry: &Rc<RefCell<LiveRegistry>>,
+    table_id_map: &Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    #[cfg(feature = "benchmark")] last_insert_profile: &Rc<RefCell<Option<StorageInsertProfile>>>,
+    table_name: &str,
+    values: &JsValue,
+) -> Result<InsertExecutionStats, JsValue> {
+    let schema = cache
+        .borrow()
+        .get_table(table_name)
+        .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?
+        .schema()
+        .clone();
+
+    let arr = js_sys::Array::from(values);
+    let start_row_id = reserve_row_ids(arr.length() as u64);
+    let rows = js_array_to_rows(values, &schema, start_row_id)?;
+
+    execute_insert_rows(
+        cache,
+        query_registry,
+        table_id_map,
+        #[cfg(feature = "benchmark")]
+        last_insert_profile,
+        table_name,
+        rows,
+    )
+    .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))
+}
+
+fn execute_insert_rows(
+    cache: &Rc<RefCell<TableCache>>,
+    query_registry: &Rc<RefCell<LiveRegistry>>,
+    table_id_map: &Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    #[cfg(feature = "benchmark")] last_insert_profile: &Rc<RefCell<Option<StorageInsertProfile>>>,
+    table_name: &str,
+    rows: Vec<Row>,
+) -> cynos_core::Result<InsertExecutionStats> {
+    let table_id = table_id_map.borrow().get(table_name).copied();
+    let should_notify = table_id.is_some() && query_registry.borrow().query_count() > 0;
+    let row_count = rows.len();
+
+    let inserted_ids = should_notify.then(|| {
+        rows.iter()
+            .map(|row| row.id())
+            .collect::<hashbrown::HashSet<_>>()
+    });
+    let deltas = should_notify.then(|| {
+        rows.iter()
+            .map(|row| Delta::insert(row.clone()))
+            .collect::<Vec<_>>()
+    });
+
+    let mut cache = cache.borrow_mut();
+    let store = cache
+        .get_table_mut(table_name)
+        .ok_or_else(|| cynos_core::Error::table_not_found(table_name))?;
+    #[cfg(feature = "benchmark")]
+    {
+        let (inserted, profile) = store.insert_batch_profiled(rows, now_ms)?;
+        debug_assert_eq!(inserted, row_count);
+        *last_insert_profile.borrow_mut() = Some(profile);
+    }
+    #[cfg(not(feature = "benchmark"))]
+    {
+        store.insert_batch(rows)?;
+    }
+    drop(cache);
+
+    if let (Some(table_id), Some(inserted_ids), Some(deltas)) = (table_id, inserted_ids, deltas) {
+        query_registry
+            .borrow_mut()
+            .on_table_change_delta(table_id, deltas, &inserted_ids);
+    }
+
+    Ok(InsertExecutionStats { row_count })
 }
 
 #[wasm_bindgen]
@@ -1742,46 +2659,16 @@ impl InsertBuilder {
             .values_data
             .as_ref()
             .ok_or_else(|| JsValue::from_str("No values specified"))?;
-
-        let mut cache = self.cache.borrow_mut();
-        let store = cache.get_table_mut(&self.table_name).ok_or_else(|| {
-            JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
-        })?;
-
-        let schema = store.schema().clone();
-
-        // Get the count of rows to insert first
-        let arr = js_sys::Array::from(values);
-        let row_count = arr.length() as u64;
-
-        // Reserve row IDs for all rows at once to avoid ID conflicts
-        let start_row_id = reserve_row_ids(row_count);
-
-        // Convert JS values to rows
-        let rows = js_array_to_rows(values, &schema, start_row_id)?;
-        let row_count = rows.len();
-
-        // Build deltas for IVM notification
-        let deltas: Vec<Delta<Row>> = rows.iter().map(|r| Delta::insert(r.clone())).collect();
-
-        // Insert rows and collect their IDs
-        let mut inserted_ids = hashbrown::HashSet::new();
-        for row in rows {
-            inserted_ids.insert(row.id());
-            store
-                .insert(row)
-                .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
-        }
-
-        // Notify query registry with changed IDs and deltas
-        if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
-            drop(cache); // Release borrow before notifying
-            self.query_registry
-                .borrow_mut()
-                .on_table_change_delta(table_id, deltas, &inserted_ids);
-        }
-
-        Ok(JsValue::from_f64(row_count as f64))
+        let stats = execute_insert_values(
+            &self.cache,
+            &self.query_registry,
+            &self.table_id_map,
+            #[cfg(feature = "benchmark")]
+            &self.last_insert_profile,
+            &self.table_name,
+            values,
+        )?;
+        Ok(JsValue::from_f64(stats.row_count as f64))
     }
 }
 
@@ -2514,6 +3401,17 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 _ => return false,
             };
 
+            let cmp_val = match js_to_value(value, DataType::String) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            if let Some(compiled_path) = SimpleJsonPath::parse(path) {
+                return compiled_path
+                    .extract(&jsonb_val.0)
+                    .map(|actual| raw_json_eq_value(actual, &cmp_val))
+                    .unwrap_or(false);
+            }
+
             // Parse JSON text bytes → cynos_jsonb::JsonbValue, then query path
             let json_str = match core::str::from_utf8(&jsonb_val.0) {
                 Ok(s) => s,
@@ -2533,11 +3431,7 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
             }
 
             // Compare first result with expected value
-            if let Ok(cmp_val) = js_to_value(value, DataType::String) {
-                compare_jsonb_with_value(results[0], &cmp_val)
-            } else {
-                false
-            }
+            compare_jsonb_with_value(results[0], &cmp_val)
         }
         ExprInner::JsonbContains {
             column,
@@ -2554,6 +3448,17 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 Some(Value::Jsonb(j)) => j,
                 _ => return false,
             };
+
+            let cmp_val = match js_to_value(value, DataType::String) {
+                Ok(Value::String(value)) => Value::String(value),
+                Ok(_) | Err(_) => return false,
+            };
+            if let Some(compiled_path) = SimpleJsonPath::parse(path) {
+                return compiled_path
+                    .extract(&jsonb_val.0)
+                    .map(|actual| raw_json_contains_value(actual, &cmp_val))
+                    .unwrap_or(false);
+            }
 
             let json_str = match core::str::from_utf8(&jsonb_val.0) {
                 Ok(s) => s,
@@ -2572,14 +3477,10 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 return false;
             }
 
-            if let Ok(cmp_val) = js_to_value(value, DataType::String) {
-                if let Value::String(s) = &cmp_val {
-                    // Check if the extracted value's string representation contains the search string
-                    let extracted_str = jsonb_value_to_string(results[0]);
-                    extracted_str.contains(s.as_str())
-                } else {
-                    false
-                }
+            if let Value::String(s) = &cmp_val {
+                // Check if the extracted value's string representation contains the search string
+                let extracted_str = jsonb_value_to_string(results[0]);
+                extracted_str.contains(s.as_str())
             } else {
                 false
             }
@@ -2595,6 +3496,10 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 Some(Value::Jsonb(j)) => j,
                 _ => return false,
             };
+
+            if let Some(compiled_path) = SimpleJsonPath::parse(path) {
+                return compiled_path.extract(&jsonb_val.0).is_some();
+            }
 
             let json_str = match core::str::from_utf8(&jsonb_val.0) {
                 Ok(s) => s,
@@ -2628,6 +3533,7 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
 mod tests {
     use super::*;
     use crate::binary_protocol::SchemaLayoutCache;
+    use crate::dataflow_compiler::compile_to_dataflow;
     use alloc::rc::Rc;
     use core::cell::RefCell;
     use cynos_core::schema::TableBuilder;
@@ -2951,6 +3857,160 @@ mod tests {
             }
             other => panic!("expected project plan, got {:?}", other),
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_select_builder_non_self_join_projection_preserves_source_tables_for_optimizer() {
+        let ctx = build_union_test_context();
+        let columns = js_sys::Array::new();
+        columns.push(&JsValue::from_str("users.name"));
+        columns.push(&JsValue::from_str("orders.amount"));
+
+        let query = ctx
+            .builder_with_columns(columns.into())
+            .from("users")
+            .left_join(
+                "orders",
+                &crate::expr::Column::new_simple("users.id").eq(&JsValue::from_str("orders.id")),
+            );
+
+        let plan = query.build_logical_plan("users");
+        match &plan {
+            LogicalPlan::Project { columns, .. } => {
+                assert_eq!(columns.len(), 2);
+                match &columns[0] {
+                    cynos_query::ast::Expr::Column(col) => {
+                        assert_eq!(col.table, "users");
+                        assert_eq!(col.index, 1);
+                    }
+                    other => panic!("expected projected column, got {:?}", other),
+                }
+                match &columns[1] {
+                    cynos_query::ast::Expr::Column(col) => {
+                        assert_eq!(col.table, "orders");
+                        assert_eq!(col.index, 1);
+                    }
+                    other => panic!("expected projected column, got {:?}", other),
+                }
+            }
+            other => panic!("expected project plan, got {:?}", other),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_trace_compile_omits_redundant_outer_join_dependency() {
+        let ctx = build_union_test_context();
+        let columns = js_sys::Array::new();
+        columns.push(&JsValue::from_str("users.name"));
+
+        let query = ctx
+            .builder_with_columns(columns.into())
+            .from("users")
+            .left_join(
+                "orders",
+                &crate::expr::Column::new_simple("users.id").eq(&JsValue::from_str("orders.id")),
+            );
+
+        let logical_plan = query.build_logical_plan("users");
+        let cache = ctx.cache.borrow();
+        let physical_plan = crate::query_engine::compile_plan(&cache, "users", logical_plan);
+        let physical_text = alloc::format!("{:#?}", physical_plan);
+
+        assert!(!physical_text.contains("table: \"orders\""));
+
+        let mut table_schemas = hashbrown::HashMap::new();
+        table_schemas.insert(
+            "users".to_string(),
+            cache.get_table("users").unwrap().schema().clone(),
+        );
+        table_schemas.insert(
+            "orders".to_string(),
+            cache.get_table("orders").unwrap().schema().clone(),
+        );
+
+        let table_id_map = ctx.table_id_map.borrow();
+        let compile_result = compile_to_dataflow(&physical_plan, &table_id_map, &table_schemas)
+            .expect("redundant join-free projection should stay incrementalizable");
+
+        assert!(compile_result.table_ids.contains_key("users"));
+        assert!(!compile_result.table_ids.contains_key("orders"));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_join_filters_and_order_by_preserve_source_tables_for_optimizer() {
+        let ctx = build_union_test_context();
+
+        let query = ctx
+            .builder()
+            .from("users")
+            .left_join(
+                "orders",
+                &crate::expr::Column::new_simple("users.id").eq(&JsValue::from_str("orders.id")),
+            )
+            .where_(&crate::expr::Column::new_simple("orders.amount").eq(&JsValue::from_f64(150.0)))
+            .order_by("users.id", JsSortOrder::Asc);
+
+        let plan = query.build_logical_plan("users");
+        match &plan {
+            LogicalPlan::Sort { input, order_by } => {
+                assert_eq!(order_by.len(), 1);
+                match &order_by[0].0 {
+                    cynos_query::ast::Expr::Column(col) => {
+                        assert_eq!(col.table, "users");
+                        assert_eq!(col.index, 0);
+                    }
+                    other => panic!("expected ORDER BY column, got {:?}", other),
+                }
+
+                match input.as_ref() {
+                    LogicalPlan::Filter { predicate, .. } => match predicate {
+                        cynos_query::ast::Expr::BinaryOp { left, .. } => match left.as_ref() {
+                            cynos_query::ast::Expr::Column(col) => {
+                                assert_eq!(col.table, "orders");
+                                assert_eq!(col.index, 1);
+                            }
+                            other => panic!("expected filter column, got {:?}", other),
+                        },
+                        other => panic!("expected binary predicate, got {:?}", other),
+                    },
+                    other => panic!("expected filter under sort, got {:?}", other),
+                }
+            }
+            other => panic!("expected sort plan, got {:?}", other),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_observe_reuses_cached_default_and_root_subset_plans() {
+        let ctx = build_union_test_context();
+        let columns = js_sys::Array::new();
+        columns.push(&JsValue::from_str("users.id"));
+        columns.push(&JsValue::from_str("users.name"));
+        columns.push(&JsValue::from_str("orders.amount"));
+
+        let query = ctx
+            .builder_with_columns(columns.into())
+            .from("users")
+            .left_join(
+                "orders",
+                &crate::expr::Column::new_simple("users.id").eq(&JsValue::from_str("orders.id")),
+            );
+
+        ctx.plan_cache.borrow_mut().clear();
+
+        let _first = query.observe().expect("first observe should succeed");
+        {
+            let plan_cache = ctx.plan_cache.borrow();
+            assert_eq!(plan_cache.misses(), 2);
+            assert_eq!(plan_cache.hits(), 0);
+            assert_eq!(plan_cache.len(), 2);
+        }
+
+        let _second = query.observe().expect("second observe should reuse cache");
+        let plan_cache = ctx.plan_cache.borrow();
+        assert_eq!(plan_cache.misses(), 2);
+        assert_eq!(plan_cache.hits(), 2);
+        assert_eq!(plan_cache.len(), 2);
     }
 
     #[wasm_bindgen_test]

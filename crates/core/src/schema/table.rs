@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::types::DataType;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// A table definition in the database schema.
@@ -286,6 +287,43 @@ impl TableBuilder {
         Ok(self)
     }
 
+    /// Adds a path-restricted GIN index for a JSONB column.
+    pub fn add_jsonb_index(
+        mut self,
+        name: impl Into<String>,
+        column: &str,
+        paths: &[&str],
+    ) -> Result<Self> {
+        let name = name.into();
+        Self::check_naming_rules(&name)?;
+
+        let column_def = self
+            .columns
+            .iter()
+            .find(|c| c.name() == column)
+            .ok_or_else(|| Error::InvalidSchema {
+                message: format!("Column not found: {}", column),
+            })?;
+
+        if column_def.data_type() != DataType::Jsonb {
+            return Err(Error::InvalidSchema {
+                message: format!("JSONB index requires Jsonb column: {}", column),
+            });
+        }
+
+        let normalized_paths = paths
+            .iter()
+            .filter(|path| !path.is_empty())
+            .map(|path| (*path).to_string())
+            .collect();
+
+        let idx = IndexDef::new(name, &self.name, vec![IndexedColumn::new(column)])
+            .index_type(IndexType::Gin)
+            .with_gin_paths(normalized_paths);
+        self.indices.push(idx);
+        Ok(self)
+    }
+
     /// Adds a hash index for point-lookups on scalar columns.
     pub fn add_hash_index(
         mut self,
@@ -521,6 +559,31 @@ mod tests {
         let index = table.get_index("idx_email_hash").unwrap();
         assert_eq!(index.get_index_type(), IndexType::Hash);
         assert!(index.is_unique());
+    }
+
+    #[test]
+    fn test_add_jsonb_index_paths() {
+        let table = TableBuilder::new("issues")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("metadata", DataType::Jsonb)
+            .unwrap()
+            .add_jsonb_index(
+                "idx_issues_metadata",
+                "metadata",
+                &["customer.tier", "risk.bucket"],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let index = table.get_index("idx_issues_metadata").unwrap();
+        assert_eq!(index.get_index_type(), IndexType::Gin);
+        assert_eq!(
+            index.gin_paths().unwrap(),
+            ["customer.tier".to_string(), "risk.bucket".to_string()]
+        );
     }
 }
 
