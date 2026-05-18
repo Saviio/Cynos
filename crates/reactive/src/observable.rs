@@ -14,7 +14,8 @@ use alloc::vec::Vec;
 use cynos_core::{Row, Value};
 use cynos_incremental::{
     BootstrapExecutionProfile, CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta,
-    MaterializedView, TableId, TraceDeltaBatch, TraceUpdateProfile,
+    MaterializedView, TableId, TraceDeltaBatch, TraceTupleArena, TraceTupleHandle,
+    TraceUpdateProfile,
 };
 use hashbrown::HashMap;
 
@@ -197,6 +198,42 @@ impl ObservableQuery {
                 compiled_bootstrap_plan,
                 initial,
                 visit_source_rows,
+                source_filter_coverage,
+                now_fn,
+            );
+        (
+            Self {
+                view,
+                subscriptions: SubscriptionManager::new(),
+                raw_delta_subscriptions: RawDeltaSubscriptionManager::new(),
+                trace_batch_subscriptions: TraceBatchSubscriptionManager::new(),
+                change_set_scratch: ChangeSet::new(),
+                initialized: true,
+            },
+            bootstrap_profile,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn with_compiled_source_slot_visitor_profiled_with_filter_coverage<F>(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<alloc::rc::Rc<Row>>,
+        visit_source_slot: F,
+        source_filter_coverage: Option<Vec<bool>>,
+        now_fn: Option<fn() -> f64>,
+    ) -> (Self, BootstrapExecutionProfile)
+    where
+        F: FnMut(TableId, usize, &TraceTupleArena, &mut Vec<TraceTupleHandle>),
+    {
+        let (view, bootstrap_profile) =
+            MaterializedView::with_compiled_source_slot_visitor_and_bootstrap_profiled_with_filter_coverage(
+                dataflow,
+                compiled_plan,
+                compiled_bootstrap_plan,
+                initial,
+                visit_source_slot,
                 source_filter_coverage,
                 now_fn,
             );

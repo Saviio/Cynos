@@ -67,6 +67,16 @@ impl JoinSideState {
         }
     }
 
+    fn with_col_count_and_capacity(col_count: usize, capacity: usize) -> Self {
+        Self {
+            buckets: HashMap::with_capacity(capacity),
+            row_to_slot: HashMap::with_capacity(capacity),
+            slots: Vec::with_capacity(capacity),
+            free_list: Vec::new(),
+            col_count,
+        }
+    }
+
     #[inline]
     fn ensure_col_count(&mut self, row: &TraceTupleHandle) {
         if self.col_count == 0 {
@@ -228,6 +238,20 @@ impl JoinState {
         Self {
             left: JoinSideState::with_col_count(left_col_count),
             right: JoinSideState::with_col_count(right_col_count),
+            match_scratch: Vec::new(),
+            normalize_scratch: JoinNormalizeScratch::default(),
+        }
+    }
+
+    fn with_col_counts_and_capacity(
+        left_col_count: usize,
+        right_col_count: usize,
+        left_capacity: usize,
+        right_capacity: usize,
+    ) -> Self {
+        Self {
+            left: JoinSideState::with_col_count_and_capacity(left_col_count, left_capacity),
+            right: JoinSideState::with_col_count_and_capacity(right_col_count, right_capacity),
             match_scratch: Vec::new(),
             normalize_scratch: JoinNormalizeScratch::default(),
         }
@@ -617,14 +641,7 @@ impl JoinState {
         self.process_right_delete(row.row_id(), join_type, arena, output);
     }
 
-    fn finalize_bootstrap_match_counts(&mut self) {
-        for slot in self.left.slots.iter_mut().filter_map(Option::as_mut) {
-            slot.match_count = 0;
-        }
-        for slot in self.right.slots.iter_mut().filter_map(Option::as_mut) {
-            slot.match_count = 0;
-        }
-
+    fn finalize_bootstrap_match_counts_for(&mut self, _join_type: JoinType) {
         let (left_slots, left_buckets) = (&mut self.left.slots, &self.left.buckets);
         let (right_slots, right_buckets) = (&mut self.right.slots, &self.right.buckets);
 
@@ -1166,12 +1183,20 @@ pub struct TraceUpdateProfile {
 
 #[derive(Clone, Debug, Default)]
 pub struct BootstrapExecutionProfile {
+    pub source_visit_ms: f64,
+    pub source_handle_wrap_ms: f64,
+    pub bootstrap_runtime_node_ms: f64,
+    pub bootstrap_slot_ms: f64,
     pub filter_bootstrap_ms: f64,
     pub project_bootstrap_ms: f64,
     pub map_bootstrap_ms: f64,
+    pub join_build_ms: f64,
+    pub join_finalize_ms: f64,
+    pub join_emit_ms: f64,
     pub join_bootstrap_ms: f64,
     pub aggregate_bootstrap_ms: f64,
     pub root_sink_ms: f64,
+    pub visible_store_init_ms: f64,
 }
 
 #[allow(dead_code)]
@@ -2852,7 +2877,7 @@ fn bootstrap_node_stream_with_source_visitor<F>(
                 },
             );
 
-            join_state.finalize_bootstrap_match_counts();
+            join_state.finalize_bootstrap_match_counts_for(*join_type);
             if emit_to_parent {
                 join_state.emit_bootstrap_rows(*join_type, &arena, emit);
             }
@@ -2900,6 +2925,23 @@ fn timed_block(now_fn: Option<fn() -> f64>, total_ms: &mut f64, run: impl FnOnce
     }
 }
 
+fn timed_block2(
+    now_fn: Option<fn() -> f64>,
+    primary_ms: &mut f64,
+    total_ms: &mut f64,
+    run: impl FnOnce(),
+) {
+    if let Some(now_fn) = now_fn {
+        let started_at = now_fn();
+        run();
+        let elapsed = now_fn() - started_at;
+        *primary_ms += elapsed;
+        *total_ms += elapsed;
+    } else {
+        run();
+    }
+}
+
 fn execute_compiled_bootstrap_program_with_source_visitor<F>(
     dataflow: &DataflowNode,
     plan: &CompiledBootstrapPlan,
@@ -2912,11 +2954,42 @@ fn execute_compiled_bootstrap_program_with_source_visitor<F>(
 where
     F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
 {
+    execute_compiled_bootstrap_program_with_source_slot_visitor(
+        dataflow,
+        plan,
+        &mut |table_id, source_index, arena, slot| {
+            let mut emit_source_row = |row: Rc<Row>| slot.push(arena.base_rc(row));
+            visit_source_rows(table_id, source_index, &mut emit_source_row);
+        },
+        source_filter_coverage,
+        join_states,
+        aggregate_states,
+        now_fn,
+    )
+}
+
+fn execute_compiled_bootstrap_program_with_source_slot_visitor<F>(
+    dataflow: &DataflowNode,
+    plan: &CompiledBootstrapPlan,
+    visit_source_slot: &mut F,
+    source_filter_coverage: Option<&[bool]>,
+    join_states: &mut HashMap<usize, JoinState>,
+    aggregate_states: &mut HashMap<usize, GroupAggregateState>,
+    now_fn: Option<fn() -> f64>,
+) -> BootstrapExecutionProfile
+where
+    F: FnMut(TableId, usize, &TraceTupleArena, &mut Vec<TraceTupleHandle>),
+{
     let arena = TraceTupleArena;
     let mut runtime_nodes = Vec::new();
-    collect_bootstrap_runtime_nodes(dataflow, &mut runtime_nodes);
-    let mut slots = vec![Vec::<TraceTupleHandle>::new(); plan.program.slot_count];
     let mut profile = BootstrapExecutionProfile::default();
+    timed_block(now_fn, &mut profile.bootstrap_runtime_node_ms, || {
+        collect_bootstrap_runtime_nodes(dataflow, &mut runtime_nodes)
+    });
+    let mut slots = Vec::new();
+    timed_block(now_fn, &mut profile.bootstrap_slot_ms, || {
+        slots = vec![Vec::<TraceTupleHandle>::new(); plan.program.slot_count];
+    });
 
     for instruction in plan.program.instructions.iter() {
         match instruction {
@@ -2933,8 +3006,9 @@ where
                 };
                 let slot = &mut slots[*output_slot];
                 slot.clear();
-                let mut emit_source_row = |row: Rc<Row>| slot.push(arena.base_rc(row));
-                visit_source_rows(table_id, *source_index, &mut emit_source_row);
+                timed_block(now_fn, &mut profile.source_visit_ms, || {
+                    visit_source_slot(table_id, *source_index, &arena, slot);
+                });
             }
             BootstrapInstruction::Filter {
                 node_index,
@@ -3041,27 +3115,50 @@ where
                 };
                 let left_input = mem::take(&mut slots[*left_slot]);
                 let right_input = mem::take(&mut slots[*right_slot]);
-                let mut join_state = JoinState::with_col_counts(*left_width, *right_width);
-                timed_block(now_fn, &mut profile.join_bootstrap_ms, || {
-                    for handle in left_input {
-                        let key = extract_join_key_handle(left_key, &arena, &handle);
-                        join_state.left.insert(handle, key, 0);
-                    }
-                    for handle in right_input {
-                        let key = extract_join_key_handle(right_key, &arena, &handle);
-                        join_state.right.insert(handle, key, 0);
-                    }
-                    join_state.finalize_bootstrap_match_counts();
-                });
+                let left_len = left_input.len();
+                let right_len = right_input.len();
+                let mut join_state = JoinState::with_col_counts_and_capacity(
+                    *left_width,
+                    *right_width,
+                    left_len,
+                    right_len,
+                );
+                timed_block2(
+                    now_fn,
+                    &mut profile.join_build_ms,
+                    &mut profile.join_bootstrap_ms,
+                    || {
+                        for handle in left_input {
+                            let key = extract_join_key_handle(left_key, &arena, &handle);
+                            join_state.left.insert(handle, key, 0);
+                        }
+                        for handle in right_input {
+                            let key = extract_join_key_handle(right_key, &arena, &handle);
+                            join_state.right.insert(handle, key, 0);
+                        }
+                    },
+                );
+                timed_block2(
+                    now_fn,
+                    &mut profile.join_finalize_ms,
+                    &mut profile.join_bootstrap_ms,
+                    || join_state.finalize_bootstrap_match_counts_for(join_type),
+                );
 
                 if let Some(output_slot) = output_slot {
                     let output = &mut slots[*output_slot];
                     output.clear();
-                    timed_block(now_fn, &mut profile.join_bootstrap_ms, || {
-                        join_state.emit_bootstrap_rows(join_type, &arena, &mut |handle| {
-                            output.push(handle);
-                        });
-                    });
+                    output.reserve(left_len);
+                    timed_block2(
+                        now_fn,
+                        &mut profile.join_emit_ms,
+                        &mut profile.join_bootstrap_ms,
+                        || {
+                            join_state.emit_bootstrap_rows(join_type, &arena, &mut |handle| {
+                                output.push(handle);
+                            });
+                        },
+                    );
                 } else {
                     // Root join is the visible sink in trace bootstrap; visible rows are already installed.
                     timed_block(now_fn, &mut profile.root_sink_ms, || {});
@@ -3346,6 +3443,28 @@ impl MaterializedView {
         .0
     }
 
+    pub fn with_compiled_source_slot_visitor_and_bootstrap<F>(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<Rc<Row>>,
+        visit_source_slot: F,
+    ) -> Self
+    where
+        F: FnMut(TableId, usize, &TraceTupleArena, &mut Vec<TraceTupleHandle>),
+    {
+        Self::with_compiled_source_slot_visitor_and_bootstrap_profiled_with_filter_coverage(
+            dataflow,
+            compiled_plan,
+            compiled_bootstrap_plan,
+            initial,
+            visit_source_slot,
+            None,
+            None,
+        )
+        .0
+    }
+
     pub fn with_compiled_source_visitor_and_bootstrap_profiled<F>(
         dataflow: DataflowNode,
         compiled_plan: CompiledIvmPlan,
@@ -3380,25 +3499,57 @@ impl MaterializedView {
     where
         F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
     {
+        Self::with_compiled_source_slot_visitor_and_bootstrap_profiled_with_filter_coverage(
+            dataflow,
+            compiled_plan,
+            compiled_bootstrap_plan,
+            initial,
+            move |table_id, source_index, arena, slot| {
+                let mut emit_source_row = |row: Rc<Row>| slot.push(arena.base_rc(row));
+                visit_source_rows(table_id, source_index, &mut emit_source_row);
+            },
+            source_filter_coverage,
+            now_fn,
+        )
+    }
+
+    pub fn with_compiled_source_slot_visitor_and_bootstrap_profiled_with_filter_coverage<F>(
+        dataflow: DataflowNode,
+        compiled_plan: CompiledIvmPlan,
+        compiled_bootstrap_plan: CompiledBootstrapPlan,
+        initial: Vec<Rc<Row>>,
+        mut visit_source_slot: F,
+        source_filter_coverage: Option<Vec<bool>>,
+        now_fn: Option<fn() -> f64>,
+    ) -> (Self, BootstrapExecutionProfile)
+    where
+        F: FnMut(TableId, usize, &TraceTupleArena, &mut Vec<TraceTupleHandle>),
+    {
         let dependencies = compiled_plan.sources().to_vec();
 
         let mut join_states = HashMap::new();
         let mut aggregate_states = HashMap::new();
-        let bootstrap_profile = execute_compiled_bootstrap_program_with_source_visitor(
+        let mut bootstrap_profile = execute_compiled_bootstrap_program_with_source_slot_visitor(
             &dataflow,
             &compiled_bootstrap_plan,
-            &mut visit_source_rows,
+            &mut visit_source_slot,
             source_filter_coverage.as_deref(),
             &mut join_states,
             &mut aggregate_states,
             now_fn,
         );
 
+        let visible_store_started_at = now_fn.map(|now_fn| now_fn());
+        let visible_rows = VisibleResultStore::from_rc_rows(initial);
+        if let (Some(now_fn), Some(started_at)) = (now_fn, visible_store_started_at) {
+            bootstrap_profile.visible_store_init_ms += now_fn() - started_at;
+        }
+
         (
             Self {
                 dataflow,
                 compiled_plan,
-                visible_rows: VisibleResultStore::from_rc_rows(initial),
+                visible_rows,
                 dependencies,
                 join_states,
                 aggregate_states,
@@ -4150,6 +4301,30 @@ mod tests {
         }
     }
 
+    fn make_employee_department_right_outer_join() -> DataflowNode {
+        DataflowNode::Join {
+            left: Box::new(DataflowNode::source(1)),
+            right: Box::new(DataflowNode::source(2)),
+            left_key: JoinKeySpec::Columns(vec![2]),
+            right_key: JoinKeySpec::Columns(vec![0]),
+            join_type: JoinType::RightOuter,
+            left_width: 3,
+            right_width: 2,
+        }
+    }
+
+    fn make_employee_department_full_outer_join() -> DataflowNode {
+        DataflowNode::Join {
+            left: Box::new(DataflowNode::source(1)),
+            right: Box::new(DataflowNode::source(2)),
+            left_key: JoinKeySpec::Columns(vec![2]),
+            right_key: JoinKeySpec::Columns(vec![0]),
+            join_type: JoinType::FullOuter,
+            left_width: 3,
+            right_width: 2,
+        }
+    }
+
     fn make_sum_aggregate() -> DataflowNode {
         DataflowNode::Aggregate {
             input: Box::new(DataflowNode::source(1)),
@@ -4847,6 +5022,53 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_bootstrap_keeps_exact_inner_match_counts_after_delete() {
+        let employee_a = make_employee(1, 200, 10);
+        let employee_b = make_employee(2, 201, 10);
+        let department_old = make_department(10, 100);
+        let department_new = make_department(10, 101);
+        let initial = vec![
+            merge_rows(&employee_a, &department_old),
+            merge_rows(&employee_b, &department_old),
+        ];
+
+        let mut source_rows = HashMap::new();
+        source_rows.insert((1, 0), vec![employee_a.clone(), employee_b]);
+        source_rows.insert((2, 1), vec![department_old.clone()]);
+
+        let mut legacy_view = bootstrap_view_with_legacy_executor(
+            make_employee_department_inner_join(),
+            initial.clone(),
+            &source_rows,
+        );
+        let mut compiled_view = bootstrap_view_with_compiled_executor(
+            make_employee_department_inner_join(),
+            initial,
+            &source_rows,
+        );
+
+        let delete_one_left = vec![Delta::delete(employee_a)];
+        assert_eq!(
+            normalize_deltas(&legacy_view.on_table_change(1, delete_one_left.clone())),
+            normalize_deltas(&compiled_view.on_table_change(1, delete_one_left))
+        );
+
+        let update_right_same_key =
+            vec![Delta::delete(department_old), Delta::insert(department_new)];
+        let legacy_output = legacy_view.on_table_change(2, update_right_same_key.clone());
+        let compiled_output = compiled_view.on_table_change(2, update_right_same_key);
+
+        assert_eq!(
+            normalize_deltas(&legacy_output),
+            normalize_deltas(&compiled_output)
+        );
+        assert_eq!(
+            normalize_rows(&legacy_view.result()),
+            normalize_rows(&compiled_view.result())
+        );
+    }
+
+    #[test]
     fn test_compiled_bootstrap_matches_legacy_left_outer_join_followup_delta() {
         let employee = make_employee(1, 200, 99);
         let initial = vec![merge_rows_null_right(&employee, 2)];
@@ -4867,6 +5089,78 @@ mod tests {
         );
 
         let follow_up = vec![Delta::insert(make_department(99, 300))];
+        let legacy_output = legacy_view.on_table_change(2, follow_up.clone());
+        let compiled_output = compiled_view.on_table_change(2, follow_up);
+
+        assert_eq!(
+            normalize_deltas(&legacy_output),
+            normalize_deltas(&compiled_output)
+        );
+        assert_eq!(
+            normalize_rows(&legacy_view.result()),
+            normalize_rows(&compiled_view.result())
+        );
+    }
+
+    #[test]
+    fn test_compiled_bootstrap_matches_legacy_right_outer_join_followup_delta() {
+        let department = make_department(99, 300);
+        let initial = vec![merge_rows_null_left(&department, 3)];
+
+        let mut source_rows = HashMap::new();
+        source_rows.insert((1, 0), Vec::new());
+        source_rows.insert((2, 1), vec![department]);
+
+        let mut legacy_view = bootstrap_view_with_legacy_executor(
+            make_employee_department_right_outer_join(),
+            initial.clone(),
+            &source_rows,
+        );
+        let mut compiled_view = bootstrap_view_with_compiled_executor(
+            make_employee_department_right_outer_join(),
+            initial,
+            &source_rows,
+        );
+
+        let follow_up = vec![Delta::insert(make_employee(1, 200, 99))];
+        let legacy_output = legacy_view.on_table_change(1, follow_up.clone());
+        let compiled_output = compiled_view.on_table_change(1, follow_up);
+
+        assert_eq!(
+            normalize_deltas(&legacy_output),
+            normalize_deltas(&compiled_output)
+        );
+        assert_eq!(
+            normalize_rows(&legacy_view.result()),
+            normalize_rows(&compiled_view.result())
+        );
+    }
+
+    #[test]
+    fn test_compiled_bootstrap_matches_legacy_full_outer_join_followup_delta() {
+        let employee = make_employee(1, 200, 99);
+        let department = make_department(10, 300);
+        let initial = vec![
+            merge_rows_null_right(&employee, 2),
+            merge_rows_null_left(&department, 3),
+        ];
+
+        let mut source_rows = HashMap::new();
+        source_rows.insert((1, 0), vec![employee]);
+        source_rows.insert((2, 1), vec![department]);
+
+        let mut legacy_view = bootstrap_view_with_legacy_executor(
+            make_employee_department_full_outer_join(),
+            initial.clone(),
+            &source_rows,
+        );
+        let mut compiled_view = bootstrap_view_with_compiled_executor(
+            make_employee_department_full_outer_join(),
+            initial,
+            &source_rows,
+        );
+
+        let follow_up = vec![Delta::insert(make_department(99, 301))];
         let legacy_output = legacy_view.on_table_change(2, follow_up.clone());
         let compiled_output = compiled_view.on_table_change(2, follow_up);
 

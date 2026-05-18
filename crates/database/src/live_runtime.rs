@@ -21,6 +21,7 @@ use cynos_gql::{bind::BoundRootField, GraphqlCatalog};
 #[cfg(feature = "benchmark")]
 use cynos_incremental::TraceUpdateProfile;
 use cynos_incremental::{CompiledBootstrapPlan, CompiledIvmPlan, DataflowNode, Delta, TableId};
+use cynos_incremental::{TraceTupleArena, TraceTupleHandle};
 use cynos_index::KeyRange;
 use cynos_query::ast::SortOrder;
 use cynos_query::planner::{IndexBounds, PhysicalPlan};
@@ -577,6 +578,223 @@ pub(crate) fn collect_trace_bootstrap_source_bindings(
     bindings
 }
 
+fn trace_bootstrap_slot_capacity_hint(
+    store: &cynos_storage::RowStore,
+    binding: &TraceBootstrapSourceBinding,
+) -> Option<usize> {
+    match &binding.access_path {
+        TraceBootstrapAccessPath::FullScan => Some(store.len()),
+        TraceBootstrapAccessPath::IndexScanScalar { limit, .. }
+        | TraceBootstrapAccessPath::IndexScanComposite { limit, .. } => *limit,
+        TraceBootstrapAccessPath::IndexGet { limit, .. } => Some(limit.unwrap_or(1)),
+        TraceBootstrapAccessPath::IndexInGet { keys, .. } => Some(keys.len()),
+        TraceBootstrapAccessPath::GinKeyValue { index, key, value } => {
+            Some(store.gin_index_cost_key_value(index, key, value))
+        }
+        TraceBootstrapAccessPath::GinKey { index, key } => {
+            Some(store.gin_index_cost_key(index, key))
+        }
+        TraceBootstrapAccessPath::GinMulti {
+            index,
+            pairs,
+            match_all,
+        } => {
+            let costs = pairs
+                .iter()
+                .map(|(key, value)| store.gin_index_cost_key_value(index, key, value));
+            if *match_all {
+                costs.min()
+            } else {
+                Some(costs.fold(0usize, usize::saturating_add).min(store.len()))
+            }
+        }
+    }
+}
+
+fn push_trace_bootstrap_slot_row(
+    arena: &TraceTupleArena,
+    slot: &mut Vec<TraceTupleHandle>,
+    row: &Rc<Row>,
+    now_fn: Option<fn() -> f64>,
+    handle_wrap_ms: &mut f64,
+) {
+    if let Some(now_fn) = now_fn {
+        let started_at = now_fn();
+        slot.push(arena.base_rc(Rc::clone(row)));
+        *handle_wrap_ms += now_fn() - started_at;
+    } else {
+        slot.push(arena.base_rc(Rc::clone(row)));
+    }
+}
+
+fn visit_trace_bootstrap_binding_rows_into_slot(
+    cache: &TableCache,
+    binding: &TraceBootstrapSourceBinding,
+    arena: &TraceTupleArena,
+    slot: &mut Vec<TraceTupleHandle>,
+    now_fn: Option<fn() -> f64>,
+) -> f64 {
+    let Some(store) = cache.get_table(&binding.table_name) else {
+        return 0.0;
+    };
+
+    if let Some(capacity_hint) = trace_bootstrap_slot_capacity_hint(store, binding) {
+        slot.reserve(capacity_hint);
+    }
+
+    let mut handle_wrap_ms = 0.0;
+    match &binding.access_path {
+        TraceBootstrapAccessPath::FullScan => {
+            store.visit_rows(|row| {
+                push_trace_bootstrap_slot_row(arena, slot, row, now_fn, &mut handle_wrap_ms);
+                true
+            });
+        }
+        TraceBootstrapAccessPath::IndexScanScalar {
+            index,
+            range,
+            limit,
+            offset,
+            reverse,
+        } => {
+            store.visit_index_scan_with_options(
+                index,
+                range.as_ref(),
+                *limit,
+                *offset,
+                *reverse,
+                |row| {
+                    push_trace_bootstrap_slot_row(arena, slot, row, now_fn, &mut handle_wrap_ms);
+                    true
+                },
+            );
+        }
+        TraceBootstrapAccessPath::IndexScanComposite {
+            index,
+            range,
+            limit,
+            offset,
+            reverse,
+        } => {
+            store.visit_index_scan_composite_with_options(
+                index,
+                range.as_ref(),
+                *limit,
+                *offset,
+                *reverse,
+                |row| {
+                    push_trace_bootstrap_slot_row(arena, slot, row, now_fn, &mut handle_wrap_ms);
+                    true
+                },
+            );
+        }
+        TraceBootstrapAccessPath::IndexGet { index, key, limit } => {
+            let mut seen_ids = BTreeSet::new();
+            let mut remaining = limit.unwrap_or(usize::MAX);
+            let enforce_limit = limit.is_some();
+
+            for probe_key in trace_bootstrap_sql_point_lookup_keys(key) {
+                if enforce_limit && remaining == 0 {
+                    break;
+                }
+
+                let range = KeyRange::only(probe_key);
+                let mut keep_scanning = true;
+                store.visit_index_scan_with_options(
+                    index,
+                    Some(&range),
+                    if enforce_limit { Some(remaining) } else { None },
+                    0,
+                    false,
+                    |row| {
+                        if !seen_ids.insert(row.id()) {
+                            return true;
+                        }
+
+                        push_trace_bootstrap_slot_row(
+                            arena,
+                            slot,
+                            row,
+                            now_fn,
+                            &mut handle_wrap_ms,
+                        );
+                        if enforce_limit {
+                            remaining = remaining.saturating_sub(1);
+                        }
+                        keep_scanning = !enforce_limit || remaining > 0;
+                        keep_scanning
+                    },
+                );
+                if !keep_scanning {
+                    break;
+                }
+            }
+        }
+        TraceBootstrapAccessPath::IndexInGet { index, keys } => {
+            let mut seen_ids = BTreeSet::new();
+            for key in keys {
+                for probe_key in trace_bootstrap_sql_point_lookup_keys(key) {
+                    let range = KeyRange::only(probe_key);
+                    store.visit_index_scan_with_options(
+                        index,
+                        Some(&range),
+                        None,
+                        0,
+                        false,
+                        |row| {
+                            if seen_ids.insert(row.id()) {
+                                push_trace_bootstrap_slot_row(
+                                    arena,
+                                    slot,
+                                    row,
+                                    now_fn,
+                                    &mut handle_wrap_ms,
+                                );
+                            }
+                            true
+                        },
+                    );
+                }
+            }
+        }
+        TraceBootstrapAccessPath::GinKeyValue { index, key, value } => {
+            store.visit_gin_index_by_key_value(index, key, value, |row| {
+                push_trace_bootstrap_slot_row(arena, slot, row, now_fn, &mut handle_wrap_ms);
+                true
+            });
+        }
+        TraceBootstrapAccessPath::GinKey { index, key } => {
+            store.visit_gin_index_by_key(index, key, |row| {
+                push_trace_bootstrap_slot_row(arena, slot, row, now_fn, &mut handle_wrap_ms);
+                true
+            });
+        }
+        TraceBootstrapAccessPath::GinMulti {
+            index,
+            pairs,
+            match_all,
+        } => {
+            let pair_refs: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            if *match_all {
+                store.visit_gin_index_by_key_values_all(index, &pair_refs, |row| {
+                    push_trace_bootstrap_slot_row(arena, slot, row, now_fn, &mut handle_wrap_ms);
+                    true
+                });
+            } else {
+                store.visit_gin_index_by_key_values_any(index, &pair_refs, |row| {
+                    push_trace_bootstrap_slot_row(arena, slot, row, now_fn, &mut handle_wrap_ms);
+                    true
+                });
+            }
+        }
+    }
+
+    handle_wrap_ms
+}
+
 fn visit_trace_bootstrap_binding_rows(
     cache: &TableCache,
     binding: &TraceBootstrapSourceBinding,
@@ -944,35 +1162,41 @@ impl LivePlan {
         let source_emit_ms = Rc::new(RefCell::new(0.0));
         let source_access_ms_ref = source_access_ms.clone();
         let source_emit_ms_ref = source_emit_ms.clone();
+        #[cfg(feature = "benchmark")]
+        let bootstrap_now_fn = Some(now_ms as fn() -> f64);
+        #[cfg(not(feature = "benchmark"))]
+        let bootstrap_now_fn = None;
         let (observable, bootstrap_profile) =
-            ObservableQuery::with_compiled_source_visitor_profiled_with_filter_coverage(
+            ObservableQuery::with_compiled_source_slot_visitor_profiled_with_filter_coverage(
                 kernel.dataflow,
                 kernel.compiled_ivm_plan,
                 kernel.compiled_bootstrap_plan,
                 kernel.initial_rows,
-                move |table_id, source_index, emit| {
-                    let load_started_at = now_ms();
-                    let mut emit_local_ms = 0.0;
-                    {
+                move |table_id, source_index, arena, slot| {
+                    let load_started_at = bootstrap_now_fn.map(|now_fn| now_fn());
+                    let handle_wrap_ms = {
                         let cache = cache_for_loader.borrow();
                         let Some(binding) = source_bindings.get(source_index) else {
                             return;
                         };
                         debug_assert_eq!(binding.source_index, source_index);
                         debug_assert_eq!(binding.table_id, table_id);
-                        let mut timed_emit = |row: Rc<Row>| {
-                            let emit_started_at = now_ms();
-                            emit(row);
-                            emit_local_ms += now_ms() - emit_started_at;
-                        };
-                        visit_trace_bootstrap_binding_rows(&cache, binding, &mut timed_emit);
+                        visit_trace_bootstrap_binding_rows_into_slot(
+                            &cache,
+                            binding,
+                            arena,
+                            slot,
+                            bootstrap_now_fn,
+                        )
+                    };
+                    if let (Some(now_fn), Some(started_at)) = (bootstrap_now_fn, load_started_at) {
+                        let total_ms = now_fn() - started_at;
+                        *source_emit_ms_ref.borrow_mut() += handle_wrap_ms;
+                        *source_access_ms_ref.borrow_mut() += (total_ms - handle_wrap_ms).max(0.0);
                     }
-                    let total_ms = now_ms() - load_started_at;
-                    *source_emit_ms_ref.borrow_mut() += emit_local_ms;
-                    *source_access_ms_ref.borrow_mut() += (total_ms - emit_local_ms).max(0.0);
                 },
                 Some(source_filter_coverage),
-                Some(now_ms),
+                bootstrap_now_fn,
             );
         let observable = Rc::new(RefCell::new(observable));
         trace_init_profile.source_access_ms = *source_access_ms.borrow();
@@ -981,12 +1205,21 @@ impl LivePlan {
             trace_init_profile.source_access_ms + trace_init_profile.source_emit_ms;
         trace_init_profile.bootstrap_scan_ms = trace_init_profile.source_bootstrap_ms;
         trace_init_profile.materialized_view_init_ms = now_ms() - init_started_at;
+        trace_init_profile.source_visit_ms = bootstrap_profile.source_visit_ms;
+        trace_init_profile.source_handle_wrap_ms =
+            trace_init_profile.source_emit_ms + bootstrap_profile.source_handle_wrap_ms;
+        trace_init_profile.bootstrap_runtime_node_ms = bootstrap_profile.bootstrap_runtime_node_ms;
+        trace_init_profile.bootstrap_slot_ms = bootstrap_profile.bootstrap_slot_ms;
         trace_init_profile.filter_bootstrap_ms = bootstrap_profile.filter_bootstrap_ms;
         trace_init_profile.project_bootstrap_ms = bootstrap_profile.project_bootstrap_ms;
         trace_init_profile.map_bootstrap_ms = bootstrap_profile.map_bootstrap_ms;
+        trace_init_profile.join_build_ms = bootstrap_profile.join_build_ms;
+        trace_init_profile.join_finalize_ms = bootstrap_profile.join_finalize_ms;
+        trace_init_profile.join_emit_ms = bootstrap_profile.join_emit_ms;
         trace_init_profile.join_bootstrap_ms = bootstrap_profile.join_bootstrap_ms;
         trace_init_profile.aggregate_bootstrap_ms = bootstrap_profile.aggregate_bootstrap_ms;
         trace_init_profile.root_sink_ms = bootstrap_profile.root_sink_ms;
+        trace_init_profile.visible_store_init_ms = bootstrap_profile.visible_store_init_ms;
         trace_init_profile.bootstrap_execute_ms = (trace_init_profile.materialized_view_init_ms
             - trace_init_profile.source_bootstrap_ms)
             .max(0.0);

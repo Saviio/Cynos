@@ -885,6 +885,18 @@ fn trace_init_profile_to_js_value(profile: TraceInitProfile) -> JsValue {
     .ok();
     js_sys::Reflect::set(
         &object,
+        &JsValue::from_str("sourceVisitMs"),
+        &JsValue::from_f64(profile.source_visit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("sourceHandleWrapMs"),
+        &JsValue::from_f64(profile.source_handle_wrap_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
         &JsValue::from_str("bootstrapScanMs"),
         &JsValue::from_f64(profile.bootstrap_scan_ms),
     )
@@ -893,6 +905,18 @@ fn trace_init_profile_to_js_value(profile: TraceInitProfile) -> JsValue {
         &object,
         &JsValue::from_str("bootstrapExecuteMs"),
         &JsValue::from_f64(profile.bootstrap_execute_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("bootstrapRuntimeNodeMs"),
+        &JsValue::from_f64(profile.bootstrap_runtime_node_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("bootstrapSlotMs"),
+        &JsValue::from_f64(profile.bootstrap_slot_ms),
     )
     .ok();
     js_sys::Reflect::set(
@@ -915,6 +939,24 @@ fn trace_init_profile_to_js_value(profile: TraceInitProfile) -> JsValue {
     .ok();
     js_sys::Reflect::set(
         &object,
+        &JsValue::from_str("joinBuildMs"),
+        &JsValue::from_f64(profile.join_build_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("joinFinalizeMs"),
+        &JsValue::from_f64(profile.join_finalize_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("joinEmitMs"),
+        &JsValue::from_f64(profile.join_emit_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
         &JsValue::from_str("joinBootstrapMs"),
         &JsValue::from_f64(profile.join_bootstrap_ms),
     )
@@ -929,6 +971,12 @@ fn trace_init_profile_to_js_value(profile: TraceInitProfile) -> JsValue {
         &object,
         &JsValue::from_str("rootSinkMs"),
         &JsValue::from_f64(profile.root_sink_ms),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &object,
+        &JsValue::from_str("visibleStoreInitMs"),
+        &JsValue::from_f64(profile.visible_store_init_ms),
     )
     .ok();
     js_sys::Reflect::set(

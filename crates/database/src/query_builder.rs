@@ -18,8 +18,8 @@ use crate::live_runtime::{
 use crate::profiling::SnapshotInitProfile;
 use crate::profiling::{now_ms, TraceInitProfile};
 use crate::query_engine::{
-    compile_cached_plan_with_profile, compile_plan, execute_compiled_physical_plan,
-    execute_compiled_physical_plan_with_summary, execute_physical_plan, execute_plan, explain_plan,
+    compile_cached_plan_with_profile, execute_compiled_physical_plan,
+    execute_compiled_physical_plan_with_summary, execute_plan, explain_plan,
     partial_refresh_overscan_for_limit, CompilePlanProfile, CompiledPhysicalPlan,
     QueryResultSummary, RootSubsetPlanningProfile,
 };
@@ -2355,7 +2355,13 @@ impl SelectBuilder {
             SchemaLayout::from_schemas(&schemas)
         };
         let compile_plan_started_at = now_ms();
-        let physical_plan = compile_plan(&cache, table_name, logical_plan);
+        let compiled_initial_plan = self.get_or_compile_cached_plan(
+            &cache,
+            table_name,
+            logical_plan,
+            CompilePlanProfile::Default,
+        );
+        let physical_plan = compiled_initial_plan.physical_plan().clone();
         trace_init_profile.compile_plan_ms = now_ms() - compile_plan_started_at;
         let mut table_schemas = hashbrown::HashMap::new();
         table_schemas.insert(table_name.clone(), store.schema().clone());
@@ -2386,8 +2392,11 @@ impl SelectBuilder {
 
         // Get initial result using the compiled physical plan
         let initial_query_started_at = now_ms();
-        let initial_rows = execute_physical_plan(&cache, &physical_plan)
-            .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
+        let initial_rows =
+            execute_compiled_physical_plan_with_summary(&cache, &compiled_initial_plan).map_err(
+                |e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)),
+            )?;
+        let initial_rows = initial_rows.rows;
         trace_init_profile.initial_query_ms = now_ms() - initial_query_started_at;
 
         let dependencies =
@@ -3525,7 +3534,6 @@ mod tests {
     use super::*;
     use crate::binary_protocol::SchemaLayoutCache;
     use crate::dataflow_compiler::compile_to_dataflow;
-    use crate::query_engine::compile_plan;
     use alloc::rc::Rc;
     use core::cell::RefCell;
     use cynos_core::schema::TableBuilder;
@@ -3905,7 +3913,7 @@ mod tests {
 
         let logical_plan = query.build_logical_plan("users");
         let cache = ctx.cache.borrow();
-        let physical_plan = compile_plan(&cache, "users", logical_plan);
+        let physical_plan = crate::query_engine::compile_plan(&cache, "users", logical_plan);
         let physical_text = alloc::format!("{:#?}", physical_plan);
 
         assert!(!physical_text.contains("table: \"orders\""));
