@@ -104,83 +104,186 @@ fn eval_path_collect<'a>(value: &'a JsonbValue, path: &JsonPath) -> Vec<&'a Json
 }
 
 fn eval_path_first<'a>(value: &'a JsonbValue, path: &JsonPath) -> Option<&'a JsonbValue> {
-    let mut first = None;
-    eval_path_until(value, path, &mut |candidate| {
-        first = Some(candidate);
-        true
-    });
-    first
+    if let SimplePathFirst::Resolved(value) = eval_simple_path_first(value, path) {
+        return value;
+    }
+
+    let mut steps = Vec::new();
+    flatten_path_steps(path, &mut steps);
+    first_after_steps(value, &steps)
 }
 
-fn eval_path_until<'a>(
-    value: &'a JsonbValue,
-    path: &JsonPath,
-    visit: &mut dyn FnMut(&'a JsonbValue) -> bool,
-) -> bool {
+enum SimplePathFirst<'a> {
+    Resolved(Option<&'a JsonbValue>),
+    Unsupported,
+}
+
+fn eval_simple_path_first<'a>(value: &'a JsonbValue, path: &JsonPath) -> SimplePathFirst<'a> {
     match path {
-        JsonPath::Root => visit(value),
-        JsonPath::Field(parent, field) => eval_path_until(value, parent, &mut |v| {
-            if let Some(obj) = v.as_object() {
-                if let Some(field_value) = obj.get(field) {
-                    return visit(field_value);
+        JsonPath::Root => SimplePathFirst::Resolved(Some(value)),
+        JsonPath::Field(parent, field) => match eval_simple_path_first(value, parent) {
+            SimplePathFirst::Resolved(Some(parent_value)) => {
+                SimplePathFirst::Resolved(parent_value.as_object().and_then(|obj| obj.get(field)))
+            }
+            SimplePathFirst::Resolved(None) => SimplePathFirst::Resolved(None),
+            SimplePathFirst::Unsupported => SimplePathFirst::Unsupported,
+        },
+        JsonPath::Index(parent, index) => match eval_simple_path_first(value, parent) {
+            SimplePathFirst::Resolved(Some(parent_value)) => {
+                SimplePathFirst::Resolved(parent_value.as_array().and_then(|arr| arr.get(*index)))
+            }
+            SimplePathFirst::Resolved(None) => SimplePathFirst::Resolved(None),
+            SimplePathFirst::Unsupported => SimplePathFirst::Unsupported,
+        },
+        JsonPath::Slice(_, _, _)
+        | JsonPath::RecursiveField(_, _)
+        | JsonPath::Wildcard(_)
+        | JsonPath::Filter(_, _) => SimplePathFirst::Unsupported,
+    }
+}
+
+enum JsonPathStep<'a> {
+    Field(&'a str),
+    Index(usize),
+    Slice(Option<usize>, Option<usize>),
+    RecursiveField(&'a str),
+    Wildcard,
+    Filter(&'a JsonPathPredicate),
+}
+
+fn flatten_path_steps<'a>(path: &'a JsonPath, out: &mut Vec<JsonPathStep<'a>>) {
+    match path {
+        JsonPath::Root => {}
+        JsonPath::Field(parent, field) => {
+            flatten_path_steps(parent, out);
+            out.push(JsonPathStep::Field(field.as_str()));
+        }
+        JsonPath::Index(parent, index) => {
+            flatten_path_steps(parent, out);
+            out.push(JsonPathStep::Index(*index));
+        }
+        JsonPath::Slice(parent, start, end) => {
+            flatten_path_steps(parent, out);
+            out.push(JsonPathStep::Slice(*start, *end));
+        }
+        JsonPath::RecursiveField(parent, field) => {
+            flatten_path_steps(parent, out);
+            out.push(JsonPathStep::RecursiveField(field.as_str()));
+        }
+        JsonPath::Wildcard(parent) => {
+            flatten_path_steps(parent, out);
+            out.push(JsonPathStep::Wildcard);
+        }
+        JsonPath::Filter(parent, predicate) => {
+            flatten_path_steps(parent, out);
+            out.push(JsonPathStep::Filter(predicate));
+        }
+    }
+}
+
+fn first_after_steps<'a>(
+    value: &'a JsonbValue,
+    steps: &[JsonPathStep<'_>],
+) -> Option<&'a JsonbValue> {
+    let Some((step, tail)) = steps.split_first() else {
+        return Some(value);
+    };
+
+    match step {
+        JsonPathStep::Field(field) => {
+            if let Some(obj) = value.as_object() {
+                if let Some(field_value) = obj.get(*field) {
+                    return first_after_steps(field_value, tail);
                 }
             }
-            false
-        }),
-        JsonPath::Index(parent, index) => eval_path_until(value, parent, &mut |v| {
-            if let Some(arr) = v.as_array() {
+            None
+        }
+        JsonPathStep::Index(index) => {
+            if let Some(arr) = value.as_array() {
                 if let Some(item) = arr.get(*index) {
-                    return visit(item);
+                    return first_after_steps(item, tail);
                 }
             }
-            false
-        }),
-        JsonPath::Slice(parent, start, end) => eval_path_until(value, parent, &mut |v| {
-            if let Some(arr) = v.as_array() {
+            None
+        }
+        JsonPathStep::Slice(start, end) => {
+            if let Some(arr) = value.as_array() {
                 let start_idx = start.unwrap_or(0);
                 let end_idx = end.unwrap_or(arr.len());
                 for item in arr.iter().skip(start_idx).take(end_idx - start_idx) {
-                    if visit(item) {
-                        return true;
+                    if let Some(found) = first_after_steps(item, tail) {
+                        return Some(found);
                     }
                 }
             }
-            false
-        }),
-        JsonPath::Wildcard(parent) => eval_path_until(value, parent, &mut |v| {
-            match v {
+            None
+        }
+        JsonPathStep::Wildcard => {
+            match value {
                 JsonbValue::Array(arr) => {
                     for item in arr {
-                        if visit(item) {
-                            return true;
+                        if let Some(found) = first_after_steps(item, tail) {
+                            return Some(found);
                         }
                     }
                 }
                 JsonbValue::Object(obj) => {
                     for (_, val) in obj.iter() {
-                        if visit(val) {
-                            return true;
+                        if let Some(found) = first_after_steps(val, tail) {
+                            return Some(found);
                         }
                     }
                 }
                 _ => {}
             }
-            false
-        }),
-        JsonPath::RecursiveField(parent, field) => eval_path_until(value, parent, &mut |v| {
-            recursive_field_search_until(v, field, visit)
-        }),
-        JsonPath::Filter(parent, predicate) => eval_path_until(value, parent, &mut |v| {
-            if let Some(arr) = v.as_array() {
+            None
+        }
+        JsonPathStep::RecursiveField(field) => {
+            first_recursive_field_after_steps(value, field, tail)
+        }
+        JsonPathStep::Filter(predicate) => {
+            if let Some(arr) = value.as_array() {
                 for item in arr {
-                    if eval_predicate(item, predicate) && visit(item) {
-                        return true;
+                    if eval_predicate(item, predicate) {
+                        if let Some(found) = first_after_steps(item, tail) {
+                            return Some(found);
+                        }
                     }
                 }
             }
-            false
-        }),
+            None
+        }
     }
+}
+
+fn first_recursive_field_after_steps<'a>(
+    value: &'a JsonbValue,
+    field: &str,
+    tail: &[JsonPathStep<'_>],
+) -> Option<&'a JsonbValue> {
+    match value {
+        JsonbValue::Object(obj) => {
+            if let Some(v) = obj.get(field) {
+                if let Some(found) = first_after_steps(v, tail) {
+                    return Some(found);
+                }
+            }
+            for (_, v) in obj.iter() {
+                if let Some(found) = first_recursive_field_after_steps(v, field, tail) {
+                    return Some(found);
+                }
+            }
+        }
+        JsonbValue::Array(arr) => {
+            for item in arr {
+                if let Some(found) = first_recursive_field_after_steps(item, field, tail) {
+                    return Some(found);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 fn recursive_field_search<'a>(
@@ -204,36 +307,6 @@ fn recursive_field_search<'a>(
         }
         _ => {}
     }
-}
-
-fn recursive_field_search_until<'a>(
-    value: &'a JsonbValue,
-    field: &str,
-    visit: &mut dyn FnMut(&'a JsonbValue) -> bool,
-) -> bool {
-    match value {
-        JsonbValue::Object(obj) => {
-            if let Some(v) = obj.get(field) {
-                if visit(v) {
-                    return true;
-                }
-            }
-            for (_, v) in obj.iter() {
-                if recursive_field_search_until(v, field, visit) {
-                    return true;
-                }
-            }
-        }
-        JsonbValue::Array(arr) => {
-            for item in arr {
-                if recursive_field_search_until(item, field, visit) {
-                    return true;
-                }
-            }
-        }
-        _ => {}
-    }
-    false
 }
 
 fn eval_predicate(value: &JsonbValue, predicate: &JsonPathPredicate) -> bool {
@@ -418,6 +491,27 @@ mod tests {
 
         let json = JsonbValue::Array(vec![JsonbValue::Object(first), JsonbValue::Object(second)]);
         let path = JsonPath::parse("$[*].name").unwrap();
+
+        assert_eq!(
+            json.query_first(&path),
+            Some(&JsonbValue::String("Alice".into()))
+        );
+    }
+
+    #[test]
+    fn test_query_first_recursive_field_applies_remaining_path() {
+        let mut first_profile = JsonbObject::new();
+        first_profile.insert("other".into(), JsonbValue::String("skip".into()));
+        let mut first = JsonbObject::new();
+        first.insert("profile".into(), JsonbValue::Object(first_profile));
+
+        let mut second_profile = JsonbObject::new();
+        second_profile.insert("name".into(), JsonbValue::String("Alice".into()));
+        let mut second = JsonbObject::new();
+        second.insert("profile".into(), JsonbValue::Object(second_profile));
+
+        let json = JsonbValue::Array(vec![JsonbValue::Object(first), JsonbValue::Object(second)]);
+        let path = JsonPath::parse("$..profile.name").unwrap();
 
         assert_eq!(
             json.query_first(&path),

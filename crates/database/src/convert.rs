@@ -68,18 +68,24 @@ pub(crate) fn prune_jsonb_js_cache(
     let target_bytes = policy.target_bytes();
     let mut projected_len = jsonb_cache.len();
     let mut projected_bytes = *jsonb_cache_bytes;
-    let mut keys_to_remove: Vec<_> = jsonb_cache
-        .keys()
-        .map(|key| (key.len(), key.clone()))
-        .collect();
-    keys_to_remove.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    let keys_to_remove: Vec<_> = {
+        let mut candidates: Vec<_> = jsonb_cache.keys().map(Vec::as_slice).collect();
+        candidates.sort_unstable_by(|left, right| right.len().cmp(&left.len()));
 
-    for (key_len, key) in keys_to_remove {
-        if projected_len <= target_entries && projected_bytes <= target_bytes {
-            break;
+        let mut selected = Vec::new();
+        for key in candidates {
+            if projected_len <= target_entries && projected_bytes <= target_bytes {
+                break;
+            }
+            projected_len = projected_len.saturating_sub(1);
+            projected_bytes = projected_bytes.saturating_sub(key.len());
+            selected.push(key.to_vec());
         }
-        projected_len = projected_len.saturating_sub(1);
-        projected_bytes = projected_bytes.saturating_sub(key_len);
+        selected
+    };
+
+    for key in keys_to_remove {
+        let key_len = key.len();
         if jsonb_cache.remove(key.as_slice()).is_some() {
             *jsonb_cache_bytes = (*jsonb_cache_bytes).saturating_sub(key_len);
         }
@@ -245,8 +251,9 @@ impl GraphqlJsEncodeCache {
 
                 let parsed = value_to_js(value);
                 let policy = JsonbJsCachePolicy::DEFAULT;
-                if policy.should_cache_entry(jsonb.0.len()) {
-                    self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_add(jsonb.0.len());
+                let jsonb_len = jsonb.0.len();
+                if policy.should_cache_entry(jsonb_len) {
+                    self.jsonb_cache_bytes = self.jsonb_cache_bytes.saturating_add(jsonb_len);
                     self.jsonb_cache.insert(jsonb.0.clone(), parsed.clone());
                     self.maybe_prune_jsonb_with_policy(policy);
                 }
