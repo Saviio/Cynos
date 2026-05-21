@@ -7,7 +7,6 @@
 use crate::dataflow::node::JoinType;
 use crate::dataflow::{AggregateType, ColumnId, DataflowNode, JoinKeySpec, TableId};
 use crate::delta::Delta;
-use crate::operators::{filter_incremental, map_incremental, project_incremental};
 use crate::trace::{TraceDeltaBatch, TraceTupleArena, TraceTupleHandle, VisibleResultStore};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -1082,15 +1081,13 @@ fn extract_join_key_handle(
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
-struct CompiledIvmNode {
+struct DataflowDependencySet {
     sources: Box<[TableId]>,
-    kind: CompiledIvmNodeKind,
 }
 
 pub struct CompiledIvmPlan {
-    node: CompiledIvmNode,
+    dependencies: DataflowDependencySet,
     program: Option<CompiledTraceProgram>,
 }
 
@@ -1199,10 +1196,8 @@ pub struct BootstrapExecutionProfile {
     pub visible_store_init_ms: f64,
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct CompiledBootstrapPlan {
-    legacy_node: CompiledBootstrapNode,
     program: CompiledBootstrapProgram,
 }
 
@@ -1281,70 +1276,10 @@ enum BootstrapRuntimeNode<'a> {
     },
 }
 
-#[allow(dead_code)]
-#[derive(Clone)]
-struct CompiledBootstrapNode {
-    kind: CompiledBootstrapNodeKind,
-}
-
-#[allow(dead_code)]
-#[derive(Clone)]
-enum CompiledBootstrapNodeKind {
-    Source {
-        source_index: usize,
-    },
-    Filter {
-        input: Box<CompiledBootstrapNode>,
-    },
-    Project {
-        input: Box<CompiledBootstrapNode>,
-        columns: Rc<[usize]>,
-    },
-    Map {
-        input: Box<CompiledBootstrapNode>,
-    },
-    Join {
-        state_id: usize,
-        left_width: usize,
-        right_width: usize,
-        left: Box<CompiledBootstrapNode>,
-        right: Box<CompiledBootstrapNode>,
-    },
-    Aggregate {
-        state_id: usize,
-        input: Box<CompiledBootstrapNode>,
-    },
-}
-
-#[allow(dead_code)]
-#[derive(Clone)]
-enum CompiledIvmNodeKind {
-    Source,
-    Filter {
-        input: Box<CompiledIvmNode>,
-    },
-    Project {
-        input: Box<CompiledIvmNode>,
-        columns: Rc<[usize]>,
-    },
-    Map {
-        input: Box<CompiledIvmNode>,
-    },
-    Join {
-        state_id: usize,
-        left: Box<CompiledIvmNode>,
-        right: Box<CompiledIvmNode>,
-    },
-    Aggregate {
-        state_id: usize,
-        input: Box<CompiledIvmNode>,
-    },
-}
-
 impl CompiledIvmPlan {
     pub fn compile(node: &DataflowNode) -> Self {
         Self {
-            node: compile_ivm_node(node, 0),
+            dependencies: DataflowDependencySet::compile(node),
             program: None,
         }
     }
@@ -1367,12 +1302,12 @@ impl CompiledIvmPlan {
 
     #[inline]
     pub fn sources(&self) -> &[TableId] {
-        &self.node.sources
+        self.dependencies.sources()
     }
 
     #[inline]
     pub fn depends_on(&self, table_id: TableId) -> bool {
-        self.node.sources.binary_search(&table_id).is_ok()
+        self.dependencies.depends_on(table_id)
     }
 }
 
@@ -1422,8 +1357,6 @@ impl TraceUnaryOp {
 
 impl CompiledBootstrapPlan {
     pub fn compile(node: &DataflowNode) -> Self {
-        let mut next_source_index = 0usize;
-        let legacy_node = compile_bootstrap_node(node, 0, &mut next_source_index);
         let mut program_source_index = 0usize;
         let mut next_node_index = 0usize;
         let mut next_slot = 0usize;
@@ -1438,7 +1371,6 @@ impl CompiledBootstrapPlan {
             &mut instructions,
         );
         Self {
-            legacy_node,
             program: CompiledBootstrapProgram {
                 instructions: instructions.into_boxed_slice(),
                 slot_count: next_slot,
@@ -1447,8 +1379,13 @@ impl CompiledBootstrapPlan {
     }
 }
 
-#[allow(dead_code)]
-impl CompiledIvmNode {
+impl DataflowDependencySet {
+    fn compile(node: &DataflowNode) -> Self {
+        Self {
+            sources: compile_dataflow_dependencies(node),
+        }
+    }
+
     #[inline]
     fn sources(&self) -> &[TableId] {
         &self.sources
@@ -1460,61 +1397,17 @@ impl CompiledIvmNode {
     }
 }
 
-fn compile_ivm_node(node: &DataflowNode, state_id: usize) -> CompiledIvmNode {
+fn compile_dataflow_dependencies(node: &DataflowNode) -> Box<[TableId]> {
     match node {
-        DataflowNode::Source { table_id } => CompiledIvmNode {
-            sources: alloc::vec![*table_id].into_boxed_slice(),
-            kind: CompiledIvmNodeKind::Source,
-        },
-        DataflowNode::Filter { input, .. } => {
-            let input = compile_ivm_node(input, state_id);
-            CompiledIvmNode {
-                sources: input.sources.clone(),
-                kind: CompiledIvmNodeKind::Filter {
-                    input: Box::new(input),
-                },
-            }
-        }
-        DataflowNode::Project { input, columns } => {
-            let input = compile_ivm_node(input, state_id);
-            CompiledIvmNode {
-                sources: input.sources.clone(),
-                kind: CompiledIvmNodeKind::Project {
-                    input: Box::new(input),
-                    columns: Rc::<[usize]>::from(columns.clone().into_boxed_slice()),
-                },
-            }
-        }
-        DataflowNode::Map { input, .. } => {
-            let input = compile_ivm_node(input, state_id);
-            CompiledIvmNode {
-                sources: input.sources.clone(),
-                kind: CompiledIvmNodeKind::Map {
-                    input: Box::new(input),
-                },
-            }
-        }
+        DataflowNode::Source { table_id } => alloc::vec![*table_id].into_boxed_slice(),
+        DataflowNode::Filter { input, .. }
+        | DataflowNode::Project { input, .. }
+        | DataflowNode::Map { input, .. }
+        | DataflowNode::Aggregate { input, .. } => compile_dataflow_dependencies(input),
         DataflowNode::Join { left, right, .. } => {
-            let left = compile_ivm_node(left, left_child_state_id(state_id));
-            let right = compile_ivm_node(right, right_child_state_id(state_id));
-            CompiledIvmNode {
-                sources: merge_compiled_sources(left.sources(), right.sources()),
-                kind: CompiledIvmNodeKind::Join {
-                    state_id,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
-            }
-        }
-        DataflowNode::Aggregate { input, .. } => {
-            let input = compile_ivm_node(input, left_child_state_id(state_id));
-            CompiledIvmNode {
-                sources: input.sources.clone(),
-                kind: CompiledIvmNodeKind::Aggregate {
-                    state_id,
-                    input: Box::new(input),
-                },
-            }
+            let left_sources = compile_dataflow_dependencies(left);
+            let right_sources = compile_dataflow_dependencies(right);
+            merge_compiled_sources(&left_sources, &right_sources)
         }
     }
 }
@@ -1686,60 +1579,6 @@ fn compile_trace_program_node(
             output_slot
         }
     }
-}
-
-fn compile_bootstrap_node(
-    node: &DataflowNode,
-    state_id: usize,
-    next_source_index: &mut usize,
-) -> CompiledBootstrapNode {
-    let kind = match node {
-        DataflowNode::Source { .. } => {
-            let source_index = *next_source_index;
-            *next_source_index = next_source_index.saturating_add(1);
-            CompiledBootstrapNodeKind::Source { source_index }
-        }
-        DataflowNode::Filter { input, .. } => CompiledBootstrapNodeKind::Filter {
-            input: Box::new(compile_bootstrap_node(input, state_id, next_source_index)),
-        },
-        DataflowNode::Project { input, columns } => CompiledBootstrapNodeKind::Project {
-            input: Box::new(compile_bootstrap_node(input, state_id, next_source_index)),
-            columns: Rc::<[usize]>::from(columns.clone().into_boxed_slice()),
-        },
-        DataflowNode::Map { input, .. } => CompiledBootstrapNodeKind::Map {
-            input: Box::new(compile_bootstrap_node(input, state_id, next_source_index)),
-        },
-        DataflowNode::Join {
-            left,
-            right,
-            left_width,
-            right_width,
-            ..
-        } => CompiledBootstrapNodeKind::Join {
-            state_id,
-            left_width: *left_width,
-            right_width: *right_width,
-            left: Box::new(compile_bootstrap_node(
-                left,
-                left_child_state_id(state_id),
-                next_source_index,
-            )),
-            right: Box::new(compile_bootstrap_node(
-                right,
-                right_child_state_id(state_id),
-                next_source_index,
-            )),
-        },
-        DataflowNode::Aggregate { input, .. } => CompiledBootstrapNodeKind::Aggregate {
-            state_id,
-            input: Box::new(compile_bootstrap_node(
-                input,
-                left_child_state_id(state_id),
-                next_source_index,
-            )),
-        },
-    };
-    CompiledBootstrapNode { kind }
 }
 
 fn alloc_bootstrap_slot(next_slot: &mut usize) -> BootstrapSlotId {
@@ -2732,189 +2571,6 @@ fn process_aggregate_trace_deltas(
     *output = agg_state.process_trace_deltas(arena, input_deltas);
 }
 
-#[allow(dead_code)]
-fn bootstrap_node_stream_with_source_visitor<F>(
-    node: &DataflowNode,
-    meta: &CompiledBootstrapNode,
-    emit_to_parent: bool,
-    visit_source_rows: &mut F,
-    join_states: &mut HashMap<usize, JoinState>,
-    aggregate_states: &mut HashMap<usize, GroupAggregateState>,
-    emit: &mut dyn FnMut(TraceTupleHandle),
-) where
-    F: FnMut(TableId, usize, &mut dyn FnMut(Rc<Row>)),
-{
-    let arena = TraceTupleArena;
-    match (node, &meta.kind) {
-        (DataflowNode::Source { table_id }, CompiledBootstrapNodeKind::Source { source_index }) => {
-            if !emit_to_parent {
-                return;
-            }
-            let mut emit_source_row = |row: Rc<Row>| emit(arena.base_rc(row));
-            visit_source_rows(*table_id, *source_index, &mut emit_source_row);
-        }
-
-        (
-            DataflowNode::Filter {
-                input,
-                predicate,
-                trace_predicate,
-            },
-            CompiledBootstrapNodeKind::Filter { input: input_meta },
-        ) => bootstrap_node_stream_with_source_visitor(
-            input,
-            input_meta,
-            emit_to_parent,
-            visit_source_rows,
-            join_states,
-            aggregate_states,
-            &mut |handle| {
-                let keep = if let Some(trace_predicate) = trace_predicate
-                    .as_ref()
-                    .filter(|_| !arena.has_materialized_row(&handle))
-                {
-                    trace_predicate(&arena, &handle)
-                } else {
-                    let row = arena.materialize_rc(&handle);
-                    predicate(&row)
-                };
-                if keep {
-                    emit(handle);
-                }
-            },
-        ),
-
-        (
-            DataflowNode::Project { input, .. },
-            CompiledBootstrapNodeKind::Project {
-                input: input_meta,
-                columns,
-            },
-        ) => {
-            bootstrap_node_stream_with_source_visitor(
-                input,
-                input_meta,
-                emit_to_parent,
-                visit_source_rows,
-                join_states,
-                aggregate_states,
-                &mut |handle| emit(arena.project(handle, columns.clone())),
-            );
-        }
-
-        (
-            DataflowNode::Map {
-                input,
-                mapper,
-                trace_mapper,
-            },
-            CompiledBootstrapNodeKind::Map { input: input_meta },
-        ) => bootstrap_node_stream_with_source_visitor(
-            input,
-            input_meta,
-            emit_to_parent,
-            visit_source_rows,
-            join_states,
-            aggregate_states,
-            &mut |handle| {
-                let mut mapped = if let Some(trace_mapper) = trace_mapper
-                    .as_ref()
-                    .filter(|_| !arena.has_materialized_row(&handle))
-                {
-                    trace_mapper(&arena, &handle)
-                } else {
-                    let row = arena.materialize_rc(&handle);
-                    mapper(&row)
-                };
-                mapped.set_id(handle.row_id());
-                mapped.set_version(handle.version());
-                emit(arena.owned(mapped));
-            },
-        ),
-
-        (
-            DataflowNode::Join {
-                left,
-                right,
-                left_key,
-                right_key,
-                join_type,
-                ..
-            },
-            CompiledBootstrapNodeKind::Join {
-                state_id,
-                left_width,
-                right_width,
-                left: left_meta,
-                right: right_meta,
-            },
-        ) => {
-            let mut join_state = JoinState::with_col_counts(*left_width, *right_width);
-
-            bootstrap_node_stream_with_source_visitor(
-                left,
-                left_meta,
-                true,
-                visit_source_rows,
-                join_states,
-                aggregate_states,
-                &mut |handle| {
-                    let key = extract_join_key_handle(left_key, &arena, &handle);
-                    join_state.left.insert(handle, key, 0);
-                },
-            );
-
-            bootstrap_node_stream_with_source_visitor(
-                right,
-                right_meta,
-                true,
-                visit_source_rows,
-                join_states,
-                aggregate_states,
-                &mut |handle| {
-                    let key = extract_join_key_handle(right_key, &arena, &handle);
-                    join_state.right.insert(handle, key, 0);
-                },
-            );
-
-            join_state.finalize_bootstrap_match_counts_for(*join_type);
-            if emit_to_parent {
-                join_state.emit_bootstrap_rows(*join_type, &arena, emit);
-            }
-            join_states.insert(*state_id, join_state);
-        }
-
-        (
-            DataflowNode::Aggregate {
-                input,
-                group_by,
-                functions,
-            },
-            CompiledBootstrapNodeKind::Aggregate {
-                state_id,
-                input: input_meta,
-            },
-        ) => {
-            let mut aggregate_state = GroupAggregateState::new(group_by.clone(), functions.clone());
-            bootstrap_node_stream_with_source_visitor(
-                input,
-                input_meta,
-                true,
-                visit_source_rows,
-                join_states,
-                aggregate_states,
-                &mut |handle| aggregate_state.apply_trace_bootstrap_handle(&arena, &handle),
-            );
-            if emit_to_parent {
-                aggregate_state.emit_bootstrap_rows(&arena, emit);
-            }
-            aggregate_states.insert(*state_id, aggregate_state);
-        }
-
-        _ => unreachable!("compiled bootstrap metadata must mirror the dataflow shape"),
-    }
-}
-
 fn timed_block(now_fn: Option<fn() -> f64>, total_ms: &mut f64, run: impl FnOnce()) {
     if let Some(now_fn) = now_fn {
         let started_at = now_fn();
@@ -3692,463 +3348,6 @@ impl MaterializedView {
     }
 }
 
-#[allow(dead_code)]
-fn propagate_row_deltas(
-    node: &DataflowNode,
-    meta: &CompiledIvmNode,
-    join_states: &mut HashMap<usize, JoinState>,
-    aggregate_states: &mut HashMap<usize, GroupAggregateState>,
-    source_table: TableId,
-    deltas: Vec<Delta<Row>>,
-    now_fn: Option<fn() -> f64>,
-    profile: &mut TraceUpdateProfile,
-) -> Vec<Delta<Row>> {
-    match (node, &meta.kind) {
-        (DataflowNode::Source { table_id }, CompiledIvmNodeKind::Source) => {
-            if *table_id == source_table {
-                deltas
-            } else {
-                Vec::new()
-            }
-        }
-        (
-            DataflowNode::Filter {
-                input, predicate, ..
-            },
-            CompiledIvmNodeKind::Filter { input: input_meta },
-        ) => {
-            let input_deltas = propagate_row_deltas(
-                input,
-                input_meta,
-                join_states,
-                aggregate_states,
-                source_table,
-                deltas,
-                now_fn,
-                profile,
-            );
-            let mut output = Vec::new();
-            timed_block(now_fn, &mut profile.unary_execute_ms, || {
-                output = filter_incremental(&input_deltas, |row| predicate(row));
-            });
-            output
-        }
-        (
-            DataflowNode::Project { input, columns },
-            CompiledIvmNodeKind::Project {
-                input: input_meta, ..
-            },
-        ) => {
-            let input_deltas = propagate_row_deltas(
-                input,
-                input_meta,
-                join_states,
-                aggregate_states,
-                source_table,
-                deltas,
-                now_fn,
-                profile,
-            );
-            let mut output = Vec::new();
-            timed_block(now_fn, &mut profile.unary_execute_ms, || {
-                output = project_incremental(&input_deltas, columns);
-            });
-            output
-        }
-        (
-            DataflowNode::Map { input, mapper, .. },
-            CompiledIvmNodeKind::Map { input: input_meta },
-        ) => {
-            let input_deltas = propagate_row_deltas(
-                input,
-                input_meta,
-                join_states,
-                aggregate_states,
-                source_table,
-                deltas,
-                now_fn,
-                profile,
-            );
-            let mut output = Vec::new();
-            timed_block(now_fn, &mut profile.unary_execute_ms, || {
-                output = map_incremental(&input_deltas, |row| mapper(row));
-            });
-            output
-        }
-        (
-            DataflowNode::Join {
-                left,
-                right,
-                left_key,
-                right_key,
-                join_type,
-                left_width,
-                right_width,
-            },
-            CompiledIvmNodeKind::Join {
-                state_id,
-                left: left_meta,
-                right: right_meta,
-            },
-        ) => {
-            if !join_states.contains_key(state_id) {
-                join_states.insert(
-                    *state_id,
-                    JoinState::with_col_counts(*left_width, *right_width),
-                );
-            }
-
-            let is_left_side = left_meta.depends_on(source_table);
-            let is_right_side = right_meta.depends_on(source_table);
-
-            let left_deltas = if is_left_side {
-                propagate_row_deltas(
-                    left,
-                    left_meta,
-                    join_states,
-                    aggregate_states,
-                    source_table,
-                    deltas.clone(),
-                    now_fn,
-                    profile,
-                )
-            } else {
-                Vec::new()
-            };
-
-            let right_deltas = if is_right_side {
-                propagate_row_deltas(
-                    right,
-                    right_meta,
-                    join_states,
-                    aggregate_states,
-                    source_table,
-                    deltas,
-                    now_fn,
-                    profile,
-                )
-            } else {
-                Vec::new()
-            };
-
-            let mut output_deltas = Vec::new();
-            timed_block(now_fn, &mut profile.join_execute_ms, || {
-                let join_state = join_states
-                    .get_mut(state_id)
-                    .expect("join state should exist after initialization");
-                let arena = TraceTupleArena;
-                let left_trace = left_deltas
-                    .into_iter()
-                    .map(|delta| Delta::new(arena.owned(delta.data), delta.diff))
-                    .collect::<Vec<_>>();
-                let right_trace = right_deltas
-                    .into_iter()
-                    .map(|delta| Delta::new(arena.owned(delta.data), delta.diff))
-                    .collect::<Vec<_>>();
-                let mut trace_output = Vec::new();
-
-                process_left_join_trace_deltas(
-                    join_state,
-                    left_key,
-                    *join_type,
-                    &arena,
-                    &left_trace,
-                    &mut trace_output,
-                );
-                process_right_join_trace_deltas(
-                    join_state,
-                    right_key,
-                    *join_type,
-                    &arena,
-                    &right_trace,
-                    &mut trace_output,
-                );
-
-                output_deltas = trace_output
-                    .into_iter()
-                    .map(|delta| Delta::new(arena.materialize_row(&delta.data), delta.diff))
-                    .collect();
-            });
-
-            output_deltas
-        }
-        (
-            DataflowNode::Aggregate {
-                input,
-                group_by,
-                functions,
-            },
-            CompiledIvmNodeKind::Aggregate {
-                state_id,
-                input: input_meta,
-            },
-        ) => {
-            let input_deltas = propagate_row_deltas(
-                input,
-                input_meta,
-                join_states,
-                aggregate_states,
-                source_table,
-                deltas,
-                now_fn,
-                profile,
-            );
-
-            if input_deltas.is_empty() {
-                return Vec::new();
-            }
-
-            if !aggregate_states.contains_key(state_id) {
-                aggregate_states.insert(
-                    *state_id,
-                    GroupAggregateState::new(group_by.clone(), functions.clone()),
-                );
-            }
-
-            let mut output = Vec::new();
-            timed_block(now_fn, &mut profile.aggregate_execute_ms, || {
-                output = aggregate_states
-                    .get_mut(state_id)
-                    .expect("aggregate state should exist after initialization")
-                    .process_deltas(&input_deltas);
-            });
-            output
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Propagates trace deltas through a dataflow node without eagerly materializing rows.
-#[allow(dead_code)]
-fn propagate_trace_deltas(
-    node: &DataflowNode,
-    meta: &CompiledIvmNode,
-    join_states: &mut HashMap<usize, JoinState>,
-    aggregate_states: &mut HashMap<usize, GroupAggregateState>,
-    source_table: TableId,
-    deltas: &TraceDeltaBatch,
-) -> TraceDeltaBatch {
-    let arena = deltas.arena().clone();
-    match (node, &meta.kind) {
-        (DataflowNode::Source { table_id }, CompiledIvmNodeKind::Source) => {
-            if *table_id == source_table {
-                TraceDeltaBatch::new(arena, deltas.deltas().to_vec())
-            } else {
-                TraceDeltaBatch::empty()
-            }
-        }
-
-        (
-            DataflowNode::Filter {
-                input,
-                predicate,
-                trace_predicate,
-            },
-            CompiledIvmNodeKind::Filter { input: input_meta },
-        ) => {
-            let input_deltas = propagate_trace_deltas(
-                input,
-                input_meta,
-                join_states,
-                aggregate_states,
-                source_table,
-                deltas,
-            );
-            if input_deltas.is_empty() {
-                return input_deltas;
-            }
-            let mut filtered = Vec::with_capacity(input_deltas.deltas().len());
-            for delta in input_deltas.deltas() {
-                if keep_trace_handle(
-                    &arena,
-                    &delta.data,
-                    predicate.as_ref(),
-                    trace_predicate.as_deref(),
-                ) {
-                    filtered.push(delta.clone());
-                }
-            }
-            TraceDeltaBatch::new(arena, filtered)
-        }
-
-        (
-            DataflowNode::Project { input, .. },
-            CompiledIvmNodeKind::Project {
-                input: input_meta,
-                columns,
-            },
-        ) => {
-            let input_deltas = propagate_trace_deltas(
-                input,
-                input_meta,
-                join_states,
-                aggregate_states,
-                source_table,
-                deltas,
-            );
-            if input_deltas.is_empty() {
-                return input_deltas;
-            }
-            let projected = input_deltas
-                .deltas()
-                .iter()
-                .map(|delta| {
-                    Delta::new(
-                        arena.project(delta.data.clone(), columns.clone()),
-                        delta.diff,
-                    )
-                })
-                .collect();
-            TraceDeltaBatch::new(arena, projected)
-        }
-
-        (
-            DataflowNode::Map {
-                input,
-                mapper,
-                trace_mapper,
-            },
-            CompiledIvmNodeKind::Map { input: input_meta },
-        ) => {
-            let input_deltas = propagate_trace_deltas(
-                input,
-                input_meta,
-                join_states,
-                aggregate_states,
-                source_table,
-                deltas,
-            );
-            if input_deltas.is_empty() {
-                return input_deltas;
-            }
-            let mapped = input_deltas
-                .deltas()
-                .iter()
-                .map(|delta| {
-                    let mut mapped = map_trace_handle(
-                        &arena,
-                        &delta.data,
-                        mapper.as_ref(),
-                        trace_mapper.as_deref(),
-                    );
-                    mapped.set_id(delta.data.row_id());
-                    mapped.set_version(delta.data.version());
-                    Delta::new(arena.owned(mapped), delta.diff)
-                })
-                .collect();
-            TraceDeltaBatch::new(arena, mapped)
-        }
-
-        (
-            DataflowNode::Join {
-                left,
-                right,
-                left_key,
-                right_key,
-                join_type,
-                left_width,
-                right_width,
-            },
-            CompiledIvmNodeKind::Join {
-                state_id: current_join_id,
-                left: left_meta,
-                right: right_meta,
-            },
-        ) => {
-            if !join_states.contains_key(current_join_id) {
-                join_states.insert(
-                    *current_join_id,
-                    JoinState::with_col_counts(*left_width, *right_width),
-                );
-            }
-
-            let is_left_side = left_meta.depends_on(source_table);
-            let is_right_side = right_meta.depends_on(source_table);
-            let jt = *join_type;
-
-            let mut output_deltas = Vec::new();
-            let left_deltas = if is_left_side {
-                propagate_trace_deltas(
-                    left,
-                    left_meta,
-                    join_states,
-                    aggregate_states,
-                    source_table,
-                    deltas,
-                )
-            } else {
-                TraceDeltaBatch::empty()
-            };
-            let right_deltas = if is_right_side {
-                propagate_trace_deltas(
-                    right,
-                    right_meta,
-                    join_states,
-                    aggregate_states,
-                    source_table,
-                    deltas,
-                )
-            } else {
-                TraceDeltaBatch::empty()
-            };
-            process_join_trace_deltas(
-                join_states,
-                *current_join_id,
-                *left_width,
-                *right_width,
-                left_key,
-                right_key,
-                jt,
-                &arena,
-                left_deltas.deltas(),
-                right_deltas.deltas(),
-                &mut output_deltas,
-            );
-
-            TraceDeltaBatch::new(arena, output_deltas)
-        }
-
-        (
-            DataflowNode::Aggregate {
-                input,
-                group_by,
-                functions,
-            },
-            CompiledIvmNodeKind::Aggregate {
-                state_id: current_agg_id,
-                input: input_meta,
-            },
-        ) => {
-            let input_deltas = propagate_trace_deltas(
-                input,
-                input_meta,
-                join_states,
-                aggregate_states,
-                source_table,
-                deltas,
-            );
-
-            if input_deltas.is_empty() {
-                return input_deltas;
-            }
-
-            let mut output = Vec::new();
-            process_aggregate_trace_deltas(
-                aggregate_states,
-                *current_agg_id,
-                group_by,
-                functions,
-                &arena,
-                input_deltas.deltas(),
-                &mut output,
-            );
-            TraceDeltaBatch::new(arena.clone(), output)
-        }
-
-        _ => unreachable!("compiled IVM metadata must mirror the dataflow shape"),
-    }
-}
-
 /// Builder for creating materialized views.
 pub struct MaterializedViewBuilder {
     dataflow: Option<DataflowNode>,
@@ -4375,43 +3574,6 @@ mod tests {
         normalized
     }
 
-    fn bootstrap_view_with_legacy_executor(
-        dataflow: DataflowNode,
-        initial: Vec<Row>,
-        source_rows: &HashMap<(TableId, usize), Vec<Row>>,
-    ) -> MaterializedView {
-        let compiled_plan = CompiledIvmPlan::compile(&dataflow);
-        let compiled_bootstrap_plan = CompiledBootstrapPlan::compile(&dataflow);
-        let dependencies = compiled_plan.sources().to_vec();
-        let mut join_states = HashMap::new();
-        let mut aggregate_states = HashMap::new();
-        bootstrap_node_stream_with_source_visitor(
-            &dataflow,
-            &compiled_bootstrap_plan.legacy_node,
-            false,
-            &mut |table_id, source_index, emit| {
-                if let Some(rows) = source_rows.get(&(table_id, source_index)) {
-                    for row in rows {
-                        emit(Rc::new(row.clone()));
-                    }
-                }
-            },
-            &mut join_states,
-            &mut aggregate_states,
-            &mut |_handle| {},
-        );
-        MaterializedView {
-            dataflow,
-            compiled_plan,
-            visible_rows: VisibleResultStore::from_rc_rows(
-                initial.into_iter().map(Rc::new).collect(),
-            ),
-            dependencies,
-            join_states,
-            aggregate_states,
-        }
-    }
-
     fn bootstrap_view_with_compiled_executor(
         dataflow: DataflowNode,
         initial: Vec<Row>,
@@ -4461,27 +3623,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    fn apply_legacy_update(
-        view: &mut MaterializedView,
-        table_id: TableId,
-        deltas: Vec<Delta<Row>>,
-    ) -> Vec<Delta<Row>> {
-        if !view.depends_on(table_id) {
-            return Vec::new();
-        }
-        let input_batch = TraceDeltaBatch::from_row_deltas(deltas);
-        let output = propagate_trace_deltas(
-            &view.dataflow,
-            &view.compiled_plan.node,
-            &mut view.join_states,
-            &mut view.aggregate_states,
-            table_id,
-            &input_batch,
-        );
-        view.visible_rows.apply(&output);
-        output.materialize_rows()
     }
 
     fn make_trace_unary_fusion_dataflow() -> DataflowNode {
@@ -4987,37 +4128,33 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_bootstrap_matches_legacy_inner_join_followup_delta() {
+    fn test_compiled_bootstrap_inner_join_followup_delta_uses_production_path() {
         let employee = make_employee(1, 200, 10);
         let department = make_department(10, 100);
         let initial = vec![merge_rows(&employee, &department)];
 
         let mut source_rows = HashMap::new();
         source_rows.insert((1, 0), vec![employee]);
-        source_rows.insert((2, 1), vec![department]);
+        source_rows.insert((2, 1), vec![department.clone()]);
 
-        let mut legacy_view = bootstrap_view_with_legacy_executor(
+        let mut compiled_view = bootstrap_view_with_compiled_executor(
             make_employee_department_inner_join(),
             initial.clone(),
             &source_rows,
         );
-        let mut compiled_view = bootstrap_view_with_compiled_executor(
-            make_employee_department_inner_join(),
-            initial,
-            &source_rows,
-        );
 
-        let follow_up = vec![Delta::insert(make_employee(2, 201, 10))];
-        let legacy_output = legacy_view.on_table_change(1, follow_up.clone());
+        let follow_up_employee = make_employee(2, 201, 10);
+        let follow_up = vec![Delta::insert(follow_up_employee.clone())];
         let compiled_output = compiled_view.on_table_change(1, follow_up);
+        let expected_row = merge_rows(&follow_up_employee, &department);
 
         assert_eq!(
-            normalize_deltas(&legacy_output),
-            normalize_deltas(&compiled_output)
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&[Delta::insert(expected_row.clone())])
         );
         assert_eq!(
-            normalize_rows(&legacy_view.result()),
-            normalize_rows(&compiled_view.result())
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&[initial[0].clone(), expected_row])
         );
     }
 
@@ -5033,14 +4170,9 @@ mod tests {
         ];
 
         let mut source_rows = HashMap::new();
-        source_rows.insert((1, 0), vec![employee_a.clone(), employee_b]);
+        source_rows.insert((1, 0), vec![employee_a.clone(), employee_b.clone()]);
         source_rows.insert((2, 1), vec![department_old.clone()]);
 
-        let mut legacy_view = bootstrap_view_with_legacy_executor(
-            make_employee_department_inner_join(),
-            initial.clone(),
-            &source_rows,
-        );
         let mut compiled_view = bootstrap_view_with_compiled_executor(
             make_employee_department_inner_join(),
             initial,
@@ -5048,96 +4180,98 @@ mod tests {
         );
 
         let delete_one_left = vec![Delta::delete(employee_a)];
+        let expected_delete = merge_rows(&make_employee(1, 200, 10), &department_old);
         assert_eq!(
-            normalize_deltas(&legacy_view.on_table_change(1, delete_one_left.clone())),
-            normalize_deltas(&compiled_view.on_table_change(1, delete_one_left))
+            normalize_deltas(&compiled_view.on_table_change(1, delete_one_left)),
+            normalize_deltas(&[Delta::delete(expected_delete)])
         );
 
-        let update_right_same_key =
-            vec![Delta::delete(department_old), Delta::insert(department_new)];
-        let legacy_output = legacy_view.on_table_change(2, update_right_same_key.clone());
+        let update_right_same_key = vec![
+            Delta::delete(department_old.clone()),
+            Delta::insert(department_new.clone()),
+        ];
         let compiled_output = compiled_view.on_table_change(2, update_right_same_key);
+        let old_join = merge_rows(&employee_b, &department_old);
+        let new_join = merge_rows(&employee_b, &department_new);
 
         assert_eq!(
-            normalize_deltas(&legacy_output),
-            normalize_deltas(&compiled_output)
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&[Delta::delete(old_join), Delta::insert(new_join.clone())])
         );
         assert_eq!(
-            normalize_rows(&legacy_view.result()),
-            normalize_rows(&compiled_view.result())
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&[new_join])
         );
     }
 
     #[test]
-    fn test_compiled_bootstrap_matches_legacy_left_outer_join_followup_delta() {
+    fn test_compiled_bootstrap_left_outer_join_followup_delta_uses_production_path() {
         let employee = make_employee(1, 200, 99);
         let initial = vec![merge_rows_null_right(&employee, 2)];
 
         let mut source_rows = HashMap::new();
-        source_rows.insert((1, 0), vec![employee]);
+        source_rows.insert((1, 0), vec![employee.clone()]);
         source_rows.insert((2, 1), Vec::new());
 
-        let mut legacy_view = bootstrap_view_with_legacy_executor(
-            make_employee_department_left_outer_join(),
-            initial.clone(),
-            &source_rows,
-        );
         let mut compiled_view = bootstrap_view_with_compiled_executor(
             make_employee_department_left_outer_join(),
             initial,
             &source_rows,
         );
 
-        let follow_up = vec![Delta::insert(make_department(99, 300))];
-        let legacy_output = legacy_view.on_table_change(2, follow_up.clone());
+        let department = make_department(99, 300);
+        let follow_up = vec![Delta::insert(department.clone())];
         let compiled_output = compiled_view.on_table_change(2, follow_up);
+        let joined = merge_rows(&employee, &department);
 
         assert_eq!(
-            normalize_deltas(&legacy_output),
-            normalize_deltas(&compiled_output)
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&[
+                Delta::delete(merge_rows_null_right(&employee, 2)),
+                Delta::insert(joined.clone()),
+            ])
         );
         assert_eq!(
-            normalize_rows(&legacy_view.result()),
-            normalize_rows(&compiled_view.result())
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&[joined])
         );
     }
 
     #[test]
-    fn test_compiled_bootstrap_matches_legacy_right_outer_join_followup_delta() {
+    fn test_compiled_bootstrap_right_outer_join_followup_delta_uses_production_path() {
         let department = make_department(99, 300);
         let initial = vec![merge_rows_null_left(&department, 3)];
 
         let mut source_rows = HashMap::new();
         source_rows.insert((1, 0), Vec::new());
-        source_rows.insert((2, 1), vec![department]);
+        source_rows.insert((2, 1), vec![department.clone()]);
 
-        let mut legacy_view = bootstrap_view_with_legacy_executor(
-            make_employee_department_right_outer_join(),
-            initial.clone(),
-            &source_rows,
-        );
         let mut compiled_view = bootstrap_view_with_compiled_executor(
             make_employee_department_right_outer_join(),
             initial,
             &source_rows,
         );
 
-        let follow_up = vec![Delta::insert(make_employee(1, 200, 99))];
-        let legacy_output = legacy_view.on_table_change(1, follow_up.clone());
+        let employee = make_employee(1, 200, 99);
+        let follow_up = vec![Delta::insert(employee.clone())];
         let compiled_output = compiled_view.on_table_change(1, follow_up);
+        let joined = merge_rows(&employee, &department);
 
         assert_eq!(
-            normalize_deltas(&legacy_output),
-            normalize_deltas(&compiled_output)
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&[
+                Delta::delete(merge_rows_null_left(&department, 3)),
+                Delta::insert(joined.clone()),
+            ])
         );
         assert_eq!(
-            normalize_rows(&legacy_view.result()),
-            normalize_rows(&compiled_view.result())
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&[joined])
         );
     }
 
     #[test]
-    fn test_compiled_bootstrap_matches_legacy_full_outer_join_followup_delta() {
+    fn test_compiled_bootstrap_full_outer_join_followup_delta_uses_production_path() {
         let employee = make_employee(1, 200, 99);
         let department = make_department(10, 300);
         let initial = vec![
@@ -5146,36 +4280,36 @@ mod tests {
         ];
 
         let mut source_rows = HashMap::new();
-        source_rows.insert((1, 0), vec![employee]);
-        source_rows.insert((2, 1), vec![department]);
+        source_rows.insert((1, 0), vec![employee.clone()]);
+        source_rows.insert((2, 1), vec![department.clone()]);
 
-        let mut legacy_view = bootstrap_view_with_legacy_executor(
-            make_employee_department_full_outer_join(),
-            initial.clone(),
-            &source_rows,
-        );
         let mut compiled_view = bootstrap_view_with_compiled_executor(
             make_employee_department_full_outer_join(),
             initial,
             &source_rows,
         );
 
-        let follow_up = vec![Delta::insert(make_department(99, 301))];
-        let legacy_output = legacy_view.on_table_change(2, follow_up.clone());
+        let matching_department = make_department(99, 301);
+        let follow_up = vec![Delta::insert(matching_department.clone())];
         let compiled_output = compiled_view.on_table_change(2, follow_up);
+        let joined = merge_rows(&employee, &matching_department);
+        let unmatched_existing_department = merge_rows_null_left(&department, 3);
 
         assert_eq!(
-            normalize_deltas(&legacy_output),
-            normalize_deltas(&compiled_output)
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&[
+                Delta::delete(merge_rows_null_right(&employee, 2)),
+                Delta::insert(joined.clone()),
+            ])
         );
         assert_eq!(
-            normalize_rows(&legacy_view.result()),
-            normalize_rows(&compiled_view.result())
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&[unmatched_existing_department, joined])
         );
     }
 
     #[test]
-    fn test_compiled_bootstrap_matches_legacy_aggregate_followup_delta() {
+    fn test_compiled_bootstrap_aggregate_followup_delta_uses_production_path() {
         let initial = vec![Row::new(
             aggregate_group_row_id(&[Value::Int64(1)]),
             vec![Value::Int64(1), Value::Float64(30.0)],
@@ -5189,11 +4323,6 @@ mod tests {
             ],
         );
 
-        let mut legacy_view = bootstrap_view_with_legacy_executor(
-            make_sum_aggregate(),
-            initial.clone(),
-            &source_rows,
-        );
         let mut compiled_view =
             bootstrap_view_with_compiled_executor(make_sum_aggregate(), initial, &source_rows);
 
@@ -5201,16 +4330,19 @@ mod tests {
             3,
             vec![Value::Int64(1), Value::Int64(5)],
         ))];
-        let legacy_output = legacy_view.on_table_change(1, follow_up.clone());
         let compiled_output = compiled_view.on_table_change(1, follow_up);
+        let new_group = Row::new(
+            aggregate_group_row_id(&[Value::Int64(1)]),
+            vec![Value::Int64(1), Value::Float64(35.0)],
+        );
 
         assert_eq!(
-            normalize_deltas(&legacy_output),
-            normalize_deltas(&compiled_output)
+            normalize_deltas(&compiled_output),
+            normalize_deltas(&[Delta::insert(new_group.clone())])
         );
         assert_eq!(
-            normalize_rows(&legacy_view.result()),
-            normalize_rows(&compiled_view.result())
+            normalize_rows(&compiled_view.result()),
+            normalize_rows(&[new_group])
         );
     }
 
@@ -5224,18 +4356,13 @@ mod tests {
         source_rows.insert((1, 0), vec![left]);
         source_rows.insert((1, 1), vec![right]);
 
-        let legacy_view =
-            bootstrap_view_with_legacy_executor(make_self_join(), initial.clone(), &source_rows);
         let compiled_view =
             bootstrap_view_with_compiled_executor(make_self_join(), initial, &source_rows);
 
-        let legacy_state = legacy_view.join_states.values().next().unwrap();
         let compiled_state = compiled_view.join_states.values().next().unwrap();
-        assert_eq!(legacy_state.left.len(), 1);
-        assert_eq!(legacy_state.right.len(), 1);
         assert_eq!(compiled_state.left.len(), 1);
         assert_eq!(compiled_state.right.len(), 1);
-        assert_eq!(legacy_view.len(), compiled_view.len());
+        assert_eq!(compiled_view.len(), 1);
     }
 
     #[test]
@@ -5268,70 +4395,91 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_unary_block_matches_legacy_recursive_path() {
+    fn test_compiled_unary_block_produces_expected_rows() {
         let mut compiled_view = MaterializedView::new(make_trace_unary_fusion_dataflow());
-        let mut legacy_view = MaterializedView::new(make_trace_unary_fusion_dataflow());
         let deltas = vec![
             Delta::insert(make_row(1, 18)),
             Delta::insert(make_row(2, 17)),
             Delta::insert(make_row(3, 26)),
         ];
 
-        let compiled_output = compiled_view.on_table_change(1, deltas.clone());
-        let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
+        let compiled_output = compiled_view.on_table_change(1, deltas);
+        let expected = vec![
+            Delta::insert(Row::new(1, vec![Value::Int64(1)])),
+            Delta::insert(Row::new(3, vec![Value::Int64(3)])),
+        ];
 
         assert_eq!(
             normalize_deltas(&compiled_output),
-            normalize_deltas(&legacy_output)
+            normalize_deltas(&expected)
         );
         assert_eq!(
             normalize_rows(&compiled_view.result()),
-            normalize_rows(&legacy_view.result())
+            normalize_rows(
+                &expected
+                    .into_iter()
+                    .map(|delta| delta.data)
+                    .collect::<Vec<_>>()
+            )
         );
     }
 
     #[test]
-    fn test_compiled_unary_filter_project_chain_matches_legacy_recursive_path() {
+    fn test_compiled_unary_filter_project_chain_produces_expected_rows() {
         let mut compiled_view = MaterializedView::new(make_trace_filter_project_chain());
-        let mut legacy_view = MaterializedView::new(make_trace_filter_project_chain());
         let deltas = vec![
             Delta::insert(make_row(1, 18)),
             Delta::insert(make_row(2, 21)),
             Delta::insert(make_row(3, 26)),
         ];
 
-        let compiled_output = compiled_view.on_table_change(1, deltas.clone());
-        let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
+        let compiled_output = compiled_view.on_table_change(1, deltas);
+        let expected = vec![
+            Delta::insert(Row::new(1, vec![Value::Int64(18)])),
+            Delta::insert(Row::new(3, vec![Value::Int64(26)])),
+        ];
 
         assert_eq!(
             normalize_deltas(&compiled_output),
-            normalize_deltas(&legacy_output)
+            normalize_deltas(&expected)
         );
         assert_eq!(
             normalize_rows(&compiled_view.result()),
-            normalize_rows(&legacy_view.result())
+            normalize_rows(
+                &expected
+                    .into_iter()
+                    .map(|delta| delta.data)
+                    .collect::<Vec<_>>()
+            )
         );
     }
 
     #[test]
-    fn test_dynamic_map_barrier_matches_legacy_recursive_path() {
+    fn test_dynamic_map_barrier_produces_expected_rows() {
         let mut compiled_view = MaterializedView::new(make_dynamic_map_barrier_chain());
-        let mut legacy_view = MaterializedView::new(make_dynamic_map_barrier_chain());
         let deltas = vec![
             Delta::insert(make_row(1, 18)),
             Delta::insert(make_row(2, 21)),
         ];
 
-        let compiled_output = compiled_view.on_table_change(1, deltas.clone());
-        let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
+        let compiled_output = compiled_view.on_table_change(1, deltas);
+        let expected = vec![
+            Delta::insert(Row::new(1, vec![Value::Int64(2)])),
+            Delta::insert(Row::new(2, vec![Value::Int64(2)])),
+        ];
 
         assert_eq!(
             normalize_deltas(&compiled_output),
-            normalize_deltas(&legacy_output)
+            normalize_deltas(&expected)
         );
         assert_eq!(
             normalize_rows(&compiled_view.result()),
-            normalize_rows(&legacy_view.result())
+            normalize_rows(
+                &expected
+                    .into_iter()
+                    .map(|delta| delta.data)
+                    .collect::<Vec<_>>()
+            )
         );
     }
 
@@ -5367,24 +4515,27 @@ mod tests {
     }
 
     #[test]
-    fn test_self_join_update_matches_legacy_recursive_path() {
+    fn test_self_join_update_uses_production_compiled_path() {
         let mut compiled_view = MaterializedView::new(make_self_join());
-        let mut legacy_view = MaterializedView::new(make_self_join());
-        let deltas = vec![
-            Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(10)])),
-            Delta::insert(Row::new(2, vec![Value::Int64(10), Value::Int64(99)])),
-        ];
+        let left = Row::new(1, vec![Value::Int64(1), Value::Int64(10)]);
+        let right = Row::new(2, vec![Value::Int64(10), Value::Int64(99)]);
+        let deltas = vec![Delta::insert(left.clone()), Delta::insert(right.clone())];
 
-        let compiled_output = compiled_view.on_table_change(1, deltas.clone());
-        let legacy_output = apply_legacy_update(&mut legacy_view, 1, deltas);
+        let compiled_output = compiled_view.on_table_change(1, deltas);
+        let expected = vec![Delta::insert(merge_rows(&left, &right))];
 
         assert_eq!(
             normalize_deltas(&compiled_output),
-            normalize_deltas(&legacy_output)
+            normalize_deltas(&expected)
         );
         assert_eq!(
             normalize_rows(&compiled_view.result()),
-            normalize_rows(&legacy_view.result())
+            normalize_rows(
+                &expected
+                    .into_iter()
+                    .map(|delta| delta.data)
+                    .collect::<Vec<_>>()
+            )
         );
     }
 
