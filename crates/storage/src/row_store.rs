@@ -872,6 +872,10 @@ impl HashIndexStore {
         limit: Option<usize>,
         skip: usize,
     ) -> Vec<RowId> {
+        if let Some(KeyRange::Only(key)) = range {
+            return apply_point_row_id_window(self.inner.get(key), limit, skip);
+        }
+
         self.inner.get_range(range, reverse, limit, skip)
     }
 
@@ -954,12 +958,17 @@ impl IndexStore for HashIndexStore {
 
     fn get_range(
         &self,
-        _range: Option<&KeyRange<Value>>,
-        _reverse: bool,
-        _limit: Option<usize>,
-        _skip: usize,
+        range: Option<&KeyRange<Value>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
     ) -> Vec<RowId> {
-        self.get_all()
+        if let Some(KeyRange::Only(key)) = range {
+            return apply_point_row_id_window(self.get(key), limit, skip);
+        }
+
+        let range = IndexKey::from_scalar_range(range);
+        self.get_range_index_keys(range.as_ref(), reverse, limit, skip)
     }
 
     fn get_all(&self) -> Vec<RowId> {
@@ -1101,6 +1110,14 @@ fn first_duplicate_batch_key<K: Clone + Ord>(entries: &[(K, RowId)]) -> Option<K
         };
         (left == right).then(|| (*left).clone())
     })
+}
+
+fn apply_point_row_id_window(row_ids: Vec<RowId>, limit: Option<usize>, skip: usize) -> Vec<RowId> {
+    let iter = row_ids.into_iter().skip(skip);
+    match limit {
+        Some(limit) => iter.take(limit).collect(),
+        None => iter.collect(),
+    }
 }
 
 fn composite_range_has_expected_arity(range: &KeyRange<Vec<Value>>, expected: usize) -> bool {
@@ -5063,6 +5080,44 @@ mod tests {
         let results = store.index_scan("idx_value_hash", Some(&KeyRange::only(Value::Int64(200))));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id(), 2);
+    }
+
+    #[test]
+    fn test_hash_index_store_range_filters_instead_of_returning_all_rows() {
+        let mut index = HashIndexStore::new(false);
+        index.add(Value::Int64(100), 1).unwrap();
+        index.add(Value::Int64(200), 2).unwrap();
+        index.add(Value::Int64(300), 3).unwrap();
+        index.add(Value::Int64(200), 4).unwrap();
+
+        let only = index.get_range(Some(&KeyRange::only(Value::Int64(200))), false, None, 0);
+        assert_eq!(only, vec![2, 4]);
+
+        let bounded = index.get_range(
+            Some(&KeyRange::bound(
+                Value::Int64(150),
+                Value::Int64(300),
+                false,
+                false,
+            )),
+            false,
+            None,
+            0,
+        );
+        assert_eq!(bounded, vec![2, 4, 3]);
+
+        let paged = index.get_range(
+            Some(&KeyRange::bound(
+                Value::Int64(100),
+                Value::Int64(300),
+                false,
+                false,
+            )),
+            false,
+            Some(2),
+            1,
+        );
+        assert_eq!(paged, vec![2, 4]);
     }
 
     #[test]
