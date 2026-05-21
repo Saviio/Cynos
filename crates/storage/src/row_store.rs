@@ -1252,6 +1252,52 @@ impl RowStore {
         self.row_slots.get_mut(slot_idx).map(|slot| &mut slot.row)
     }
 
+    fn for_each_secondary_index_mut<F>(&mut self, mut visitor: F)
+    where
+        F: FnMut(&str, &[usize], &mut SecondaryIndexStore),
+    {
+        let index_columns = &self.index_columns;
+        let secondary_indices = &mut self.secondary_indices;
+        for (name, columns) in index_columns {
+            let Some(index) = secondary_indices.get_mut(name) else {
+                continue;
+            };
+            visitor(name.as_str(), columns, index);
+        }
+    }
+
+    fn try_for_each_secondary_index_mut<E, F>(
+        &mut self,
+        mut visitor: F,
+    ) -> core::result::Result<(), E>
+    where
+        F: FnMut(&str, &[usize], &mut SecondaryIndexStore) -> core::result::Result<(), E>,
+    {
+        let index_columns = &self.index_columns;
+        let secondary_indices = &mut self.secondary_indices;
+        for (name, columns) in index_columns {
+            let Some(index) = secondary_indices.get_mut(name) else {
+                continue;
+            };
+            visitor(name.as_str(), columns, index)?;
+        }
+        Ok(())
+    }
+
+    fn for_each_gin_index_mut<F>(&mut self, mut visitor: F)
+    where
+        F: FnMut(&str, &GinIndexConfig, &mut GinIndex),
+    {
+        let gin_index_configs = &self.gin_index_configs;
+        let gin_indices = &mut self.gin_indices;
+        for (name, config) in gin_index_configs {
+            let Some(index) = gin_indices.get_mut(name) else {
+                continue;
+            };
+            visitor(name.as_str(), config, index);
+        }
+    }
+
     fn insert_row_slot(&mut self, row_id: RowId, row: Rc<Row>) {
         let slot_idx = self.row_slots.len();
         self.row_slots.push(RowSlot { row_id, row });
@@ -2036,41 +2082,27 @@ impl RowStore {
             }
         }
 
-        // Add to secondary indices
-        // Collect index names first to avoid borrow conflict
-        let index_names: Vec<String> = self.index_columns.keys().cloned().collect();
-        for idx_name in &index_names {
-            let cols = &self.index_columns[idx_name];
+        let secondary_result = self.try_for_each_secondary_index_mut(|idx_name, cols, idx| {
             let key = extract_key(&row, cols);
-            if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                if idx.add_index_key(key.clone(), row_id).is_err() {
-                    self.rollback_insert(row_id, &row);
-                    return Err(Error::UniqueConstraint {
-                        column: idx_name.clone(),
-                        value: key.to_error_value(),
-                    });
-                }
-            }
+            idx.add_index_key(key.clone(), row_id)
+                .map_err(|_| (idx_name.to_string(), key.to_error_value()))
+        });
+        if let Err((column, value)) = secondary_result {
+            self.rollback_insert(row_id, &row);
+            return Err(Error::UniqueConstraint { column, value });
         }
 
-        // Add to GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(config.column_idx) {
-                    Self::index_jsonb_value(
-                        gin_idx,
-                        value,
-                        row_id,
-                        config.compiled_indexed_paths.as_deref(),
-                        config.compiled_indexed_path_tree.as_ref(),
-                    );
-                }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            if let Some(value) = row.get(config.column_idx) {
+                Self::index_jsonb_value(
+                    gin_idx,
+                    value,
+                    row_id,
+                    config.compiled_indexed_paths.as_deref(),
+                    config.compiled_indexed_path_tree.as_ref(),
+                );
             }
-        }
+        });
 
         self.insert_row_slot(row_id, Rc::new(row));
         Ok(row_id)
@@ -2082,33 +2114,22 @@ impl RowStore {
             pk_index.remove_index_key(&pk_value, Some(row_id));
         }
 
-        let index_names: Vec<String> = self.index_columns.keys().cloned().collect();
-        for idx_name in &index_names {
-            let cols = &self.index_columns[idx_name];
+        self.for_each_secondary_index_mut(|_, cols, idx| {
             let key = extract_key(row, cols);
-            if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                idx.remove_index_key(&key, Some(row_id));
-            }
-        }
+            idx.remove_index_key(&key, Some(row_id));
+        });
 
-        // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(config.column_idx) {
-                    Self::remove_jsonb_from_gin(
-                        gin_idx,
-                        value,
-                        row_id,
-                        config.compiled_indexed_paths.as_deref(),
-                        config.compiled_indexed_path_tree.as_ref(),
-                    );
-                }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            if let Some(value) = row.get(config.column_idx) {
+                Self::remove_jsonb_from_gin(
+                    gin_idx,
+                    value,
+                    row_id,
+                    config.compiled_indexed_paths.as_deref(),
+                    config.compiled_indexed_path_tree.as_ref(),
+                );
             }
-        }
+        });
     }
 
     /// Updates a row in the store.
@@ -2158,52 +2179,39 @@ impl RowStore {
             }
         }
 
-        // Update secondary indices
-        let index_names: Vec<String> = self.index_columns.keys().cloned().collect();
-        for idx_name in &index_names {
-            let cols = &self.index_columns[idx_name];
+        self.for_each_secondary_index_mut(|_, cols, idx| {
             let old_key = extract_key(&old_row, cols);
             let new_key = extract_key(&new_row, cols);
-            if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                if old_key != new_key {
-                    idx.remove_index_key(&old_key, Some(row_id));
-                    let _ = idx.add_index_key(new_key, row_id);
-                }
+            if old_key != new_key {
+                idx.remove_index_key(&old_key, Some(row_id));
+                let _ = idx.add_index_key(new_key, row_id);
             }
-        }
+        });
 
-        // Update GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                let old_value = old_row.get(config.column_idx);
-                let new_value = new_row.get(config.column_idx);
-                // Only update if the JSONB value changed
-                if old_value != new_value {
-                    if let Some(old_val) = old_value {
-                        Self::remove_jsonb_from_gin(
-                            gin_idx,
-                            old_val,
-                            row_id,
-                            config.compiled_indexed_paths.as_deref(),
-                            config.compiled_indexed_path_tree.as_ref(),
-                        );
-                    }
-                    if let Some(new_val) = new_value {
-                        Self::index_jsonb_value(
-                            gin_idx,
-                            new_val,
-                            row_id,
-                            config.compiled_indexed_paths.as_deref(),
-                            config.compiled_indexed_path_tree.as_ref(),
-                        );
-                    }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            let old_value = old_row.get(config.column_idx);
+            let new_value = new_row.get(config.column_idx);
+            if old_value != new_value {
+                if let Some(old_val) = old_value {
+                    Self::remove_jsonb_from_gin(
+                        gin_idx,
+                        old_val,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                    );
+                }
+                if let Some(new_val) = new_value {
+                    Self::index_jsonb_value(
+                        gin_idx,
+                        new_val,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                    );
                 }
             }
-        }
+        });
 
         self.replace_row_slot(row_id, Rc::new(new_row));
         Ok(())
@@ -2222,33 +2230,22 @@ impl RowStore {
             }
         }
 
-        let index_names: Vec<String> = self.index_columns.keys().cloned().collect();
-        for idx_name in &index_names {
-            let cols = &self.index_columns[idx_name];
+        self.for_each_secondary_index_mut(|_, cols, idx| {
             let key = extract_key(&row, cols);
-            if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                idx.remove_index_key(&key, Some(row_id));
-            }
-        }
+            idx.remove_index_key(&key, Some(row_id));
+        });
 
-        // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(config.column_idx) {
-                    Self::remove_jsonb_from_gin(
-                        gin_idx,
-                        value,
-                        row_id,
-                        config.compiled_indexed_paths.as_deref(),
-                        config.compiled_indexed_path_tree.as_ref(),
-                    );
-                }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            if let Some(value) = row.get(config.column_idx) {
+                Self::remove_jsonb_from_gin(
+                    gin_idx,
+                    value,
+                    row_id,
+                    config.compiled_indexed_paths.as_deref(),
+                    config.compiled_indexed_path_tree.as_ref(),
+                );
             }
-        }
+        });
 
         Ok(row)
     }
@@ -2297,26 +2294,19 @@ impl RowStore {
             }
         }
 
-        // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                for row in &deleted_rows {
-                    if let Some(value) = row.get(config.column_idx) {
-                        Self::remove_jsonb_from_gin(
-                            gin_idx,
-                            value,
-                            row.id(),
-                            config.compiled_indexed_paths.as_deref(),
-                            config.compiled_indexed_path_tree.as_ref(),
-                        );
-                    }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            for row in &deleted_rows {
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::remove_jsonb_from_gin(
+                        gin_idx,
+                        value,
+                        row.id(),
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                    );
                 }
             }
-        }
+        });
 
         deleted_rows
     }
@@ -2406,7 +2396,7 @@ impl RowStore {
     pub fn count_existing_rows_by_ids(&self, row_ids: &[RowId]) -> usize {
         row_ids
             .iter()
-            .filter(|row_id| self.rows.contains_key(row_id))
+            .filter(|row_id| self.rows.contains_key(*row_id))
             .count()
     }
 
