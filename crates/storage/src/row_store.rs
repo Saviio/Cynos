@@ -194,7 +194,6 @@ struct BatchSecondaryDef {
 }
 
 struct PreparedBatchInsert {
-    row_id_entries: Vec<(Value, RowId)>,
     primary_entries: Option<Vec<(IndexKey, RowId)>>,
     secondary_entries: Vec<Vec<(IndexKey, RowId)>>,
 }
@@ -202,7 +201,6 @@ struct PreparedBatchInsert {
 #[derive(Clone, Copy)]
 enum InsertProfilePhase {
     Validation,
-    RowIdIndex,
     PrimaryIndex,
     SecondaryIndex,
     GinCollect,
@@ -290,7 +288,6 @@ impl InsertBatchProfiler {
             let elapsed = now_ms() - started_at;
             match phase {
                 InsertProfilePhase::Validation => self.profile.validation_ms += elapsed,
-                InsertProfilePhase::RowIdIndex => self.profile.row_id_index_ms += elapsed,
                 InsertProfilePhase::PrimaryIndex => self.profile.primary_index_ms += elapsed,
                 InsertProfilePhase::SecondaryIndex => self.profile.secondary_index_ms += elapsed,
                 InsertProfilePhase::GinCollect => self.profile.gin_collect_ms += elapsed,
@@ -1125,7 +1122,6 @@ pub struct RowStore {
     row_slots: Vec<RowSlot>,
     /// Slot indices maintained in row_id order for deterministic scans.
     scan_order: Vec<usize>,
-    row_id_index: BTreeIndexStore,
     primary_index: Option<BTreeIndexStore>,
     pk_columns: Vec<usize>,
     secondary_indices: BTreeMap<String, SecondaryIndexStore>,
@@ -1144,7 +1140,6 @@ impl RowStore {
             rows: RowMap::default(),
             row_slots: Vec::new(),
             scan_order: Vec::new(),
-            row_id_index: BTreeIndexStore::new(true),
             primary_index: None,
             pk_columns: Vec::new(),
             secondary_indices: BTreeMap::new(),
@@ -1363,7 +1358,6 @@ impl RowStore {
             .windows(2)
             .all(|window| window[0].id() < window[1].id()));
 
-        let mut row_id_entries = Vec::with_capacity(rows.len());
         let mut primary_entries = self
             .primary_index
             .as_ref()
@@ -1374,7 +1368,6 @@ impl RowStore {
             .collect();
         for row in &rows {
             let row_id = row.id();
-            row_id_entries.push((Value::Int64(row_id as i64), row_id));
             if let Some(entries) = primary_entries.as_mut() {
                 entries.push((extract_key(row, &self.pk_columns), row_id));
             }
@@ -1382,15 +1375,6 @@ impl RowStore {
                 entries.push((extract_key(row, &def.cols), row_id));
             }
         }
-
-        let started = profiler.start_timer();
-        if self.row_id_index.add_batch(&row_id_entries).is_err() {
-            self.clear();
-            return Err(Error::invalid_operation(
-                "Failed to add to row ID index during bulk load",
-            ));
-        }
-        profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
 
         if let Some(ref mut pk_index) = self.primary_index {
             let started = profiler.start_timer();
@@ -1635,28 +1619,9 @@ impl RowStore {
             }
 
             let started = profiler.start_timer();
-            if self
-                .row_id_index
-                .add(Value::Int64(row_id as i64), row_id)
-                .is_err()
-            {
-                profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
-                Self::flush_gin_bulk_builders_profiled(
-                    &mut self.gin_indices,
-                    gin_defs,
-                    &mut gin_builders,
-                    profiler,
-                );
-                return Err(Error::invalid_operation("Failed to add to row ID index"));
-            }
-            profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
-
-            let started = profiler.start_timer();
             if let (Some(ref mut pk_index), Some(pk)) = (&mut self.primary_index, pk_value.clone())
             {
                 if pk_index.add_index_key(pk.clone(), row_id).is_err() {
-                    self.row_id_index
-                        .remove(&Value::Int64(row_id as i64), Some(row_id));
                     profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
                     Self::flush_gin_bulk_builders_profiled(
                         &mut self.gin_indices,
@@ -1693,8 +1658,6 @@ impl RowStore {
                         {
                             pk_index.remove_index_key(pk, Some(row_id));
                         }
-                        self.row_id_index
-                            .remove(&Value::Int64(row_id as i64), Some(row_id));
                         Self::flush_gin_bulk_builders_profiled(
                             &mut self.gin_indices,
                             gin_defs,
@@ -1753,7 +1716,6 @@ impl RowStore {
             return None;
         }
 
-        let mut row_id_entries = Vec::with_capacity(rows.len());
         let mut primary_entries =
             (!self.pk_columns.is_empty()).then(|| Vec::with_capacity(rows.len()));
         let mut secondary_entries: Vec<Vec<(IndexKey, RowId)>> = secondary_defs
@@ -1773,7 +1735,6 @@ impl RowStore {
             if self.rows.contains_key(&row_id) || !seen_row_ids.insert(row_id) {
                 return None;
             }
-            row_id_entries.push((Value::Int64(row_id as i64), row_id));
 
             if let Some(entries) = primary_entries.as_mut() {
                 let pk = extract_key(row, &self.pk_columns);
@@ -1814,7 +1775,6 @@ impl RowStore {
         }
 
         Some(PreparedBatchInsert {
-            row_id_entries,
             primary_entries,
             secondary_entries,
         })
@@ -1829,7 +1789,6 @@ impl RowStore {
         profiler: &mut InsertBatchProfiler,
     ) -> Result<usize> {
         let PreparedBatchInsert {
-            row_id_entries,
             primary_entries,
             secondary_entries,
         } = prepared_batch;
@@ -1837,18 +1796,10 @@ impl RowStore {
         let row_count = rows.len();
 
         let started = profiler.start_timer();
-        if self.row_id_index.add_batch(&row_id_entries).is_err() {
-            profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
-            return Err(Error::invalid_operation("Failed to add to row ID index"));
-        }
-        profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
-
-        let started = profiler.start_timer();
         if let (Some(ref mut pk_index), Some(entries)) =
             (&mut self.primary_index, primary_entries.as_ref())
         {
             if pk_index.add_batch_index_keys(entries).is_err() {
-                self.row_id_index.remove_batch(&row_id_entries);
                 profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
                 let value = first_duplicate_batch_key(entries)
                     .map(|pk| pk.to_error_value())
@@ -1882,7 +1833,6 @@ impl RowStore {
                 {
                     pk_index.remove_batch_index_keys(entries);
                 }
-                self.row_id_index.remove_batch(&row_id_entries);
                 profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
                 let value = first_duplicate_batch_key(entries)
                     .map(|key| key.to_error_value())
@@ -2076,16 +2026,9 @@ impl RowStore {
             None
         };
 
-        // Add to row ID index
-        self.row_id_index
-            .add(Value::Int64(row_id as i64), row_id)
-            .map_err(|_| Error::invalid_operation("Failed to add to row ID index"))?;
-
         // Add to primary key index
         if let (Some(ref mut pk_index), Some(pk)) = (&mut self.primary_index, pk_value.clone()) {
             if pk_index.add_index_key(pk.clone(), row_id).is_err() {
-                self.row_id_index
-                    .remove(&Value::Int64(row_id as i64), Some(row_id));
                 return Err(Error::UniqueConstraint {
                     column: "primary_key".into(),
                     value: pk.to_error_value(),
@@ -2134,9 +2077,6 @@ impl RowStore {
     }
 
     fn rollback_insert(&mut self, row_id: RowId, row: &Row) {
-        self.row_id_index
-            .remove(&Value::Int64(row_id as i64), Some(row_id));
-
         if let Some(ref mut pk_index) = self.primary_index {
             let pk_value = extract_key(row, &self.pk_columns);
             pk_index.remove_index_key(&pk_value, Some(row_id));
@@ -2275,9 +2215,6 @@ impl RowStore {
             .remove_row_slot(row_id)
             .ok_or_else(|| Error::not_found(self.schema.name(), Value::Int64(row_id as i64)))?;
 
-        self.row_id_index
-            .remove(&Value::Int64(row_id as i64), Some(row_id));
-
         if !self.pk_columns.is_empty() {
             let pk_value = extract_key(&row, &self.pk_columns);
             if let Some(ref mut pk_index) = self.primary_index {
@@ -2337,13 +2274,6 @@ impl RowStore {
         if deleted_rows.is_empty() {
             return Vec::new();
         }
-
-        // Prepare batch entries for row_id_index
-        let row_id_entries: Vec<(Value, RowId)> = deleted_rows
-            .iter()
-            .map(|row| (Value::Int64(row.id() as i64), row.id()))
-            .collect();
-        self.row_id_index.remove_batch(&row_id_entries);
 
         // Prepare batch entries for primary key index
         if !self.pk_columns.is_empty() {
@@ -3021,7 +2951,6 @@ impl RowStore {
         self.rows.clear();
         self.row_slots.clear();
         self.scan_order.clear();
-        self.row_id_index.clear();
         if let Some(ref mut pk_index) = self.primary_index {
             pk_index.clear();
         }
