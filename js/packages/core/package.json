@@ -1,6 +1,6 @@
 {
   "name": "@cynos/core",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Cynos - High-performance in-memory database for JavaScript/TypeScript",
   "author": "Saviio",
   "license": "Apache-2.0",
