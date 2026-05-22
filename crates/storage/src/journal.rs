@@ -7,7 +7,7 @@ use crate::cache::TableCache;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use cynos_core::{Result, Row, RowId};
+use cynos_core::{Error, Result, Row, RowId};
 
 /// A single journal entry representing a change.
 #[derive(Clone, Debug)]
@@ -298,9 +298,14 @@ impl Journal {
                 } => {
                     if let Some(store) = cache.get_table_mut(table) {
                         // Restore old values but keep version incrementing to maintain monotonicity
+                        let rollback_version = new.version().checked_add(1).ok_or_else(|| {
+                            Error::invalid_operation(
+                                "Cannot rollback update: row version would overflow",
+                            )
+                        })?;
                         let rollback_row = Row::new_with_version(
                             old.id(),
-                            new.version().wrapping_add(1),
+                            rollback_version,
                             old.values().to_vec(),
                         );
                         let _ = store.update(*row_id, rollback_row);
@@ -337,7 +342,7 @@ mod tests {
     use super::*;
     use alloc::vec;
     use cynos_core::schema::TableBuilder;
-    use cynos_core::{DataType, Value};
+    use cynos_core::{DataType, Error, Value};
 
     fn test_schema() -> cynos_core::schema::Table {
         TableBuilder::new("test")
@@ -399,6 +404,39 @@ mod tests {
 
         // Should only have the first row
         assert_eq!(cache.get_table("test").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_journal_rollback_update_rejects_version_overflow() {
+        let mut cache = TableCache::new();
+        cache.create_table(test_schema()).unwrap();
+
+        let old_row = Row::new_with_version(
+            1,
+            u64::MAX - 1,
+            vec![Value::Int64(1), Value::String("old".into())],
+        );
+        let new_row = Row::new_with_version(
+            1,
+            u64::MAX,
+            vec![Value::Int64(1), Value::String("new".into())],
+        );
+
+        cache
+            .get_table_mut("test")
+            .unwrap()
+            .insert(new_row.clone())
+            .unwrap();
+
+        let mut journal = Journal::new();
+        journal.record_update("test", old_row, new_row);
+
+        let error = journal.rollback(&mut cache).unwrap_err();
+        assert!(matches!(error, Error::InvalidOperation { .. }));
+
+        let stored = cache.get_table("test").unwrap().get(1).unwrap();
+        assert_eq!(stored.version(), u64::MAX);
+        assert_eq!(stored.get(1), Some(&Value::String("new".into())));
     }
 
     #[test]
