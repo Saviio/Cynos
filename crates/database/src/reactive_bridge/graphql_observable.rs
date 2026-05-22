@@ -758,7 +758,7 @@ impl GraphqlDeltaObservable {
         let cache = self.cache.borrow();
         let response = match self.batch_plan.as_ref() {
             Some(plan) => {
-                let rows = self.view.result_row_refs().collect::<Vec<_>>();
+                let rows = self.view.result_rows().collect::<Vec<_>>();
                 build_graphql_response_batched_refs(
                     &cache,
                     &self.catalog,
@@ -790,7 +790,7 @@ impl GraphqlDeltaObservable {
         let cache = self.cache.borrow();
         let response = match self.batch_plan.as_ref() {
             Some(plan) => {
-                let rows = self.view.result_row_refs().collect::<Vec<_>>();
+                let rows = self.view.result_rows().collect::<Vec<_>>();
                 build_graphql_response_batched_refs(
                     &cache,
                     &self.catalog,

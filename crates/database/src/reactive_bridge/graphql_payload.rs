@@ -281,7 +281,7 @@ pub(super) fn build_graphql_response_batched_refs(
     field: &cynos_gql::bind::BoundRootField,
     plan: &cynos_gql::GraphqlBatchPlan,
     state: &mut cynos_gql::GraphqlBatchState,
-    rows: &[&Rc<Row>],
+    rows: &[&Row],
 ) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
     cynos_gql::batch_render::render_graphql_response_refs(cache, catalog, field, plan, state, rows)
 }

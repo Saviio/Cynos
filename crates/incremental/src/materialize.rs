@@ -3249,6 +3249,11 @@ impl MaterializedView {
         self.visible_rows.rc_rows()
     }
 
+    #[deprecated(
+        since = "0.1.0",
+        note = "use result_rows() for read-only access; result_row_refs() may build an Rc shadow for owned result storage"
+    )]
+    #[allow(deprecated)]
     #[inline]
     pub fn result_row_refs(&self) -> impl Iterator<Item = &Rc<Row>> + '_ {
         self.visible_rows.row_refs()
