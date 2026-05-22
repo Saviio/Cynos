@@ -1377,12 +1377,6 @@ fn storage_insert_profile_to_js_value(profile: StorageInsertProfile) -> JsValue 
     .ok();
     js_sys::Reflect::set(
         &object,
-        &JsValue::from_str("rowIdIndexMs"),
-        &JsValue::from_f64(profile.row_id_index_ms),
-    )
-    .ok();
-    js_sys::Reflect::set(
-        &object,
         &JsValue::from_str("primaryIndexMs"),
         &JsValue::from_f64(profile.primary_index_ms),
     )

@@ -15,7 +15,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem;
 use cynos_core::{aggregate_group_row_id, Row, RowId, Value};
-use hashbrown::HashMap;
+use hashbrown::{hash_map::Entry, HashMap};
 
 // Tiny flushes are common for live updates; scan them linearly to avoid HashMap allocation.
 const JOIN_NORMALIZE_LINEAR_SCAN_LIMIT: usize = 16;
@@ -862,6 +862,28 @@ pub struct GroupAggregateState {
     group_by: Vec<ColumnId>,
     /// Track the last emitted row ID per group key, so deletes use the correct ID
     last_row_ids: HashMap<Vec<Value>, RowId>,
+    /// Reusable grouping scratch for the legacy row executor.
+    row_group_scratch: HashMap<Vec<Value>, AggregateDeltaIndices>,
+    /// Reusable grouping scratch for the compiled trace executor.
+    trace_group_scratch: HashMap<Vec<Value>, AggregateDeltaIndices>,
+}
+
+enum AggregateDeltaIndices {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl AggregateDeltaIndices {
+    #[inline]
+    fn push(&mut self, index: usize) {
+        match self {
+            Self::One(first) => {
+                let first = *first;
+                *self = Self::Many(vec![first, index]);
+            }
+            Self::Many(indices) => indices.push(index),
+        }
+    }
 }
 
 impl GroupAggregateState {
@@ -871,6 +893,8 @@ impl GroupAggregateState {
             functions,
             group_by,
             last_row_ids: HashMap::new(),
+            row_group_scratch: HashMap::new(),
+            trace_group_scratch: HashMap::new(),
         }
     }
 
@@ -880,69 +904,108 @@ impl GroupAggregateState {
     ///   2. Update aggregate states
     ///   3. Emit insert(new_aggregate_row) if group still has data
     pub fn process_deltas(&mut self, deltas: &[Delta<Row>]) -> Vec<Delta<Row>> {
-        // Collect deltas by group key
-        let mut grouped: HashMap<Vec<Value>, Vec<(&Row, i32)>> = HashMap::new();
-        for d in deltas {
-            let key: Vec<Value> = self
-                .group_by
-                .iter()
-                .map(|&col| d.data.get(col).cloned().unwrap_or(Value::Null))
-                .collect();
-            grouped.entry(key).or_default().push((&d.data, d.diff));
-        }
-
         let mut output = Vec::new();
+        self.process_deltas_into(deltas, &mut output);
+        output
+    }
 
-        for (key, rows) in grouped {
-            let existed = self.groups.contains_key(&key);
+    pub fn process_deltas_into(&mut self, deltas: &[Delta<Row>], output: &mut Vec<Delta<Row>>) {
+        output.clear();
+        if deltas.is_empty() {
+            self.row_group_scratch.clear();
+            return;
+        }
 
-            // Snapshot old value before update
-            let old_row = if existed {
-                Some(self.build_output_row(&key))
-            } else {
-                None
-            };
+        if deltas.len() == 1 {
+            self.row_group_scratch.clear();
+            let key = self.row_group_key(&deltas[0].data);
+            self.process_row_delta_group(&key, &AggregateDeltaIndices::One(0), deltas, output);
+            return;
+        }
 
-            // Get or create group state
-            let states = self.groups.entry(key.clone()).or_insert_with(|| {
-                self.functions
-                    .iter()
-                    .map(|(_, agg_type)| AggregateState::new(*agg_type))
-                    .collect()
-            });
-
-            // Apply all deltas for this group
-            for (row, diff) in &rows {
-                for (i, (col, _)) in self.functions.iter().enumerate() {
-                    let value = row.get(*col).cloned().unwrap_or(Value::Null);
-                    states[i].apply(&value, *diff);
+        let mut grouped = mem::take(&mut self.row_group_scratch);
+        grouped.clear();
+        grouped.reserve(deltas.len());
+        for (index, delta) in deltas.iter().enumerate() {
+            let key = self.row_group_key(&delta.data);
+            match grouped.entry(key) {
+                Entry::Occupied(mut entry) => entry.get_mut().push(index),
+                Entry::Vacant(entry) => {
+                    entry.insert(AggregateDeltaIndices::One(index));
                 }
-            }
-
-            // Check if group is now empty
-            let is_empty = states.iter().all(|s| s.is_empty());
-
-            // Emit old row deletion if group existed (use tracked row ID)
-            if let Some(&old_id) = self.last_row_ids.get(&key) {
-                if let Some(old) = old_row {
-                    let mut old_with_id = old;
-                    old_with_id.set_id(old_id);
-                    output.push(Delta::delete(old_with_id));
-                }
-            }
-
-            // Emit new row insertion if group still has data
-            if !is_empty {
-                let new_row = self.build_output_row(&key);
-                self.last_row_ids.insert(key.clone(), new_row.id());
-                output.push(Delta::insert(new_row));
-            } else {
-                self.groups.remove(&key);
-                self.last_row_ids.remove(&key);
             }
         }
 
-        output
+        for (key, indices) in grouped.iter() {
+            self.process_row_delta_group(key, indices, deltas, output);
+        }
+        self.row_group_scratch = grouped;
+    }
+
+    fn process_row_delta_group(
+        &mut self,
+        key: &Vec<Value>,
+        indices: &AggregateDeltaIndices,
+        deltas: &[Delta<Row>],
+        output: &mut Vec<Delta<Row>>,
+    ) {
+        let existed = self.groups.contains_key(key);
+
+        // Snapshot old value before update.
+        let old_row = if existed {
+            Some(self.build_output_row(key))
+        } else {
+            None
+        };
+
+        // Get or create group state.
+        let functions = &self.functions;
+        let states = self.groups.entry(key.clone()).or_insert_with(|| {
+            functions
+                .iter()
+                .map(|(_, agg_type)| AggregateState::new(*agg_type))
+                .collect()
+        });
+
+        match indices {
+            AggregateDeltaIndices::One(index) => {
+                let delta = &deltas[*index];
+                for (state_index, (col, _)) in functions.iter().enumerate() {
+                    let value = delta.data.get(*col).cloned().unwrap_or(Value::Null);
+                    states[state_index].apply(&value, delta.diff);
+                }
+            }
+            AggregateDeltaIndices::Many(group_indices) => {
+                for index in group_indices {
+                    let delta = &deltas[*index];
+                    for (state_index, (col, _)) in functions.iter().enumerate() {
+                        let value = delta.data.get(*col).cloned().unwrap_or(Value::Null);
+                        states[state_index].apply(&value, delta.diff);
+                    }
+                }
+            }
+        }
+
+        let is_empty = states.iter().all(|state| state.is_empty());
+
+        // Emit old row deletion if group existed (use tracked row ID).
+        if let Some(&old_id) = self.last_row_ids.get(key) {
+            if let Some(old) = old_row {
+                let mut old_with_id = old;
+                old_with_id.set_id(old_id);
+                output.push(Delta::delete(old_with_id));
+            }
+        }
+
+        // Emit new row insertion if group still has data.
+        if !is_empty {
+            let new_row = self.build_output_row(key);
+            self.last_row_ids.insert(key.clone(), new_row.id());
+            output.push(Delta::insert(new_row));
+        } else {
+            self.groups.remove(key);
+            self.last_row_ids.remove(key);
+        }
     }
 
     pub fn process_trace_deltas(
@@ -950,63 +1013,129 @@ impl GroupAggregateState {
         arena: &TraceTupleArena,
         deltas: &[Delta<TraceTupleHandle>],
     ) -> Vec<Delta<TraceTupleHandle>> {
-        let mut grouped: HashMap<Vec<Value>, Vec<(&TraceTupleHandle, i32)>> = HashMap::new();
-        for delta in deltas {
-            let key = self
-                .group_by
-                .iter()
-                .map(|&col| arena.value_at(&delta.data, col).unwrap_or(Value::Null))
-                .collect::<Vec<_>>();
-            grouped
-                .entry(key)
-                .or_default()
-                .push((&delta.data, delta.diff));
-        }
-
         let mut output = Vec::new();
-        for (key, rows) in grouped {
-            let existed = self.groups.contains_key(&key);
-            let old_row = if existed {
-                Some(self.build_output_row(&key))
-            } else {
-                None
-            };
+        self.process_trace_deltas_into(arena, deltas, &mut output);
+        output
+    }
 
-            let states = self.groups.entry(key.clone()).or_insert_with(|| {
-                self.functions
-                    .iter()
-                    .map(|(_, agg_type)| AggregateState::new(*agg_type))
-                    .collect()
-            });
+    pub fn process_trace_deltas_into(
+        &mut self,
+        arena: &TraceTupleArena,
+        deltas: &[Delta<TraceTupleHandle>],
+        output: &mut Vec<Delta<TraceTupleHandle>>,
+    ) {
+        output.clear();
+        if deltas.is_empty() {
+            self.trace_group_scratch.clear();
+            return;
+        }
 
-            for (handle, diff) in &rows {
-                for (index, (col, _)) in self.functions.iter().enumerate() {
-                    let value = arena.value_at(handle, *col).unwrap_or(Value::Null);
-                    states[index].apply(&value, *diff);
+        if deltas.len() == 1 {
+            self.trace_group_scratch.clear();
+            let key = self.trace_group_key(arena, &deltas[0].data);
+            self.process_trace_delta_group(
+                arena,
+                &key,
+                &AggregateDeltaIndices::One(0),
+                deltas,
+                output,
+            );
+            return;
+        }
+
+        let mut grouped = mem::take(&mut self.trace_group_scratch);
+        grouped.clear();
+        grouped.reserve(deltas.len());
+        for (index, delta) in deltas.iter().enumerate() {
+            let key = self.trace_group_key(arena, &delta.data);
+            match grouped.entry(key) {
+                Entry::Occupied(mut entry) => entry.get_mut().push(index),
+                Entry::Vacant(entry) => {
+                    entry.insert(AggregateDeltaIndices::One(index));
                 }
-            }
-
-            let is_empty = states.iter().all(|state| state.is_empty());
-
-            if let Some(&old_id) = self.last_row_ids.get(&key) {
-                if let Some(old) = old_row {
-                    let mut old_with_id = old;
-                    old_with_id.set_id(old_id);
-                    output.push(Delta::delete(arena.owned(old_with_id)));
-                }
-            }
-
-            if !is_empty {
-                let new_row = self.build_output_row(&key);
-                self.last_row_ids.insert(key.clone(), new_row.id());
-                output.push(Delta::insert(arena.owned(new_row)));
-            } else {
-                self.groups.remove(&key);
-                self.last_row_ids.remove(&key);
             }
         }
 
-        output
+        for (key, indices) in grouped.iter() {
+            self.process_trace_delta_group(arena, key, indices, deltas, output);
+        }
+        self.trace_group_scratch = grouped;
+    }
+
+    fn process_trace_delta_group(
+        &mut self,
+        arena: &TraceTupleArena,
+        key: &Vec<Value>,
+        indices: &AggregateDeltaIndices,
+        deltas: &[Delta<TraceTupleHandle>],
+        output: &mut Vec<Delta<TraceTupleHandle>>,
+    ) {
+        let existed = self.groups.contains_key(key);
+        let old_row = if existed {
+            Some(self.build_output_row(key))
+        } else {
+            None
+        };
+
+        let functions = &self.functions;
+        let states = self.groups.entry(key.clone()).or_insert_with(|| {
+            functions
+                .iter()
+                .map(|(_, agg_type)| AggregateState::new(*agg_type))
+                .collect()
+        });
+
+        match indices {
+            AggregateDeltaIndices::One(index) => {
+                let delta = &deltas[*index];
+                for (state_index, (col, _)) in functions.iter().enumerate() {
+                    let value = arena.value_at(&delta.data, *col).unwrap_or(Value::Null);
+                    states[state_index].apply(&value, delta.diff);
+                }
+            }
+            AggregateDeltaIndices::Many(group_indices) => {
+                for index in group_indices {
+                    let delta = &deltas[*index];
+                    for (state_index, (col, _)) in functions.iter().enumerate() {
+                        let value = arena.value_at(&delta.data, *col).unwrap_or(Value::Null);
+                        states[state_index].apply(&value, delta.diff);
+                    }
+                }
+            }
+        }
+
+        let is_empty = states.iter().all(|state| state.is_empty());
+
+        if let Some(&old_id) = self.last_row_ids.get(key) {
+            if let Some(old) = old_row {
+                let mut old_with_id = old;
+                old_with_id.set_id(old_id);
+                output.push(Delta::delete(arena.owned(old_with_id)));
+            }
+        }
+
+        if !is_empty {
+            let new_row = self.build_output_row(key);
+            self.last_row_ids.insert(key.clone(), new_row.id());
+            output.push(Delta::insert(arena.owned(new_row)));
+        } else {
+            self.groups.remove(key);
+            self.last_row_ids.remove(key);
+        }
+    }
+
+    fn row_group_key(&self, row: &Row) -> Vec<Value> {
+        self.group_by
+            .iter()
+            .map(|&col| row.get(col).cloned().unwrap_or(Value::Null))
+            .collect()
+    }
+
+    fn trace_group_key(&self, arena: &TraceTupleArena, handle: &TraceTupleHandle) -> Vec<Value> {
+        self.group_by
+            .iter()
+            .map(|&col| arena.value_at(handle, col).unwrap_or(Value::Null))
+            .collect()
     }
 
     fn apply_trace_bootstrap_handle(&mut self, arena: &TraceTupleArena, handle: &TraceTupleHandle) {
@@ -1042,7 +1171,7 @@ impl GroupAggregateState {
     }
 
     /// Build an output row from group key + aggregate values.
-    fn build_output_row(&mut self, key: &[Value]) -> Row {
+    fn build_output_row(&self, key: &[Value]) -> Row {
         let states = self.groups.get(key).unwrap();
         let mut values: Vec<Value> = key.to_vec();
         for state in states {
@@ -2572,7 +2701,7 @@ fn process_aggregate_trace_deltas(
     let agg_state = aggregate_states
         .entry(state_id)
         .or_insert_with(|| GroupAggregateState::new(group_by.to_vec(), functions.to_vec()));
-    *output = agg_state.process_trace_deltas(arena, input_deltas);
+    agg_state.process_trace_deltas_into(arena, input_deltas, output);
 }
 
 fn timed_block(now_fn: Option<fn() -> f64>, total_ms: &mut f64, run: impl FnOnce()) {
@@ -3924,6 +4053,43 @@ mod tests {
         assert_eq!(last_insert.data.get(0), Some(&Value::Int64(1)));
         assert_eq!(last_insert.data.get(1), Some(&Value::Int64(2)));
         assert_eq!(last_insert.data.get(2), Some(&Value::Float64(30.0)));
+    }
+
+    #[test]
+    fn test_group_aggregate_trace_deltas_reuses_scratch_and_output() {
+        let arena = TraceTupleArena;
+        let mut state = GroupAggregateState::new(vec![0], vec![(1, AggregateType::Sum)]);
+        let mut output = Vec::with_capacity(4);
+
+        let first_batch = vec![
+            Delta::insert(arena.owned(Row::new(1, vec![Value::Int64(1), Value::Int64(10)]))),
+            Delta::insert(arena.owned(Row::new(2, vec![Value::Int64(1), Value::Int64(20)]))),
+        ];
+        state.process_trace_deltas_into(&arena, &first_batch, &mut output);
+
+        assert_eq!(output.len(), 1);
+        let first_capacity = output.capacity();
+        let first_scratch_capacity = state.trace_group_scratch.capacity();
+        let first_row = arena.materialize_rc(&output[0].data);
+        assert!(output[0].is_insert());
+        assert_eq!(first_row.get(0), Some(&Value::Int64(1)));
+        assert_eq!(first_row.get(1), Some(&Value::Float64(30.0)));
+
+        let second_batch = vec![
+            Delta::insert(arena.owned(Row::new(3, vec![Value::Int64(1), Value::Int64(5)]))),
+            Delta::insert(arena.owned(Row::new(4, vec![Value::Int64(1), Value::Int64(7)]))),
+        ];
+        state.process_trace_deltas_into(&arena, &second_batch, &mut output);
+
+        assert_eq!(output.capacity(), first_capacity);
+        assert!(state.trace_group_scratch.capacity() >= first_scratch_capacity);
+        assert_eq!(output.len(), 2);
+        assert!(output[0].is_delete());
+        assert!(output[1].is_insert());
+        let old_row = arena.materialize_rc(&output[0].data);
+        let new_row = arena.materialize_rc(&output[1].data);
+        assert_eq!(old_row.get(1), Some(&Value::Float64(30.0)));
+        assert_eq!(new_row.get(1), Some(&Value::Float64(42.0)));
     }
 
     #[test]
