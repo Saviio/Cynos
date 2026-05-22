@@ -3255,6 +3255,11 @@ impl MaterializedView {
     }
 
     #[inline]
+    pub fn result_rows(&self) -> impl Iterator<Item = &Row> + '_ {
+        self.visible_rows.row_iter()
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
         self.visible_rows.len()
     }

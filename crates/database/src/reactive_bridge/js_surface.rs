@@ -1,6 +1,6 @@
 use super::graphql_observable::{GraphqlDeltaObservable, GraphqlSubscriptionObservable};
 use super::{
-    binary_result_to_js_value, encode_rc_rows_iter_to_binary, encode_rc_rows_to_binary,
+    binary_result_to_js_value, encode_rc_rows_to_binary, encode_rows_iter_to_binary,
     ReQueryObservable,
 };
 use crate::binary_protocol::{BinaryResult, SchemaLayout};
@@ -362,7 +362,7 @@ impl JsIvmObservableQuery {
     pub fn get_result(&self) -> JsValue {
         let inner = self.inner.borrow();
         self.materializer.materialize_from_iter(
-            inner.result_row_refs(),
+            inner.result_rows(),
             inner.len(),
             &mut self.materialization_cache.borrow_mut(),
         )
@@ -372,7 +372,7 @@ impl JsIvmObservableQuery {
     #[wasm_bindgen(js_name = getResultBinary)]
     pub fn get_result_binary(&self) -> BinaryResult {
         let inner = self.inner.borrow();
-        encode_rc_rows_iter_to_binary(inner.result_row_refs(), inner.len(), &self.binary_layout)
+        encode_rows_iter_to_binary(inner.result_rows(), inner.len(), &self.binary_layout)
     }
 
     /// Returns the schema layout for decoding binary results.
@@ -681,7 +681,7 @@ impl JsSnapshotRowsMaterializer {
     }
 
     fn materialize(&self, rows: &[Rc<Row>], cache: &mut JsSnapshotRowsCache) -> JsValue {
-        self.materialize_from_iter(rows.iter(), rows.len(), cache)
+        self.materialize_from_iter(rows.iter().map(|row| row.as_ref()), rows.len(), cache)
     }
 
     fn materialize_from_iter<'a, I>(
@@ -691,7 +691,7 @@ impl JsSnapshotRowsMaterializer {
         cache: &mut JsSnapshotRowsCache,
     ) -> JsValue
     where
-        I: IntoIterator<Item = &'a Rc<Row>>,
+        I: IntoIterator<Item = &'a Row>,
     {
         if cache.epoch == u64::MAX {
             cache.rows.clear();
@@ -706,7 +706,7 @@ impl JsSnapshotRowsMaterializer {
 
         let arr = js_sys::Array::new_with_length(row_count as u32);
         for (index, row) in rows.into_iter().enumerate() {
-            let js_row = self.materialize_row(row.as_ref(), cache, epoch);
+            let js_row = self.materialize_row(row, cache, epoch);
             arr.set(index as u32, js_row);
         }
 

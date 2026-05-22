@@ -555,6 +555,21 @@ pub struct VisibleResultStoreRowRefs<'a> {
     index: usize,
 }
 
+pub struct VisibleResultStoreRows<'a> {
+    storage: VisibleResultStoreRowsStorage<'a>,
+}
+
+enum VisibleResultStoreRowsStorage<'a> {
+    Owned {
+        slots: &'a [Option<Row>],
+        index: usize,
+    },
+    Shared {
+        slots: &'a [Option<Rc<Row>>],
+        index: usize,
+    },
+}
+
 impl Default for VisibleResultStore {
     fn default() -> Self {
         Self {
@@ -572,6 +587,35 @@ impl<'a> Iterator for VisibleResultStoreRowRefs<'a> {
             self.index += 1;
             if let Some(row) = self.slots[index].as_ref() {
                 return Some(row);
+            }
+        }
+
+        None
+    }
+}
+
+impl<'a> Iterator for VisibleResultStoreRows<'a> {
+    type Item = &'a Row;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.storage {
+            VisibleResultStoreRowsStorage::Owned { slots, index } => {
+                while *index < slots.len() {
+                    let current = *index;
+                    *index += 1;
+                    if let Some(row) = slots[current].as_ref() {
+                        return Some(row);
+                    }
+                }
+            }
+            VisibleResultStoreRowsStorage::Shared { slots, index } => {
+                while *index < slots.len() {
+                    let current = *index;
+                    *index += 1;
+                    if let Some(row) = slots[current].as_ref() {
+                        return Some(row.as_ref());
+                    }
+                }
             }
         }
 
@@ -620,6 +664,15 @@ impl OwnedVisibleRows {
             .iter()
             .filter_map(|row| row.as_ref().cloned())
             .collect()
+    }
+
+    fn row_iter(&self) -> VisibleResultStoreRows<'_> {
+        VisibleResultStoreRows {
+            storage: VisibleResultStoreRowsStorage::Owned {
+                slots: self.slots.as_slice(),
+                index: 0,
+            },
+        }
     }
 
     fn rc_rows(&self) -> Vec<Rc<Row>> {
@@ -764,6 +817,15 @@ impl SharedVisibleRows {
             .collect()
     }
 
+    fn row_iter(&self) -> VisibleResultStoreRows<'_> {
+        VisibleResultStoreRows {
+            storage: VisibleResultStoreRowsStorage::Shared {
+                slots: self.slots.as_slice(),
+                index: 0,
+            },
+        }
+    }
+
     fn rc_rows(&self) -> Vec<Rc<Row>> {
         self.slots
             .iter()
@@ -889,6 +951,13 @@ impl VisibleResultStore {
         match &self.storage {
             VisibleResultStoreStorage::Owned(rows) => rows.rows(),
             VisibleResultStoreStorage::Shared(rows) => rows.rows(),
+        }
+    }
+
+    pub fn row_iter(&self) -> VisibleResultStoreRows<'_> {
+        match &self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.row_iter(),
+            VisibleResultStoreStorage::Shared(rows) => rows.row_iter(),
         }
     }
 
@@ -1026,6 +1095,21 @@ mod tests {
         match &store.storage {
             VisibleResultStoreStorage::Owned(rows) => {
                 assert!(rows.rc_shadow.get().is_some());
+            }
+            VisibleResultStoreStorage::Shared(_) => panic!("expected owned storage"),
+        }
+    }
+
+    #[test]
+    fn visible_result_store_row_iter_does_not_build_owned_rc_shadow() {
+        let store = VisibleResultStore::from_rows(vec![make_row(1, 10), make_row(2, 20)]);
+
+        let ids = store.row_iter().map(|row| row.id()).collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2]);
+
+        match &store.storage {
+            VisibleResultStoreStorage::Owned(rows) => {
+                assert!(rows.rc_shadow.get().is_none());
             }
             VisibleResultStoreStorage::Shared(_) => panic!("expected owned storage"),
         }

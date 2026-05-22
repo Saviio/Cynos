@@ -47,6 +47,14 @@ impl BinaryEncoder {
     where
         I: IntoIterator<Item = &'a Rc<Row>>,
     {
+        self.encode_row_refs_iter(rows.into_iter().map(|row| row.as_ref()));
+    }
+
+    /// Encode a batch of rows from any iterator over borrowed rows.
+    pub fn encode_row_refs_iter<'a, I>(&mut self, rows: I)
+    where
+        I: IntoIterator<Item = &'a Row>,
+    {
         // Reserve space for header (will be written at the end)
         if self.buffer.is_empty() {
             self.buffer.resize(HEADER_SIZE, 0);

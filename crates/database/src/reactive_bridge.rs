@@ -81,6 +81,19 @@ where
     BinaryResult::new(encoder.finish())
 }
 
+fn encode_rows_iter_to_binary<'a, I>(
+    rows: I,
+    row_count: usize,
+    binary_layout: &SchemaLayout,
+) -> BinaryResult
+where
+    I: IntoIterator<Item = &'a Row>,
+{
+    let mut encoder = BinaryEncoder::new(binary_layout.clone(), row_count);
+    encoder.encode_row_refs_iter(rows);
+    BinaryResult::new(encoder.finish())
+}
+
 fn binary_result_to_js_value(result: BinaryResult) -> JsValue {
     result.into()
 }

@@ -281,6 +281,12 @@ impl ObservableQuery {
         self.view.result_row_refs()
     }
 
+    /// Returns borrowed rows without requiring an Rc shadow for owned result storage.
+    #[inline]
+    pub fn result_rows(&self) -> impl Iterator<Item = &Row> + '_ {
+        self.view.result_rows()
+    }
+
     /// Returns the number of rows in the result.
     #[inline]
     pub fn len(&self) -> usize {
