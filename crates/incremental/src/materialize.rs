@@ -142,9 +142,13 @@ impl JoinSideState {
             if remove_pos >= bucket.len() {
                 bucket_should_remove = bucket.is_empty();
             } else {
-                let swapped = bucket.swap_remove(remove_pos);
-                if swapped != slot_id {
-                    if let Some(moved_slot) = self.slots.get_mut(swapped).and_then(Option::as_mut) {
+                let removed = bucket.swap_remove(remove_pos);
+                debug_assert_eq!(removed, slot_id);
+                if remove_pos < bucket.len() {
+                    let moved_slot_id = bucket[remove_pos];
+                    if let Some(moved_slot) =
+                        self.slots.get_mut(moved_slot_id).and_then(Option::as_mut)
+                    {
                         moved_slot.bucket_pos = remove_pos;
                     } else {
                         repair_bucket_positions(bucket, &mut self.slots, &bucket_key);
@@ -3410,6 +3414,50 @@ mod tests {
 
     fn make_row(id: u64, age: i64) -> Row {
         Row::new(id, vec![Value::Int64(id as i64), Value::Int64(age)])
+    }
+
+    fn assert_join_bucket_positions(
+        state: &JoinSideState,
+        key: &JoinKey,
+        expected_row_ids: &[u64],
+    ) {
+        let bucket = state
+            .buckets
+            .get(key)
+            .expect("expected join bucket to exist");
+        assert_eq!(bucket.len(), expected_row_ids.len());
+
+        for (bucket_pos, &slot_id) in bucket.iter().enumerate() {
+            let slot = state.slot(slot_id);
+            assert_eq!(slot.bucket_pos, bucket_pos);
+            assert_eq!(slot.key, *key);
+            assert_eq!(slot.row.row_id(), expected_row_ids[bucket_pos]);
+            assert_eq!(state.row_to_slot.get(&slot.row.row_id()), Some(&slot_id));
+        }
+    }
+
+    #[test]
+    fn test_join_side_remove_updates_swapped_bucket_position() {
+        let arena = TraceTupleArena;
+        let key = JoinKey::One(Value::Int64(1));
+        let mut state = JoinSideState::default();
+
+        state.insert(arena.owned(make_row(1, 10)), key.clone(), 0);
+        state.insert(arena.owned(make_row(2, 20)), key.clone(), 0);
+        state.insert(arena.owned(make_row(3, 30)), key.clone(), 0);
+        assert_join_bucket_positions(&state, &key, &[1, 2, 3]);
+
+        let removed = state.remove_by_row_id(1).expect("row 1 should be removed");
+        assert_eq!(removed.row.row_id(), 1);
+        assert_join_bucket_positions(&state, &key, &[3, 2]);
+
+        let removed = state.remove_by_row_id(3).expect("row 3 should be removed");
+        assert_eq!(removed.row.row_id(), 3);
+        assert_join_bucket_positions(&state, &key, &[2]);
+
+        let removed = state.remove_by_row_id(2).expect("row 2 should be removed");
+        assert_eq!(removed.row.row_id(), 2);
+        assert!(!state.buckets.contains_key(&key));
     }
 
     #[test]
