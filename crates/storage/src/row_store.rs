@@ -4820,6 +4820,60 @@ mod tests {
             .unwrap()
     }
 
+    fn assert_row_slot_invariants(store: &RowStore, expected_row_ids: &[RowId]) {
+        assert_eq!(store.len(), expected_row_ids.len());
+        assert_eq!(store.row_slots.len(), expected_row_ids.len());
+        assert_eq!(store.scan_order.len(), expected_row_ids.len());
+        assert_eq!(store.row_ids(), expected_row_ids);
+
+        let scan_ids: Vec<RowId> = store.scan().map(|row| row.id()).collect();
+        assert_eq!(scan_ids, expected_row_ids);
+
+        let mut seen_slots = BTreeSet::new();
+        let mut previous_row_id = None;
+        for &slot_idx in &store.scan_order {
+            assert!(
+                slot_idx < store.row_slots.len(),
+                "scan_order points outside row_slots"
+            );
+            assert!(
+                seen_slots.insert(slot_idx),
+                "scan_order contains duplicate slot {slot_idx}"
+            );
+
+            let slot = &store.row_slots[slot_idx];
+            if let Some(previous) = previous_row_id {
+                assert!(
+                    previous < slot.row_id,
+                    "scan_order is not sorted by row_id: {previous} then {}",
+                    slot.row_id
+                );
+            }
+            previous_row_id = Some(slot.row_id);
+
+            assert_eq!(slot.row.id(), slot.row_id);
+            assert_eq!(store.rows.get(&slot.row_id).copied(), Some(slot_idx));
+            assert_eq!(
+                store.get(slot.row_id).map(|row| row.id()),
+                Some(slot.row_id)
+            );
+        }
+
+        for (row_id, &slot_idx) in &store.rows {
+            assert!(
+                slot_idx < store.row_slots.len(),
+                "RowMap points outside row_slots"
+            );
+            let slot = &store.row_slots[slot_idx];
+            assert_eq!(slot.row_id, *row_id);
+            assert_eq!(slot.row.id(), *row_id);
+            assert!(
+                seen_slots.contains(&slot_idx),
+                "RowMap points to slot missing from scan_order"
+            );
+        }
+    }
+
     fn test_schema_with_index() -> Table {
         TableBuilder::new("test")
             .unwrap()
@@ -5053,6 +5107,43 @@ mod tests {
 
         let row_ids: Vec<_> = store.scan().map(|row| row.id()).collect();
         assert_eq!(row_ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_row_store_remove_row_slot_keeps_internal_indices_consistent() {
+        let mut store = RowStore::new(test_schema());
+        for row_id in [40_u64, 10, 30, 20, 50, 15] {
+            store
+                .insert(Row::new(
+                    row_id,
+                    vec![
+                        Value::Int64(row_id as i64),
+                        Value::String(format!("row-{row_id}")),
+                    ],
+                ))
+                .unwrap();
+        }
+
+        assert_row_slot_invariants(&store, &[10, 15, 20, 30, 40, 50]);
+
+        store.delete(40).unwrap();
+        assert_row_slot_invariants(&store, &[10, 15, 20, 30, 50]);
+
+        store.delete(10).unwrap();
+        assert_row_slot_invariants(&store, &[15, 20, 30, 50]);
+
+        store.delete(20).unwrap();
+        assert_row_slot_invariants(&store, &[15, 30, 50]);
+
+        let deleted = store.delete_batch(&[15, 999, 30]);
+        assert_eq!(
+            deleted.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![15, 30]
+        );
+        assert_row_slot_invariants(&store, &[50]);
+
+        store.delete(50).unwrap();
+        assert_row_slot_invariants(&store, &[]);
     }
 
     #[test]
