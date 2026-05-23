@@ -130,6 +130,7 @@ impl GraphqlSubscriptionObservable {
     }
 
     #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
     pub(crate) fn on_change_profiled(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
@@ -139,6 +140,7 @@ impl GraphqlSubscriptionObservable {
         profile
     }
 
+    #[allow(dead_code)]
     pub(crate) fn on_change_with_deltas(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
@@ -153,6 +155,7 @@ impl GraphqlSubscriptionObservable {
     }
 
     #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
     pub(crate) fn on_change_with_deltas_profiled(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,

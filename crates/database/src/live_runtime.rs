@@ -1349,6 +1349,7 @@ pub(crate) enum DeltaSubscription {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "benchmark")]
 enum DeltaSubscriptionKind {
     Rows,
     Graphql,
@@ -1362,6 +1363,7 @@ impl DeltaSubscription {
         }
     }
 
+    #[cfg(feature = "benchmark")]
     fn kind(&self) -> DeltaSubscriptionKind {
         match self {
             Self::Rows(_) => DeltaSubscriptionKind::Rows,
@@ -1398,6 +1400,7 @@ impl DeltaSubscription {
     }
 }
 
+#[cfg(feature = "benchmark")]
 fn dispatch_delta_query(
     query: &DeltaSubscription,
     table_id: TableId,
@@ -1411,24 +1414,18 @@ fn dispatch_delta_query(
     }
 
     let query_started_at = now_ms();
-    #[cfg(feature = "benchmark")]
     let update_profile = query.on_table_change_profiled(table_id, deltas);
-    #[cfg(not(feature = "benchmark"))]
-    query.on_table_change(table_id, deltas);
     profile.query_on_table_change_ms += now_ms() - query_started_at;
-    #[cfg(feature = "benchmark")]
-    {
-        profile.source_dispatch_ms += update_profile.source_dispatch_ms;
-        profile.unary_execute_ms += update_profile.unary_execute_ms;
-        profile.join_execute_ms += update_profile.join_execute_ms;
-        profile.aggregate_execute_ms += update_profile.aggregate_execute_ms;
-        profile.result_apply_ms += update_profile.result_apply_ms;
-        profile.graphql_view_update_ms += update_profile.graphql_view_update_ms;
-        profile.graphql_invalidation_ms += update_profile.graphql_invalidation_ms;
-        profile.graphql_render_ms += update_profile.graphql_render_ms;
-        profile.graphql_encode_ms += update_profile.graphql_encode_ms;
-        profile.graphql_emit_ms += update_profile.graphql_emit_ms;
-    }
+    profile.source_dispatch_ms += update_profile.source_dispatch_ms;
+    profile.unary_execute_ms += update_profile.unary_execute_ms;
+    profile.join_execute_ms += update_profile.join_execute_ms;
+    profile.aggregate_execute_ms += update_profile.aggregate_execute_ms;
+    profile.result_apply_ms += update_profile.result_apply_ms;
+    profile.graphql_view_update_ms += update_profile.graphql_view_update_ms;
+    profile.graphql_invalidation_ms += update_profile.graphql_invalidation_ms;
+    profile.graphql_render_ms += update_profile.graphql_render_ms;
+    profile.graphql_encode_ms += update_profile.graphql_encode_ms;
+    profile.graphql_emit_ms += update_profile.graphql_emit_ms;
 }
 
 #[cfg(feature = "benchmark")]
@@ -1541,6 +1538,7 @@ impl LiveRegistry {
             .unwrap_or(false)
     }
 
+    #[cfg(feature = "benchmark")]
     fn flush_snapshot_lane(
         &self,
         changes: HashMap<TableId, HashSet<u64>>,
@@ -1628,6 +1626,65 @@ impl LiveRegistry {
         *self.last_snapshot_flush_profile.borrow_mut() = Some(profile);
     }
 
+    #[cfg(not(feature = "benchmark"))]
+    fn flush_snapshot_lane(
+        &self,
+        changes: HashMap<TableId, HashSet<u64>>,
+        delta_changes: &HashMap<TableId, Vec<Delta<Row>>>,
+    ) {
+        let mut merged_rows: HashMap<
+            usize,
+            (
+                Rc<RefCell<ReQueryObservable>>,
+                HashMap<TableId, HashSet<u64>>,
+            ),
+        > = HashMap::new();
+        let mut merged_graphql: HashMap<
+            usize,
+            (
+                Rc<RefCell<GraphqlSubscriptionObservable>>,
+                HashMap<TableId, HashSet<u64>>,
+            ),
+        > = HashMap::new();
+
+        for (table_id, changed_ids) in changes {
+            if let Some(queries) = self.snapshot_queries.get(&table_id) {
+                for query in queries {
+                    match query {
+                        SnapshotSubscription::Rows(query) => {
+                            let entry = merged_rows
+                                .entry(Rc::as_ptr(query) as usize)
+                                .or_insert_with(|| (query.clone(), HashMap::new()));
+                            entry
+                                .1
+                                .entry(table_id)
+                                .or_insert_with(HashSet::new)
+                                .extend(changed_ids.iter().copied());
+                        }
+                        SnapshotSubscription::Graphql(query) => {
+                            let entry = merged_graphql
+                                .entry(Rc::as_ptr(query) as usize)
+                                .or_insert_with(|| (query.clone(), HashMap::new()));
+                            entry.1.insert(table_id, changed_ids.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        for (_, (query, changes)) in merged_rows {
+            query
+                .borrow_mut()
+                .on_change_with_deltas(&changes, delta_changes);
+        }
+
+        for (_, (query, changes)) in merged_graphql {
+            query
+                .borrow_mut()
+                .on_change_with_deltas(&changes, delta_changes);
+        }
+    }
+
     pub fn on_table_change(&mut self, table_id: TableId, changed_ids: &HashSet<u64>) {
         {
             let mut pending = self.pending_changes.borrow_mut();
@@ -1675,6 +1732,7 @@ impl LiveRegistry {
         }
     }
 
+    #[cfg(feature = "benchmark")]
     fn flush_delta_lane(&self, delta_changes: &mut HashMap<TableId, Vec<Delta<Row>>>) {
         let started_at = now_ms();
         let mut profile = DeltaFlushProfile::default();
@@ -1725,6 +1783,38 @@ impl LiveRegistry {
         self.ivm_bridge_profiler.borrow_mut().end_flush();
         profile.total_ms = now_ms() - started_at;
         *self.last_delta_flush_profile.borrow_mut() = Some(profile);
+    }
+
+    #[cfg(not(feature = "benchmark"))]
+    fn flush_delta_lane(&self, delta_changes: &mut HashMap<TableId, Vec<Delta<Row>>>) {
+        let table_ids: Vec<_> = delta_changes.keys().copied().collect();
+        for table_id in table_ids {
+            let Some(queries) = self.delta_queries.get(&table_id) else {
+                continue;
+            };
+
+            let mut active_queries = queries
+                .iter()
+                .filter(|query| query.subscription_count() > 0);
+            let Some(first_query) = active_queries.next() else {
+                continue;
+            };
+
+            let has_snapshot_queries = self.has_active_snapshot_queries(table_id);
+            if !has_snapshot_queries {
+                let mut owned_deltas = delta_changes.remove(&table_id).unwrap_or_default();
+                let mut last_query = first_query;
+                for query in active_queries {
+                    query.on_table_change(table_id, owned_deltas.clone());
+                    last_query = query;
+                }
+                last_query.on_table_change(table_id, core::mem::take(&mut owned_deltas));
+            } else if let Some(deltas) = delta_changes.get(&table_id) {
+                for query in core::iter::once(first_query).chain(active_queries) {
+                    query.on_table_change(table_id, deltas.clone());
+                }
+            }
+        }
     }
 
     fn schedule_flush(&mut self) {
@@ -1943,10 +2033,13 @@ mod tests {
         delta_changes.insert(1, vec![Delta::insert(Row::new(1, vec![Value::Int64(10)]))]);
         registry.flush_delta_lane(&mut delta_changes);
 
-        let profile = registry.take_last_delta_flush_profile().unwrap();
-        assert_eq!(profile.delta_table_count, 1);
-        assert_eq!(profile.delta_query_count, 1);
-        assert_eq!(profile.clone_ms, 0.0);
+        #[cfg(feature = "benchmark")]
+        {
+            let profile = registry.take_last_delta_flush_profile().unwrap();
+            assert_eq!(profile.delta_table_count, 1);
+            assert_eq!(profile.delta_query_count, 1);
+            assert_eq!(profile.clone_ms, 0.0);
+        }
         assert_eq!(*observed.borrow(), 1);
         assert!(!delta_changes.contains_key(&1));
     }

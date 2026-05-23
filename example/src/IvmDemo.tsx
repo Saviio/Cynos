@@ -338,11 +338,12 @@ export default function IvmDemo() {
     await insertStocks(Number(benchDataScale))
     setTotalCount(getStockCount())
 
-    // Step 2: Subscribe to live updates
+    // Step 2: Prime the table preview, then release the UI subscription so
+    // benchmark numbers measure one live query at a time.
     await subscribeLive()
-
-    // Record matching rows count for results display
     setBenchMatchCount(stockMapRef.current.size)
+    unsubLiveRef.current?.()
+    unsubLiveRef.current = null
 
     // Step 3: Run IVM benchmark
     const ivmResult = await runBench('ivm', Number(benchDuration))
