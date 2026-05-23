@@ -1137,6 +1137,162 @@ async fn primary_key_update_candidate_path_preserves_predicate_semantics() {
 }
 
 #[wasm_bindgen_test(async)]
+async fn primary_key_update_candidate_path_supports_finite_point_sets() {
+    let db = Database::new("query_correctness_update_pk_candidate_sets");
+    register_filter_users_table(&db);
+    seed_filter_users(&db).await;
+
+    let in_updated = db
+        .update("users")
+        .set(
+            &JsValue::from_str("city"),
+            Some(JsValue::from_str("Hangzhou")),
+        )
+        .where_(&col("id").in_(&js_array([
+            JsValue::from_f64(3.0),
+            JsValue::from_f64(4.0),
+            JsValue::from_f64(4.0),
+        ])))
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(in_updated.as_f64().unwrap() as usize, 2);
+
+    let and_rechecked = db
+        .update("users")
+        .set(
+            &JsValue::from_str("city"),
+            Some(JsValue::from_str("Suzhou")),
+        )
+        .where_(
+            &col("id")
+                .in_(&js_array([JsValue::from_f64(3.0), JsValue::from_f64(4.0)]))
+                .and(&col("active").eq(&JsValue::from_bool(true))),
+        )
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(and_rechecked.as_f64().unwrap() as usize, 2);
+
+    let intersection = db
+        .update("users")
+        .set(
+            &JsValue::from_str("city"),
+            Some(JsValue::from_str("Wuxi")),
+        )
+        .where_(
+            &col("id")
+                .in_(&js_array([JsValue::from_f64(3.0), JsValue::from_f64(4.0)]))
+                .and(&col("id").eq(&JsValue::from_f64(4.0))),
+        )
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(intersection.as_f64().unwrap() as usize, 1);
+
+    let empty_intersection = db
+        .update("users")
+        .set(
+            &JsValue::from_str("city"),
+            Some(JsValue::from_str("Ningbo")),
+        )
+        .where_(
+            &col("id")
+                .in_(&js_array([JsValue::from_f64(3.0), JsValue::from_f64(4.0)]))
+                .and(&col("id").eq(&JsValue::from_f64(5.0))),
+        )
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(empty_intersection.as_f64().unwrap() as usize, 0);
+
+    let or_with_non_pk_falls_back_correctly = db
+        .update("users")
+        .set(
+            &JsValue::from_str("city"),
+            Some(JsValue::from_str("Fallback")),
+        )
+        .where_(
+            &col("id")
+                .eq(&JsValue::from_f64(1.0))
+                .or(&col("active").eq(&JsValue::from_bool(false))),
+        )
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(or_with_non_pk_falls_back_correctly.as_f64().unwrap() as usize, 4);
+
+    let row_specs = [
+        spec("id", CellKind::I64, true),
+        spec("city", CellKind::String, true),
+    ];
+    let query = db
+        .select(&js_str_array(&["id", "city"]))
+        .from("users")
+        .order_by("id", JsSortOrder::Asc);
+    let expected = vec![
+        vec![Cell::I64(1), Cell::String("Fallback".into())],
+        vec![Cell::I64(2), Cell::String("Fallback".into())],
+        vec![Cell::I64(3), Cell::String("Suzhou".into())],
+        vec![Cell::I64(4), Cell::String("Wuxi".into())],
+        vec![Cell::I64(5), Cell::String("Fallback".into())],
+        vec![Cell::I64(6), Cell::String("Shenzhen".into())],
+        vec![Cell::I64(7), Cell::String("Fallback".into())],
+    ];
+    assert_select_matches(&query, &row_specs, &expected).await;
+}
+
+#[wasm_bindgen_test(async)]
+async fn primary_key_delete_candidate_path_supports_finite_point_sets() {
+    let db = Database::new("query_correctness_delete_pk_candidate_sets");
+    register_filter_users_table(&db);
+    seed_filter_users(&db).await;
+
+    let deleted = db
+        .delete("users")
+        .where_(
+            &col("id")
+                .eq(&JsValue::from_f64(3.0))
+                .or(&col("id").in_(&js_array([
+                    JsValue::from_f64(4.0),
+                    JsValue::from_f64(4.0),
+                ]))),
+        )
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(deleted.as_f64().unwrap() as usize, 2);
+
+    let filtered_deleted = db
+        .delete("users")
+        .where_(
+            &col("id")
+                .in_(&js_array([JsValue::from_f64(5.0), JsValue::from_f64(6.0)]))
+                .and(&col("active").eq(&JsValue::from_bool(true))),
+        )
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(filtered_deleted.as_f64().unwrap() as usize, 1);
+
+    let row_specs = [
+        spec("id", CellKind::I64, true),
+        spec("name", CellKind::String, true),
+    ];
+    let query = db
+        .select(&js_str_array(&["id", "name"]))
+        .from("users")
+        .order_by("id", JsSortOrder::Asc);
+    let expected = vec![
+        vec![Cell::I64(1), Cell::String("Alice".into())],
+        vec![Cell::I64(2), Cell::String("Bob".into())],
+        vec![Cell::I64(5), Cell::String("Eve".into())],
+        vec![Cell::I64(7), Cell::String("Grace".into())],
+    ];
+    assert_select_matches(&query, &row_specs, &expected).await;
+}
+
+#[wasm_bindgen_test(async)]
 async fn multi_column_group_by_is_correct() {
     let db = Database::new("query_correctness_group_by_multi_column");
     register_filter_users_table(&db);

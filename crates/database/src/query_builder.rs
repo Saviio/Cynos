@@ -49,7 +49,7 @@ enum PrimaryKeyPredicateCandidate {
     NoMatch,
     Unsupported,
     Empty,
-    Value(Value),
+    Values(Vec<Value>),
 }
 
 /// SELECT query builder.
@@ -2716,25 +2716,29 @@ impl UpdateBuilder {
         let Some(pk_column) = single_primary_key_column_name(schema) else {
             return Ok(None);
         };
-        let candidate = find_primary_key_equality_candidate(predicate, schema, pk_column)?;
-        let pk_value = match candidate {
+        let candidate = find_primary_key_candidate(predicate, schema, pk_column)?;
+        let pk_values = match candidate {
             PrimaryKeyPredicateCandidate::NoMatch | PrimaryKeyPredicateCandidate::Unsupported => {
                 return Ok(None)
             }
             PrimaryKeyPredicateCandidate::Empty => return Ok(Some(Vec::new())),
-            PrimaryKeyPredicateCandidate::Value(value) => value,
+            PrimaryKeyPredicateCandidate::Values(values) => values,
         };
 
         let cache = self.cache.borrow();
         let store = cache.get_table(&self.table_name).ok_or_else(|| {
             JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
         })?;
-        let rows = store
-            .get_by_pk(&pk_value)
-            .into_iter()
-            .filter(|row| evaluate_predicate(predicate, row, schema))
-            .map(|row| (*row).clone())
-            .collect();
+        let mut rows = Vec::new();
+        for pk_value in &pk_values {
+            rows.extend(
+                store
+                    .get_by_pk(pk_value)
+                    .into_iter()
+                    .filter(|row| evaluate_predicate(predicate, row, schema))
+                    .map(|row| (*row).clone()),
+            );
+        }
         Ok(Some(rows))
     }
 }
@@ -2905,6 +2909,40 @@ impl DeleteBuilder {
             where_clause: None,
         }
     }
+
+    fn find_delete_rows_by_primary_key_candidate(
+        &self,
+        predicate: &Expr,
+        schema: &Table,
+    ) -> Result<Option<Vec<Row>>, JsValue> {
+        let Some(pk_column) = single_primary_key_column_name(schema) else {
+            return Ok(None);
+        };
+        let candidate = find_primary_key_candidate(predicate, schema, pk_column)?;
+        let pk_values = match candidate {
+            PrimaryKeyPredicateCandidate::NoMatch | PrimaryKeyPredicateCandidate::Unsupported => {
+                return Ok(None)
+            }
+            PrimaryKeyPredicateCandidate::Empty => return Ok(Some(Vec::new())),
+            PrimaryKeyPredicateCandidate::Values(values) => values,
+        };
+
+        let cache = self.cache.borrow();
+        let store = cache.get_table(&self.table_name).ok_or_else(|| {
+            JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
+        })?;
+        let mut rows = Vec::new();
+        for pk_value in &pk_values {
+            rows.extend(
+                store
+                    .get_by_pk(pk_value)
+                    .into_iter()
+                    .filter(|row| evaluate_predicate(predicate, row, schema))
+                    .map(|row| (*row).clone()),
+            );
+        }
+        Ok(Some(rows))
+    }
 }
 
 #[wasm_bindgen]
@@ -2971,28 +3009,36 @@ impl DeleteBuilder {
         // Slow path: DELETE with WHERE clause - need to find matching rows
         let rows_to_delete: Vec<Row> = {
             let predicate = self.where_clause.as_ref().unwrap();
-            // Build logical plan: SELECT * FROM table WHERE predicate
-            let get_col_info = |name: &str| -> Option<(String, usize, DataType)> {
-                schema
-                    .get_column(name)
-                    .map(|col| (self.table_name.clone(), col.index(), col.data_type()))
-            };
-            let ast_predicate = predicate.to_ast_with_table(&get_col_info);
+            if let Some(rows) =
+                self.find_delete_rows_by_primary_key_candidate(predicate, &schema)?
+            {
+                rows
+            } else {
+                // Build logical plan: SELECT * FROM table WHERE predicate
+                let get_col_info = |name: &str| -> Option<(String, usize, DataType)> {
+                    schema
+                        .get_column(name)
+                        .map(|col| (self.table_name.clone(), col.index(), col.data_type()))
+                };
+                let ast_predicate = predicate.to_ast_with_table(&get_col_info);
 
-            let plan = LogicalPlan::Filter {
-                input: Box::new(LogicalPlan::Scan {
-                    table: self.table_name.clone(),
-                }),
-                predicate: ast_predicate,
-            };
+                let plan = LogicalPlan::Filter {
+                    input: Box::new(LogicalPlan::Scan {
+                        table: self.table_name.clone(),
+                    }),
+                    predicate: ast_predicate,
+                };
 
-            // Execute using query engine (with index optimization)
-            let cache = self.cache.borrow();
-            execute_plan(&cache, &self.table_name, plan)
-                .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?
-                .into_iter()
-                .map(|rc| (*rc).clone())
-                .collect()
+                // Execute using query engine (with index optimization)
+                let cache = self.cache.borrow();
+                execute_plan(&cache, &self.table_name, plan)
+                    .map_err(|e| {
+                        JsValue::from_str(&alloc::format!("Query execution error: {:?}", e))
+                    })?
+                    .into_iter()
+                    .map(|rc| (*rc).clone())
+                    .collect()
+            }
         };
 
         // Collect row IDs for batch deletion
@@ -3583,56 +3629,133 @@ fn single_primary_key_column_name(schema: &Table) -> Option<&str> {
     Some(column.name.as_str())
 }
 
-fn find_primary_key_equality_candidate(
+fn find_primary_key_candidate(
     predicate: &Expr,
     schema: &Table,
     pk_column: &str,
 ) -> Result<PrimaryKeyPredicateCandidate, JsValue> {
-    let mut candidate = PrimaryKeyPredicateCandidate::NoMatch;
-    collect_primary_key_equality_candidate(predicate, schema, pk_column, &mut candidate)?;
-    Ok(candidate)
+    collect_primary_key_candidate(predicate, schema, pk_column)
 }
 
-fn collect_primary_key_equality_candidate(
+fn collect_primary_key_candidate(
     predicate: &Expr,
     schema: &Table,
     pk_column: &str,
-    candidate: &mut PrimaryKeyPredicateCandidate,
-) -> Result<(), JsValue> {
-    if matches!(
-        candidate,
-        PrimaryKeyPredicateCandidate::Empty | PrimaryKeyPredicateCandidate::Unsupported
-    ) {
-        return Ok(());
-    }
-
-    match predicate.inner() {
+) -> Result<PrimaryKeyPredicateCandidate, JsValue> {
+    let candidate = match predicate.inner() {
         ExprInner::And { left, right } => {
-            collect_primary_key_equality_candidate(left, schema, pk_column, candidate)?;
-            collect_primary_key_equality_candidate(right, schema, pk_column, candidate)?;
+            let left = collect_primary_key_candidate(left, schema, pk_column)?;
+            let right = collect_primary_key_candidate(right, schema, pk_column)?;
+            combine_primary_key_candidates_for_and(left, right)
+        }
+        ExprInner::Or { left, right } => {
+            let left = collect_primary_key_candidate(left, schema, pk_column)?;
+            let right = collect_primary_key_candidate(right, schema, pk_column)?;
+            combine_primary_key_candidates_for_or(left, right)
         }
         ExprInner::Comparison { column, op, value }
             if *op == ComparisonOp::Eq && column_matches_unqualified_name(column, pk_column) =>
         {
             let Some(column_schema) = schema.get_column(pk_column) else {
-                return Ok(());
+                return Ok(PrimaryKeyPredicateCandidate::NoMatch);
             };
             let Ok(value) = js_to_value(value, column_schema.data_type()) else {
-                *candidate = PrimaryKeyPredicateCandidate::Unsupported;
-                return Ok(());
+                return Ok(PrimaryKeyPredicateCandidate::Unsupported);
             };
-            if let PrimaryKeyPredicateCandidate::Value(existing) = candidate {
-                if existing != &value {
-                    // Contradictory primary-key equality predicates cannot match any row.
-                    *candidate = PrimaryKeyPredicateCandidate::Empty;
-                    return Ok(());
+            PrimaryKeyPredicateCandidate::Values(alloc::vec![value])
+        }
+        ExprInner::InList { column, values } if column_matches_unqualified_name(column, pk_column) => {
+            let Some(column_schema) = schema.get_column(pk_column) else {
+                return Ok(PrimaryKeyPredicateCandidate::NoMatch);
+            };
+            let arr = js_sys::Array::from(values);
+            let mut pk_values = Vec::with_capacity(arr.length() as usize);
+            for js_value in arr.iter() {
+                let Ok(value) = js_to_value(&js_value, column_schema.data_type()) else {
+                    return Ok(PrimaryKeyPredicateCandidate::Unsupported);
+                };
+                push_unique_primary_key_value(&mut pk_values, value);
+            }
+            if pk_values.is_empty() {
+                PrimaryKeyPredicateCandidate::Empty
+            } else {
+                PrimaryKeyPredicateCandidate::Values(pk_values)
+            }
+        }
+        _ => PrimaryKeyPredicateCandidate::NoMatch,
+    };
+    Ok(candidate)
+}
+
+fn combine_primary_key_candidates_for_and(
+    left: PrimaryKeyPredicateCandidate,
+    right: PrimaryKeyPredicateCandidate,
+) -> PrimaryKeyPredicateCandidate {
+    match (left, right) {
+        (PrimaryKeyPredicateCandidate::Empty, _) | (_, PrimaryKeyPredicateCandidate::Empty) => {
+            PrimaryKeyPredicateCandidate::Empty
+        }
+        (
+            PrimaryKeyPredicateCandidate::Unsupported,
+            PrimaryKeyPredicateCandidate::Values(values),
+        )
+        | (
+            PrimaryKeyPredicateCandidate::Values(values),
+            PrimaryKeyPredicateCandidate::Unsupported,
+        ) => PrimaryKeyPredicateCandidate::Values(values),
+        (PrimaryKeyPredicateCandidate::Unsupported, PrimaryKeyPredicateCandidate::NoMatch)
+        | (PrimaryKeyPredicateCandidate::NoMatch, PrimaryKeyPredicateCandidate::Unsupported)
+        | (PrimaryKeyPredicateCandidate::Unsupported, PrimaryKeyPredicateCandidate::Unsupported) => {
+            PrimaryKeyPredicateCandidate::Unsupported
+        }
+        (PrimaryKeyPredicateCandidate::NoMatch, candidate)
+        | (candidate, PrimaryKeyPredicateCandidate::NoMatch) => candidate,
+        (
+            PrimaryKeyPredicateCandidate::Values(left_values),
+            PrimaryKeyPredicateCandidate::Values(right_values),
+        ) => {
+            let mut intersection = Vec::new();
+            for value in left_values {
+                if right_values.iter().any(|candidate| candidate == &value) {
+                    push_unique_primary_key_value(&mut intersection, value);
                 }
             }
-            *candidate = PrimaryKeyPredicateCandidate::Value(value);
+            if intersection.is_empty() {
+                PrimaryKeyPredicateCandidate::Empty
+            } else {
+                PrimaryKeyPredicateCandidate::Values(intersection)
+            }
         }
-        _ => {}
     }
-    Ok(())
+}
+
+fn combine_primary_key_candidates_for_or(
+    left: PrimaryKeyPredicateCandidate,
+    right: PrimaryKeyPredicateCandidate,
+) -> PrimaryKeyPredicateCandidate {
+    match (left, right) {
+        (PrimaryKeyPredicateCandidate::Unsupported, _)
+        | (_, PrimaryKeyPredicateCandidate::Unsupported)
+        | (PrimaryKeyPredicateCandidate::NoMatch, _)
+        | (_, PrimaryKeyPredicateCandidate::NoMatch) => PrimaryKeyPredicateCandidate::Unsupported,
+        (PrimaryKeyPredicateCandidate::Empty, candidate)
+        | (candidate, PrimaryKeyPredicateCandidate::Empty) => candidate,
+        (
+            PrimaryKeyPredicateCandidate::Values(mut left_values),
+            PrimaryKeyPredicateCandidate::Values(right_values),
+        ) => {
+            for value in right_values {
+                push_unique_primary_key_value(&mut left_values, value);
+            }
+            PrimaryKeyPredicateCandidate::Values(left_values)
+        }
+    }
+}
+
+fn push_unique_primary_key_value(values: &mut Vec<Value>, value: Value) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 fn column_matches_unqualified_name(column: &Column, name: &str) -> bool {
