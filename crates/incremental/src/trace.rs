@@ -555,6 +555,21 @@ pub struct VisibleResultStoreRowRefs<'a> {
     index: usize,
 }
 
+pub struct VisibleResultStoreRows<'a> {
+    storage: VisibleResultStoreRowsStorage<'a>,
+}
+
+enum VisibleResultStoreRowsStorage<'a> {
+    Owned {
+        slots: &'a [Option<Row>],
+        index: usize,
+    },
+    Shared {
+        slots: &'a [Option<Rc<Row>>],
+        index: usize,
+    },
+}
+
 impl Default for VisibleResultStore {
     fn default() -> Self {
         Self {
@@ -572,6 +587,35 @@ impl<'a> Iterator for VisibleResultStoreRowRefs<'a> {
             self.index += 1;
             if let Some(row) = self.slots[index].as_ref() {
                 return Some(row);
+            }
+        }
+
+        None
+    }
+}
+
+impl<'a> Iterator for VisibleResultStoreRows<'a> {
+    type Item = &'a Row;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.storage {
+            VisibleResultStoreRowsStorage::Owned { slots, index } => {
+                while *index < slots.len() {
+                    let current = *index;
+                    *index += 1;
+                    if let Some(row) = slots[current].as_ref() {
+                        return Some(row);
+                    }
+                }
+            }
+            VisibleResultStoreRowsStorage::Shared { slots, index } => {
+                while *index < slots.len() {
+                    let current = *index;
+                    *index += 1;
+                    if let Some(row) = slots[current].as_ref() {
+                        return Some(row.as_ref());
+                    }
+                }
             }
         }
 
@@ -620,6 +664,15 @@ impl OwnedVisibleRows {
             .iter()
             .filter_map(|row| row.as_ref().cloned())
             .collect()
+    }
+
+    fn row_iter(&self) -> VisibleResultStoreRows<'_> {
+        VisibleResultStoreRows {
+            storage: VisibleResultStoreRowsStorage::Owned {
+                slots: self.slots.as_slice(),
+                index: 0,
+            },
+        }
     }
 
     fn rc_rows(&self) -> Vec<Rc<Row>> {
@@ -764,6 +817,15 @@ impl SharedVisibleRows {
             .collect()
     }
 
+    fn row_iter(&self) -> VisibleResultStoreRows<'_> {
+        VisibleResultStoreRows {
+            storage: VisibleResultStoreRowsStorage::Shared {
+                slots: self.slots.as_slice(),
+                index: 0,
+            },
+        }
+    }
+
     fn rc_rows(&self) -> Vec<Rc<Row>> {
         self.slots
             .iter()
@@ -892,6 +954,13 @@ impl VisibleResultStore {
         }
     }
 
+    pub fn row_iter(&self) -> VisibleResultStoreRows<'_> {
+        match &self.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows.row_iter(),
+            VisibleResultStoreStorage::Shared(rows) => rows.row_iter(),
+        }
+    }
+
     pub fn rc_rows(&self) -> Vec<Rc<Row>> {
         match &self.storage {
             VisibleResultStoreStorage::Owned(rows) => rows.rc_rows(),
@@ -899,6 +968,10 @@ impl VisibleResultStore {
         }
     }
 
+    #[deprecated(
+        since = "0.1.0",
+        note = "use row_iter() for read-only access; row_refs() may build an Rc shadow for owned storage"
+    )]
     pub fn row_refs(&self) -> VisibleResultStoreRowRefs<'_> {
         match &self.storage {
             VisibleResultStoreStorage::Owned(rows) => rows.row_refs(),
@@ -1020,7 +1093,12 @@ mod tests {
             VisibleResultStoreStorage::Shared(_) => panic!("expected owned storage"),
         }
 
-        let ids = store.row_refs().map(|row| row.id()).collect::<Vec<_>>();
+        let ids = match &store.storage {
+            VisibleResultStoreStorage::Owned(rows) => {
+                rows.row_refs().map(|row| row.id()).collect::<Vec<_>>()
+            }
+            VisibleResultStoreStorage::Shared(_) => panic!("expected owned storage"),
+        };
         assert_eq!(ids, vec![1, 2]);
 
         match &store.storage {
@@ -1032,9 +1110,29 @@ mod tests {
     }
 
     #[test]
+    fn visible_result_store_row_iter_does_not_build_owned_rc_shadow() {
+        let store = VisibleResultStore::from_rows(vec![make_row(1, 10), make_row(2, 20)]);
+
+        let ids = store.row_iter().map(|row| row.id()).collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2]);
+
+        match &store.storage {
+            VisibleResultStoreStorage::Owned(rows) => {
+                assert!(rows.rc_shadow.get().is_none());
+            }
+            VisibleResultStoreStorage::Shared(_) => panic!("expected owned storage"),
+        }
+    }
+
+    #[test]
     fn visible_result_store_updates_rc_shadow_after_owned_mutations() {
         let mut store = VisibleResultStore::from_rows(vec![make_row(1, 10), make_row(2, 20)]);
-        let _ = store.row_refs().collect::<Vec<_>>();
+        match &store.storage {
+            VisibleResultStoreStorage::Owned(rows) => {
+                let _ = rows.row_refs().collect::<Vec<_>>();
+            }
+            VisibleResultStoreStorage::Shared(_) => panic!("expected owned storage"),
+        }
 
         store.apply_rows(&[
             Delta::delete(make_row(1, 10)),
@@ -1058,17 +1156,20 @@ mod tests {
         assert_eq!(rows.get(&3), Some(&30));
         assert!(!rows.contains_key(&1));
 
-        let refs = store
-            .row_refs()
-            .map(|row| {
-                (
-                    row.id(),
-                    row.get(1)
-                        .and_then(|value| value.as_i64())
-                        .unwrap_or_default(),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let refs = match &store.storage {
+            VisibleResultStoreStorage::Owned(rows) => rows
+                .row_refs()
+                .map(|row| {
+                    (
+                        row.id(),
+                        row.get(1)
+                            .and_then(|value| value.as_i64())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+            VisibleResultStoreStorage::Shared(_) => panic!("expected owned storage"),
+        };
         assert_eq!(refs.get(&2), Some(&200));
         assert_eq!(refs.get(&3), Some(&30));
         assert!(!refs.contains_key(&1));

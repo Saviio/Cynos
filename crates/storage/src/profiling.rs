@@ -20,7 +20,6 @@ pub struct StorageInsertProfile {
     pub secondary_index_count: usize,
     pub gin_index_count: usize,
     pub validation_ms: f64,
-    pub row_id_index_ms: f64,
     pub primary_index_ms: f64,
     pub secondary_index_ms: f64,
     pub gin_collect_ms: f64,

@@ -130,6 +130,7 @@ impl GraphqlSubscriptionObservable {
     }
 
     #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
     pub(crate) fn on_change_profiled(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
@@ -139,6 +140,7 @@ impl GraphqlSubscriptionObservable {
         profile
     }
 
+    #[allow(dead_code)]
     pub(crate) fn on_change_with_deltas(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
@@ -153,6 +155,7 @@ impl GraphqlSubscriptionObservable {
     }
 
     #[cfg(feature = "benchmark")]
+    #[allow(dead_code)]
     pub(crate) fn on_change_with_deltas_profiled(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
@@ -758,7 +761,7 @@ impl GraphqlDeltaObservable {
         let cache = self.cache.borrow();
         let response = match self.batch_plan.as_ref() {
             Some(plan) => {
-                let rows = self.view.result_row_refs().collect::<Vec<_>>();
+                let rows = self.view.result_rows().collect::<Vec<_>>();
                 build_graphql_response_batched_refs(
                     &cache,
                     &self.catalog,
@@ -790,7 +793,7 @@ impl GraphqlDeltaObservable {
         let cache = self.cache.borrow();
         let response = match self.batch_plan.as_ref() {
             Some(plan) => {
-                let rows = self.view.result_row_refs().collect::<Vec<_>>();
+                let rows = self.view.result_rows().collect::<Vec<_>>();
                 build_graphql_response_batched_refs(
                     &cache,
                     &self.catalog,

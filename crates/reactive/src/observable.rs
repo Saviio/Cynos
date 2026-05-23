@@ -276,9 +276,20 @@ impl ObservableQuery {
     }
 
     /// Returns shared row references without cloning the current result vector.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use result_rows() for read-only access; result_row_refs() may build an Rc shadow for owned result storage"
+    )]
+    #[allow(deprecated)]
     #[inline]
     pub fn result_row_refs(&self) -> impl Iterator<Item = &alloc::rc::Rc<Row>> + '_ {
         self.view.result_row_refs()
+    }
+
+    /// Returns borrowed rows without requiring an Rc shadow for owned result storage.
+    #[inline]
+    pub fn result_rows(&self) -> impl Iterator<Item = &Row> + '_ {
+        self.view.result_rows()
     }
 
     /// Returns the number of rows in the result.

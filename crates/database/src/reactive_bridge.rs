@@ -81,6 +81,19 @@ where
     BinaryResult::new(encoder.finish())
 }
 
+fn encode_rows_iter_to_binary<'a, I>(
+    rows: I,
+    row_count: usize,
+    binary_layout: &SchemaLayout,
+) -> BinaryResult
+where
+    I: IntoIterator<Item = &'a Row>,
+{
+    let mut encoder = BinaryEncoder::new(binary_layout.clone(), row_count);
+    encoder.encode_row_refs_iter(rows);
+    BinaryResult::new(encoder.finish())
+}
+
 fn binary_result_to_js_value(result: BinaryResult) -> JsValue {
     result.into()
 }
@@ -217,7 +230,7 @@ impl ReQueryObservable {
     /// only when the underlying patch table changed; all other plans fall back
     /// to deterministic full-result comparison.
     pub fn on_change(&mut self, changes: &HashMap<TableId, HashSet<u64>>) {
-        let _ = self.on_change_profiled_inner(changes, None);
+        self.on_change_inner(changes, None);
     }
 
     #[allow(dead_code)]
@@ -228,12 +241,84 @@ impl ReQueryObservable {
         self.on_change_profiled_inner(changes, None)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn on_change_with_deltas(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: &HashMap<TableId, Vec<Delta<Row>>>,
+    ) {
+        self.on_change_inner(changes, Some(delta_changes));
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn on_change_with_deltas_profiled(
         &mut self,
         changes: &HashMap<TableId, HashSet<u64>>,
         delta_changes: &HashMap<TableId, Vec<Delta<Row>>>,
     ) -> SnapshotQueryProfile {
         self.on_change_profiled_inner(changes, Some(delta_changes))
+    }
+
+    fn on_change_inner(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
+    ) {
+        // Skip re-query if no subscribers - major optimization for unused observables
+        if self.subscriptions.is_empty() {
+            return;
+        }
+
+        if let Some(changed_ids) = self.patch_table_changed_ids(changes) {
+            if let Some(changed_rows) =
+                collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
+            {
+                match self
+                    .compiled_plan
+                    .apply_reactive_patch(&mut self.result, &changed_rows)
+                {
+                    Some(true) => {
+                        self.result_summary = QueryResultSummary::from_rows(&self.result);
+                        self.notify_subscribers();
+                        return;
+                    }
+                    Some(false) => return,
+                    None => {}
+                }
+            }
+        }
+
+        if let Some(changed) = self.try_partial_refresh(changes, delta_changes) {
+            if changed {
+                self.notify_subscribers();
+            }
+            return;
+        }
+
+        if let Some(changed) = self.try_root_subset_refresh(changes, delta_changes) {
+            if changed {
+                self.notify_subscribers();
+            }
+            return;
+        }
+
+        // Re-execute the cached compiled plan (no optimization or lowering overhead)
+        let output = {
+            let cache = self.cache.borrow();
+            execute_compiled_physical_plan_with_summary(&cache, &self.compiled_plan)
+        };
+
+        if let Ok(output) = output {
+            if self.apply_full_requery_output(output.rows, output.summary) {
+                self.notify_subscribers();
+            }
+        }
+    }
+
+    fn notify_subscribers(&self) {
+        for (_, callback) in &self.subscriptions {
+            callback(&self.result);
+        }
     }
 
     fn on_change_profiled_inner(
@@ -408,6 +493,194 @@ impl ReQueryObservable {
         self.result = rows;
         self.result_summary = summary;
         true
+    }
+
+    fn apply_full_requery_output(
+        &mut self,
+        rows: Vec<Rc<Row>>,
+        summary: QueryResultSummary,
+    ) -> bool {
+        if let Some(metadata) = self
+            .partial_refresh
+            .as_ref()
+            .map(|partial_refresh| partial_refresh.metadata.clone())
+        {
+            let candidate_rows = {
+                let cache = self.cache.borrow();
+                build_partial_refresh_candidate_rows(&cache, &metadata, &rows)
+            };
+            let Some(candidate_rows) = candidate_rows else {
+                return false;
+            };
+            let visible_rows = slice_partial_visible_rows(&candidate_rows, &metadata);
+            let visible_summary = QueryResultSummary::from_rows(&visible_rows);
+            let changed = !query_results_equal(
+                &self.result_summary,
+                &visible_summary,
+                &self.result,
+                &visible_rows,
+            );
+
+            if let Some(partial_refresh) = &mut self.partial_refresh {
+                partial_refresh.candidate_rows = candidate_rows;
+            }
+            self.result = visible_rows;
+            self.result_summary = visible_summary;
+            return changed;
+        }
+
+        if query_results_equal(&self.result_summary, &summary, &self.result, &rows) {
+            return false;
+        }
+
+        self.result = rows;
+        self.result_summary = summary;
+        true
+    }
+
+    fn try_partial_refresh(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
+    ) -> Option<bool> {
+        let (affected_root_ids, affected_candidate_rows, partial_metadata) = {
+            let partial_refresh = self.partial_refresh.as_ref()?;
+            let affected_root_ids = Self::collect_affected_root_row_ids(
+                &self.cache,
+                changes,
+                delta_changes,
+                &partial_refresh.metadata.dependency_graph,
+            )?;
+            if affected_root_ids.is_empty() {
+                return Some(false);
+            }
+
+            let affected_candidate_rows = partial_refresh
+                .candidate_rows
+                .iter()
+                .filter(|entry| affected_root_ids.contains(&entry.root_row_id))
+                .count();
+            (
+                affected_root_ids,
+                affected_candidate_rows,
+                partial_refresh.metadata.clone(),
+            )
+        };
+        if affected_candidate_rows > partial_metadata.overscan {
+            return None;
+        }
+
+        let recomputed_rows = {
+            let cache = self.cache.borrow();
+            let rows = execute_compiled_physical_plan_on_table_subset(
+                &cache,
+                &self.compiled_plan,
+                &partial_metadata.root_table,
+                &affected_root_ids,
+            )
+            .ok()?;
+            build_partial_refresh_candidate_rows(&cache, &partial_metadata, &rows)?
+        };
+
+        let mut merged_rows: Vec<PartialRefreshCandidateRow> = {
+            let current_candidate_rows = &self.partial_refresh.as_ref()?.candidate_rows;
+            current_candidate_rows
+                .iter()
+                .filter(|entry| !affected_root_ids.contains(&entry.root_row_id))
+                .cloned()
+                .chain(recomputed_rows)
+                .collect()
+        };
+        merged_rows.sort_by(|left, right| {
+            compare_partial_refresh_rows(left, right, &partial_metadata.order_keys)
+        });
+        merged_rows.truncate(partial_metadata.candidate_limit);
+        let min_shadow_window = partial_metadata
+            .visible_offset
+            .saturating_add(partial_metadata.visible_limit)
+            .saturating_add(partial_metadata.overscan);
+        let current_candidate_len = self.partial_refresh.as_ref()?.candidate_rows.len();
+        if merged_rows.len() < min_shadow_window && current_candidate_len >= min_shadow_window {
+            return None;
+        }
+
+        let visible_rows = slice_partial_visible_rows(&merged_rows, &partial_metadata);
+        let visible_summary = QueryResultSummary::from_rows(&visible_rows);
+        let changed = !query_results_equal(
+            &self.result_summary,
+            &visible_summary,
+            &self.result,
+            &visible_rows,
+        );
+
+        if let Some(partial_refresh) = &mut self.partial_refresh {
+            partial_refresh.candidate_rows = merged_rows;
+        }
+        self.result = visible_rows;
+        self.result_summary = visible_summary;
+        Some(changed)
+    }
+
+    fn try_root_subset_refresh(
+        &mut self,
+        changes: &HashMap<TableId, HashSet<u64>>,
+        delta_changes: Option<&HashMap<TableId, Vec<Delta<Row>>>>,
+    ) -> Option<bool> {
+        let (affected_root_ids, affected_root_keys) = {
+            let root_subset_refresh = self.root_subset_refresh.as_mut()?;
+            let affected_root_ids = Self::collect_affected_root_row_ids(
+                &self.cache,
+                changes,
+                delta_changes,
+                &root_subset_refresh.metadata.dependency_graph,
+            )?;
+            if affected_root_ids.is_empty() {
+                return Some(false);
+            }
+
+            let cache = self.cache.borrow();
+            let refresh_existing_root_keys =
+                changes.contains_key(&root_subset_refresh.metadata.dependency_graph.root_table_id);
+            let affected_root_keys = root_subset_refresh.collect_affected_root_keys(
+                &cache,
+                &affected_root_ids,
+                refresh_existing_root_keys,
+            )?;
+            (affected_root_ids, affected_root_keys)
+        };
+
+        if affected_root_keys.is_empty() {
+            return Some(false);
+        }
+
+        let root_table = self
+            .root_subset_refresh
+            .as_ref()
+            .map(|runtime| runtime.metadata.root_table.clone())?;
+        let rows = {
+            let cache = self.cache.borrow();
+            let subset_plan = self
+                .root_subset_refresh
+                .as_ref()
+                .map(|runtime| runtime.select_compiled_plan(&cache, &affected_root_ids))?;
+            execute_compiled_physical_plan_on_table_subset(
+                &cache,
+                subset_plan,
+                &root_table,
+                &affected_root_ids,
+            )
+            .ok()?
+        };
+
+        let rows = {
+            let root_subset_refresh = self.root_subset_refresh.as_mut()?;
+            root_subset_refresh.apply_subset_rows(&affected_root_keys, rows)?
+        };
+        let summary = QueryResultSummary::from_rows(&rows);
+        let changed = !query_results_equal(&self.result_summary, &summary, &self.result, &rows);
+        self.result = rows;
+        self.result_summary = summary;
+        Some(changed)
     }
 
     fn try_partial_refresh_profiled(

@@ -1067,6 +1067,76 @@ async fn update_object_form_and_delete_paths_are_correct() {
 }
 
 #[wasm_bindgen_test(async)]
+async fn primary_key_update_candidate_path_preserves_predicate_semantics() {
+    let db = Database::new("query_correctness_update_pk_candidate");
+    register_filter_users_table(&db);
+    seed_filter_users(&db).await;
+
+    let updated = db
+        .update("users")
+        .set(
+            &JsValue::from_str("city"),
+            Some(JsValue::from_str("Chengdu")),
+        )
+        .where_(
+            &col("id")
+                .eq(&JsValue::from_f64(3.0))
+                .and(&col("active").eq(&JsValue::from_bool(true))),
+        )
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(updated.as_f64().unwrap() as usize, 1);
+
+    let contradictory = db
+        .update("users")
+        .set(
+            &JsValue::from_str("city"),
+            Some(JsValue::from_str("Xiamen")),
+        )
+        .where_(
+            &col("id")
+                .eq(&JsValue::from_f64(3.0))
+                .and(&col("id").eq(&JsValue::from_f64(4.0))),
+        )
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(contradictory.as_f64().unwrap() as usize, 0);
+
+    let or_updated = db
+        .update("users")
+        .set(
+            &JsValue::from_str("city"),
+            Some(JsValue::from_str("Nanjing")),
+        )
+        .where_(
+            &col("id")
+                .eq(&JsValue::from_f64(3.0))
+                .or(&col("id").eq(&JsValue::from_f64(4.0))),
+        )
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(or_updated.as_f64().unwrap() as usize, 2);
+
+    let row_specs = [
+        spec("id", CellKind::I64, true),
+        spec("city", CellKind::String, true),
+    ];
+    let query = db
+        .select(&js_str_array(&["id", "city"]))
+        .from("users")
+        .where_(&col("id").in_(&js_array([JsValue::from_f64(3.0), JsValue::from_f64(4.0)])))
+        .order_by("id", JsSortOrder::Asc);
+    let expected = vec![
+        vec![Cell::I64(3), Cell::String("Nanjing".into())],
+        vec![Cell::I64(4), Cell::String("Nanjing".into())],
+    ];
+    assert_select_matches(&query, &row_specs, &expected).await;
+}
+
+#[wasm_bindgen_test(async)]
 async fn multi_column_group_by_is_correct() {
     let db = Database::new("query_correctness_group_by_multi_column");
     register_filter_users_table(&db);

@@ -2849,8 +2849,7 @@ mod tests {
     }
 
     /// Test: composite index used for ORDER BY must preserve real tuple order.
-    /// Bug: storage currently serializes multi-column keys as debug strings,
-    /// so lexicographic string order can diverge from `(col1, col2, ...)` order.
+    /// Regression coverage for the old string-serialized multi-column key bug.
     #[test]
     fn test_order_by_composite_index_preserves_tuple_order() {
         use cynos_core::schema::TableBuilder;

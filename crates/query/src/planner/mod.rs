@@ -2,12 +2,14 @@
 
 mod index_bounds;
 mod logical;
+mod lowering;
 mod physical;
 mod properties;
 mod query_planner;
 
 pub use index_bounds::IndexBounds;
 pub use logical::LogicalPlan;
+pub(crate) use lowering::logical_to_physical;
 pub use physical::{JoinAlgorithm, PhysicalPlan};
 pub use properties::{OrderingColumn, OrderingProperty, PhysicalProperties};
 pub use query_planner::{PlannerProfile, QueryPlanner};

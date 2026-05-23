@@ -194,7 +194,6 @@ struct BatchSecondaryDef {
 }
 
 struct PreparedBatchInsert {
-    row_id_entries: Vec<(Value, RowId)>,
     primary_entries: Option<Vec<(IndexKey, RowId)>>,
     secondary_entries: Vec<Vec<(IndexKey, RowId)>>,
 }
@@ -202,7 +201,6 @@ struct PreparedBatchInsert {
 #[derive(Clone, Copy)]
 enum InsertProfilePhase {
     Validation,
-    RowIdIndex,
     PrimaryIndex,
     SecondaryIndex,
     GinCollect,
@@ -290,7 +288,6 @@ impl InsertBatchProfiler {
             let elapsed = now_ms() - started_at;
             match phase {
                 InsertProfilePhase::Validation => self.profile.validation_ms += elapsed,
-                InsertProfilePhase::RowIdIndex => self.profile.row_id_index_ms += elapsed,
                 InsertProfilePhase::PrimaryIndex => self.profile.primary_index_ms += elapsed,
                 InsertProfilePhase::SecondaryIndex => self.profile.secondary_index_ms += elapsed,
                 InsertProfilePhase::GinCollect => self.profile.gin_collect_ms += elapsed,
@@ -875,6 +872,10 @@ impl HashIndexStore {
         limit: Option<usize>,
         skip: usize,
     ) -> Vec<RowId> {
+        if let Some(KeyRange::Only(key)) = range {
+            return apply_point_row_id_window(self.inner.get(key), limit, skip);
+        }
+
         self.inner.get_range(range, reverse, limit, skip)
     }
 
@@ -957,12 +958,17 @@ impl IndexStore for HashIndexStore {
 
     fn get_range(
         &self,
-        _range: Option<&KeyRange<Value>>,
-        _reverse: bool,
-        _limit: Option<usize>,
-        _skip: usize,
+        range: Option<&KeyRange<Value>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
     ) -> Vec<RowId> {
-        self.get_all()
+        if let Some(KeyRange::Only(key)) = range {
+            return apply_point_row_id_window(self.get(key), limit, skip);
+        }
+
+        let range = IndexKey::from_scalar_range(range);
+        self.get_range_index_keys(range.as_ref(), reverse, limit, skip)
     }
 
     fn get_all(&self) -> Vec<RowId> {
@@ -1106,6 +1112,14 @@ fn first_duplicate_batch_key<K: Clone + Ord>(entries: &[(K, RowId)]) -> Option<K
     })
 }
 
+fn apply_point_row_id_window(row_ids: Vec<RowId>, limit: Option<usize>, skip: usize) -> Vec<RowId> {
+    let iter = row_ids.into_iter().skip(skip);
+    match limit {
+        Some(limit) => iter.take(limit).collect(),
+        None => iter.collect(),
+    }
+}
+
 fn composite_range_has_expected_arity(range: &KeyRange<Vec<Value>>, expected: usize) -> bool {
     match range {
         KeyRange::All => true,
@@ -1125,7 +1139,6 @@ pub struct RowStore {
     row_slots: Vec<RowSlot>,
     /// Slot indices maintained in row_id order for deterministic scans.
     scan_order: Vec<usize>,
-    row_id_index: BTreeIndexStore,
     primary_index: Option<BTreeIndexStore>,
     pk_columns: Vec<usize>,
     secondary_indices: BTreeMap<String, SecondaryIndexStore>,
@@ -1144,7 +1157,6 @@ impl RowStore {
             rows: RowMap::default(),
             row_slots: Vec::new(),
             scan_order: Vec::new(),
-            row_id_index: BTreeIndexStore::new(true),
             primary_index: None,
             pk_columns: Vec::new(),
             secondary_indices: BTreeMap::new(),
@@ -1257,6 +1269,52 @@ impl RowStore {
         self.row_slots.get_mut(slot_idx).map(|slot| &mut slot.row)
     }
 
+    fn for_each_secondary_index_mut<F>(&mut self, mut visitor: F)
+    where
+        F: FnMut(&str, &[usize], &mut SecondaryIndexStore),
+    {
+        let index_columns = &self.index_columns;
+        let secondary_indices = &mut self.secondary_indices;
+        for (name, columns) in index_columns {
+            let Some(index) = secondary_indices.get_mut(name) else {
+                continue;
+            };
+            visitor(name.as_str(), columns, index);
+        }
+    }
+
+    fn try_for_each_secondary_index_mut<E, F>(
+        &mut self,
+        mut visitor: F,
+    ) -> core::result::Result<(), E>
+    where
+        F: FnMut(&str, &[usize], &mut SecondaryIndexStore) -> core::result::Result<(), E>,
+    {
+        let index_columns = &self.index_columns;
+        let secondary_indices = &mut self.secondary_indices;
+        for (name, columns) in index_columns {
+            let Some(index) = secondary_indices.get_mut(name) else {
+                continue;
+            };
+            visitor(name.as_str(), columns, index)?;
+        }
+        Ok(())
+    }
+
+    fn for_each_gin_index_mut<F>(&mut self, mut visitor: F)
+    where
+        F: FnMut(&str, &GinIndexConfig, &mut GinIndex),
+    {
+        let gin_index_configs = &self.gin_index_configs;
+        let gin_indices = &mut self.gin_indices;
+        for (name, config) in gin_index_configs {
+            let Some(index) = gin_indices.get_mut(name) else {
+                continue;
+            };
+            visitor(name.as_str(), config, index);
+        }
+    }
+
     fn insert_row_slot(&mut self, row_id: RowId, row: Rc<Row>) {
         let slot_idx = self.row_slots.len();
         self.row_slots.push(RowSlot { row_id, row });
@@ -1363,7 +1421,6 @@ impl RowStore {
             .windows(2)
             .all(|window| window[0].id() < window[1].id()));
 
-        let mut row_id_entries = Vec::with_capacity(rows.len());
         let mut primary_entries = self
             .primary_index
             .as_ref()
@@ -1374,7 +1431,6 @@ impl RowStore {
             .collect();
         for row in &rows {
             let row_id = row.id();
-            row_id_entries.push((Value::Int64(row_id as i64), row_id));
             if let Some(entries) = primary_entries.as_mut() {
                 entries.push((extract_key(row, &self.pk_columns), row_id));
             }
@@ -1382,15 +1438,6 @@ impl RowStore {
                 entries.push((extract_key(row, &def.cols), row_id));
             }
         }
-
-        let started = profiler.start_timer();
-        if self.row_id_index.add_batch(&row_id_entries).is_err() {
-            self.clear();
-            return Err(Error::invalid_operation(
-                "Failed to add to row ID index during bulk load",
-            ));
-        }
-        profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
 
         if let Some(ref mut pk_index) = self.primary_index {
             let started = profiler.start_timer();
@@ -1635,28 +1682,9 @@ impl RowStore {
             }
 
             let started = profiler.start_timer();
-            if self
-                .row_id_index
-                .add(Value::Int64(row_id as i64), row_id)
-                .is_err()
-            {
-                profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
-                Self::flush_gin_bulk_builders_profiled(
-                    &mut self.gin_indices,
-                    gin_defs,
-                    &mut gin_builders,
-                    profiler,
-                );
-                return Err(Error::invalid_operation("Failed to add to row ID index"));
-            }
-            profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
-
-            let started = profiler.start_timer();
             if let (Some(ref mut pk_index), Some(pk)) = (&mut self.primary_index, pk_value.clone())
             {
                 if pk_index.add_index_key(pk.clone(), row_id).is_err() {
-                    self.row_id_index
-                        .remove(&Value::Int64(row_id as i64), Some(row_id));
                     profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
                     Self::flush_gin_bulk_builders_profiled(
                         &mut self.gin_indices,
@@ -1693,8 +1721,6 @@ impl RowStore {
                         {
                             pk_index.remove_index_key(pk, Some(row_id));
                         }
-                        self.row_id_index
-                            .remove(&Value::Int64(row_id as i64), Some(row_id));
                         Self::flush_gin_bulk_builders_profiled(
                             &mut self.gin_indices,
                             gin_defs,
@@ -1753,7 +1779,6 @@ impl RowStore {
             return None;
         }
 
-        let mut row_id_entries = Vec::with_capacity(rows.len());
         let mut primary_entries =
             (!self.pk_columns.is_empty()).then(|| Vec::with_capacity(rows.len()));
         let mut secondary_entries: Vec<Vec<(IndexKey, RowId)>> = secondary_defs
@@ -1773,7 +1798,6 @@ impl RowStore {
             if self.rows.contains_key(&row_id) || !seen_row_ids.insert(row_id) {
                 return None;
             }
-            row_id_entries.push((Value::Int64(row_id as i64), row_id));
 
             if let Some(entries) = primary_entries.as_mut() {
                 let pk = extract_key(row, &self.pk_columns);
@@ -1814,7 +1838,6 @@ impl RowStore {
         }
 
         Some(PreparedBatchInsert {
-            row_id_entries,
             primary_entries,
             secondary_entries,
         })
@@ -1829,7 +1852,6 @@ impl RowStore {
         profiler: &mut InsertBatchProfiler,
     ) -> Result<usize> {
         let PreparedBatchInsert {
-            row_id_entries,
             primary_entries,
             secondary_entries,
         } = prepared_batch;
@@ -1837,18 +1859,10 @@ impl RowStore {
         let row_count = rows.len();
 
         let started = profiler.start_timer();
-        if self.row_id_index.add_batch(&row_id_entries).is_err() {
-            profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
-            return Err(Error::invalid_operation("Failed to add to row ID index"));
-        }
-        profiler.finish_phase(InsertProfilePhase::RowIdIndex, started);
-
-        let started = profiler.start_timer();
         if let (Some(ref mut pk_index), Some(entries)) =
             (&mut self.primary_index, primary_entries.as_ref())
         {
             if pk_index.add_batch_index_keys(entries).is_err() {
-                self.row_id_index.remove_batch(&row_id_entries);
                 profiler.finish_phase(InsertProfilePhase::PrimaryIndex, started);
                 let value = first_duplicate_batch_key(entries)
                     .map(|pk| pk.to_error_value())
@@ -1882,7 +1896,6 @@ impl RowStore {
                 {
                     pk_index.remove_batch_index_keys(entries);
                 }
-                self.row_id_index.remove_batch(&row_id_entries);
                 profiler.finish_phase(InsertProfilePhase::SecondaryIndex, started);
                 let value = first_duplicate_batch_key(entries)
                     .map(|key| key.to_error_value())
@@ -2076,16 +2089,9 @@ impl RowStore {
             None
         };
 
-        // Add to row ID index
-        self.row_id_index
-            .add(Value::Int64(row_id as i64), row_id)
-            .map_err(|_| Error::invalid_operation("Failed to add to row ID index"))?;
-
         // Add to primary key index
         if let (Some(ref mut pk_index), Some(pk)) = (&mut self.primary_index, pk_value.clone()) {
             if pk_index.add_index_key(pk.clone(), row_id).is_err() {
-                self.row_id_index
-                    .remove(&Value::Int64(row_id as i64), Some(row_id));
                 return Err(Error::UniqueConstraint {
                     column: "primary_key".into(),
                     value: pk.to_error_value(),
@@ -2093,82 +2099,54 @@ impl RowStore {
             }
         }
 
-        // Add to secondary indices
-        // Collect index names first to avoid borrow conflict
-        let index_names: Vec<String> = self.index_columns.keys().cloned().collect();
-        for idx_name in &index_names {
-            let cols = &self.index_columns[idx_name];
+        let secondary_result = self.try_for_each_secondary_index_mut(|idx_name, cols, idx| {
             let key = extract_key(&row, cols);
-            if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                if idx.add_index_key(key.clone(), row_id).is_err() {
-                    self.rollback_insert(row_id, &row);
-                    return Err(Error::UniqueConstraint {
-                        column: idx_name.clone(),
-                        value: key.to_error_value(),
-                    });
-                }
-            }
+            idx.add_index_key(key.clone(), row_id)
+                .map_err(|_| (idx_name.to_string(), key.to_error_value()))
+        });
+        if let Err((column, value)) = secondary_result {
+            self.rollback_insert(row_id, &row);
+            return Err(Error::UniqueConstraint { column, value });
         }
 
-        // Add to GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(config.column_idx) {
-                    Self::index_jsonb_value(
-                        gin_idx,
-                        value,
-                        row_id,
-                        config.compiled_indexed_paths.as_deref(),
-                        config.compiled_indexed_path_tree.as_ref(),
-                    );
-                }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            if let Some(value) = row.get(config.column_idx) {
+                Self::index_jsonb_value(
+                    gin_idx,
+                    value,
+                    row_id,
+                    config.compiled_indexed_paths.as_deref(),
+                    config.compiled_indexed_path_tree.as_ref(),
+                );
             }
-        }
+        });
 
         self.insert_row_slot(row_id, Rc::new(row));
         Ok(row_id)
     }
 
     fn rollback_insert(&mut self, row_id: RowId, row: &Row) {
-        self.row_id_index
-            .remove(&Value::Int64(row_id as i64), Some(row_id));
-
         if let Some(ref mut pk_index) = self.primary_index {
             let pk_value = extract_key(row, &self.pk_columns);
             pk_index.remove_index_key(&pk_value, Some(row_id));
         }
 
-        let index_names: Vec<String> = self.index_columns.keys().cloned().collect();
-        for idx_name in &index_names {
-            let cols = &self.index_columns[idx_name];
+        self.for_each_secondary_index_mut(|_, cols, idx| {
             let key = extract_key(row, cols);
-            if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                idx.remove_index_key(&key, Some(row_id));
-            }
-        }
+            idx.remove_index_key(&key, Some(row_id));
+        });
 
-        // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(config.column_idx) {
-                    Self::remove_jsonb_from_gin(
-                        gin_idx,
-                        value,
-                        row_id,
-                        config.compiled_indexed_paths.as_deref(),
-                        config.compiled_indexed_path_tree.as_ref(),
-                    );
-                }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            if let Some(value) = row.get(config.column_idx) {
+                Self::remove_jsonb_from_gin(
+                    gin_idx,
+                    value,
+                    row_id,
+                    config.compiled_indexed_paths.as_deref(),
+                    config.compiled_indexed_path_tree.as_ref(),
+                );
             }
-        }
+        });
     }
 
     /// Updates a row in the store.
@@ -2218,52 +2196,39 @@ impl RowStore {
             }
         }
 
-        // Update secondary indices
-        let index_names: Vec<String> = self.index_columns.keys().cloned().collect();
-        for idx_name in &index_names {
-            let cols = &self.index_columns[idx_name];
+        self.for_each_secondary_index_mut(|_, cols, idx| {
             let old_key = extract_key(&old_row, cols);
             let new_key = extract_key(&new_row, cols);
-            if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                if old_key != new_key {
-                    idx.remove_index_key(&old_key, Some(row_id));
-                    let _ = idx.add_index_key(new_key, row_id);
-                }
+            if old_key != new_key {
+                idx.remove_index_key(&old_key, Some(row_id));
+                let _ = idx.add_index_key(new_key, row_id);
             }
-        }
+        });
 
-        // Update GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                let old_value = old_row.get(config.column_idx);
-                let new_value = new_row.get(config.column_idx);
-                // Only update if the JSONB value changed
-                if old_value != new_value {
-                    if let Some(old_val) = old_value {
-                        Self::remove_jsonb_from_gin(
-                            gin_idx,
-                            old_val,
-                            row_id,
-                            config.compiled_indexed_paths.as_deref(),
-                            config.compiled_indexed_path_tree.as_ref(),
-                        );
-                    }
-                    if let Some(new_val) = new_value {
-                        Self::index_jsonb_value(
-                            gin_idx,
-                            new_val,
-                            row_id,
-                            config.compiled_indexed_paths.as_deref(),
-                            config.compiled_indexed_path_tree.as_ref(),
-                        );
-                    }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            let old_value = old_row.get(config.column_idx);
+            let new_value = new_row.get(config.column_idx);
+            if old_value != new_value {
+                if let Some(old_val) = old_value {
+                    Self::remove_jsonb_from_gin(
+                        gin_idx,
+                        old_val,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                    );
+                }
+                if let Some(new_val) = new_value {
+                    Self::index_jsonb_value(
+                        gin_idx,
+                        new_val,
+                        row_id,
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                    );
                 }
             }
-        }
+        });
 
         self.replace_row_slot(row_id, Rc::new(new_row));
         Ok(())
@@ -2275,9 +2240,6 @@ impl RowStore {
             .remove_row_slot(row_id)
             .ok_or_else(|| Error::not_found(self.schema.name(), Value::Int64(row_id as i64)))?;
 
-        self.row_id_index
-            .remove(&Value::Int64(row_id as i64), Some(row_id));
-
         if !self.pk_columns.is_empty() {
             let pk_value = extract_key(&row, &self.pk_columns);
             if let Some(ref mut pk_index) = self.primary_index {
@@ -2285,33 +2247,22 @@ impl RowStore {
             }
         }
 
-        let index_names: Vec<String> = self.index_columns.keys().cloned().collect();
-        for idx_name in &index_names {
-            let cols = &self.index_columns[idx_name];
+        self.for_each_secondary_index_mut(|_, cols, idx| {
             let key = extract_key(&row, cols);
-            if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                idx.remove_index_key(&key, Some(row_id));
-            }
-        }
+            idx.remove_index_key(&key, Some(row_id));
+        });
 
-        // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                if let Some(value) = row.get(config.column_idx) {
-                    Self::remove_jsonb_from_gin(
-                        gin_idx,
-                        value,
-                        row_id,
-                        config.compiled_indexed_paths.as_deref(),
-                        config.compiled_indexed_path_tree.as_ref(),
-                    );
-                }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            if let Some(value) = row.get(config.column_idx) {
+                Self::remove_jsonb_from_gin(
+                    gin_idx,
+                    value,
+                    row_id,
+                    config.compiled_indexed_paths.as_deref(),
+                    config.compiled_indexed_path_tree.as_ref(),
+                );
             }
-        }
+        });
 
         Ok(row)
     }
@@ -2338,13 +2289,6 @@ impl RowStore {
             return Vec::new();
         }
 
-        // Prepare batch entries for row_id_index
-        let row_id_entries: Vec<(Value, RowId)> = deleted_rows
-            .iter()
-            .map(|row| (Value::Int64(row.id() as i64), row.id()))
-            .collect();
-        self.row_id_index.remove_batch(&row_id_entries);
-
         // Prepare batch entries for primary key index
         if !self.pk_columns.is_empty() {
             if let Some(ref mut pk_index) = self.primary_index {
@@ -2367,26 +2311,19 @@ impl RowStore {
             }
         }
 
-        // Remove from GIN indices
-        let gin_index_names: Vec<String> = self.gin_index_configs.keys().cloned().collect();
-        for idx_name in &gin_index_names {
-            let Some(config) = self.gin_index_configs.get(idx_name).cloned() else {
-                continue;
-            };
-            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
-                for row in &deleted_rows {
-                    if let Some(value) = row.get(config.column_idx) {
-                        Self::remove_jsonb_from_gin(
-                            gin_idx,
-                            value,
-                            row.id(),
-                            config.compiled_indexed_paths.as_deref(),
-                            config.compiled_indexed_path_tree.as_ref(),
-                        );
-                    }
+        self.for_each_gin_index_mut(|_, config, gin_idx| {
+            for row in &deleted_rows {
+                if let Some(value) = row.get(config.column_idx) {
+                    Self::remove_jsonb_from_gin(
+                        gin_idx,
+                        value,
+                        row.id(),
+                        config.compiled_indexed_paths.as_deref(),
+                        config.compiled_indexed_path_tree.as_ref(),
+                    );
                 }
             }
-        }
+        });
 
         deleted_rows
     }
@@ -2476,7 +2413,7 @@ impl RowStore {
     pub fn count_existing_rows_by_ids(&self, row_ids: &[RowId]) -> usize {
         row_ids
             .iter()
-            .filter(|row_id| self.rows.contains_key(row_id))
+            .filter(|row_id| self.rows.contains_key(*row_id))
             .count()
     }
 
@@ -3021,7 +2958,6 @@ impl RowStore {
         self.rows.clear();
         self.row_slots.clear();
         self.scan_order.clear();
-        self.row_id_index.clear();
         if let Some(ref mut pk_index) = self.primary_index {
             pk_index.clear();
         }
@@ -4884,6 +4820,60 @@ mod tests {
             .unwrap()
     }
 
+    fn assert_row_slot_invariants(store: &RowStore, expected_row_ids: &[RowId]) {
+        assert_eq!(store.len(), expected_row_ids.len());
+        assert_eq!(store.row_slots.len(), expected_row_ids.len());
+        assert_eq!(store.scan_order.len(), expected_row_ids.len());
+        assert_eq!(store.row_ids(), expected_row_ids);
+
+        let scan_ids: Vec<RowId> = store.scan().map(|row| row.id()).collect();
+        assert_eq!(scan_ids, expected_row_ids);
+
+        let mut seen_slots = BTreeSet::new();
+        let mut previous_row_id = None;
+        for &slot_idx in &store.scan_order {
+            assert!(
+                slot_idx < store.row_slots.len(),
+                "scan_order points outside row_slots"
+            );
+            assert!(
+                seen_slots.insert(slot_idx),
+                "scan_order contains duplicate slot {slot_idx}"
+            );
+
+            let slot = &store.row_slots[slot_idx];
+            if let Some(previous) = previous_row_id {
+                assert!(
+                    previous < slot.row_id,
+                    "scan_order is not sorted by row_id: {previous} then {}",
+                    slot.row_id
+                );
+            }
+            previous_row_id = Some(slot.row_id);
+
+            assert_eq!(slot.row.id(), slot.row_id);
+            assert_eq!(store.rows.get(&slot.row_id).copied(), Some(slot_idx));
+            assert_eq!(
+                store.get(slot.row_id).map(|row| row.id()),
+                Some(slot.row_id)
+            );
+        }
+
+        for (row_id, &slot_idx) in &store.rows {
+            assert!(
+                slot_idx < store.row_slots.len(),
+                "RowMap points outside row_slots"
+            );
+            let slot = &store.row_slots[slot_idx];
+            assert_eq!(slot.row_id, *row_id);
+            assert_eq!(slot.row.id(), *row_id);
+            assert!(
+                seen_slots.contains(&slot_idx),
+                "RowMap points to slot missing from scan_order"
+            );
+        }
+    }
+
     fn test_schema_with_index() -> Table {
         TableBuilder::new("test")
             .unwrap()
@@ -5120,6 +5110,43 @@ mod tests {
     }
 
     #[test]
+    fn test_row_store_remove_row_slot_keeps_internal_indices_consistent() {
+        let mut store = RowStore::new(test_schema());
+        for row_id in [40_u64, 10, 30, 20, 50, 15] {
+            store
+                .insert(Row::new(
+                    row_id,
+                    vec![
+                        Value::Int64(row_id as i64),
+                        Value::String(format!("row-{row_id}")),
+                    ],
+                ))
+                .unwrap();
+        }
+
+        assert_row_slot_invariants(&store, &[10, 15, 20, 30, 40, 50]);
+
+        store.delete(40).unwrap();
+        assert_row_slot_invariants(&store, &[10, 15, 20, 30, 50]);
+
+        store.delete(10).unwrap();
+        assert_row_slot_invariants(&store, &[15, 20, 30, 50]);
+
+        store.delete(20).unwrap();
+        assert_row_slot_invariants(&store, &[15, 30, 50]);
+
+        let deleted = store.delete_batch(&[15, 999, 30]);
+        assert_eq!(
+            deleted.iter().map(|row| row.id()).collect::<Vec<_>>(),
+            vec![15, 30]
+        );
+        assert_row_slot_invariants(&store, &[50]);
+
+        store.delete(50).unwrap();
+        assert_row_slot_invariants(&store, &[]);
+    }
+
+    #[test]
     fn test_row_store_index_maintenance() {
         let mut store = RowStore::new(test_schema_with_index());
         let row = Row::new(1, vec![Value::Int64(1), Value::Int64(100)]);
@@ -5144,6 +5171,44 @@ mod tests {
         let results = store.index_scan("idx_value_hash", Some(&KeyRange::only(Value::Int64(200))));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id(), 2);
+    }
+
+    #[test]
+    fn test_hash_index_store_range_filters_instead_of_returning_all_rows() {
+        let mut index = HashIndexStore::new(false);
+        index.add(Value::Int64(100), 1).unwrap();
+        index.add(Value::Int64(200), 2).unwrap();
+        index.add(Value::Int64(300), 3).unwrap();
+        index.add(Value::Int64(200), 4).unwrap();
+
+        let only = index.get_range(Some(&KeyRange::only(Value::Int64(200))), false, None, 0);
+        assert_eq!(only, vec![2, 4]);
+
+        let bounded = index.get_range(
+            Some(&KeyRange::bound(
+                Value::Int64(150),
+                Value::Int64(300),
+                false,
+                false,
+            )),
+            false,
+            None,
+            0,
+        );
+        assert_eq!(bounded, vec![2, 4, 3]);
+
+        let paged = index.get_range(
+            Some(&KeyRange::bound(
+                Value::Int64(100),
+                Value::Int64(300),
+                false,
+                false,
+            )),
+            false,
+            Some(2),
+            1,
+        );
+        assert_eq!(paged, vec![2, 4]);
     }
 
     #[test]

@@ -1,10 +1,13 @@
 use super::graphql_observable::{GraphqlDeltaObservable, GraphqlSubscriptionObservable};
 use super::{
-    binary_result_to_js_value, encode_rc_rows_iter_to_binary, encode_rc_rows_to_binary,
+    binary_result_to_js_value, encode_rc_rows_to_binary, encode_rows_iter_to_binary,
     ReQueryObservable,
 };
 use crate::binary_protocol::{BinaryResult, SchemaLayout};
 use crate::convert::{prune_jsonb_js_cache, value_to_js, GraphqlJsCachePolicy};
+#[cfg(not(feature = "benchmark"))]
+use crate::profiling::IvmBridgeProfiler;
+#[cfg(feature = "benchmark")]
 use crate::profiling::{now_ms, IvmBridgeProfile, IvmBridgeProfiler};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -255,6 +258,7 @@ pub struct JsIvmObservableQuery {
     /// Snapshot cache reused across getResult() calls.
     materialization_cache: Rc<RefCell<JsSnapshotRowsCache>>,
     /// Shared sink for per-flush bridge profiling.
+    #[allow(dead_code)]
     bridge_profiler: Rc<RefCell<IvmBridgeProfiler>>,
 }
 
@@ -305,6 +309,7 @@ impl JsIvmObservableQuery {
     /// Returns an unsubscribe function.
     pub fn subscribe(&mut self, callback: js_sys::Function) -> js_sys::Function {
         let materializer = self.materializer.clone();
+        #[cfg(feature = "benchmark")]
         let bridge_profiler = self.bridge_profiler.clone();
         let added_key = JsValue::from_str("added");
         let removed_key = JsValue::from_str("removed");
@@ -314,22 +319,37 @@ impl JsIvmObservableQuery {
             .inner
             .borrow_mut()
             .subscribe_trace_batches(move |batch| {
+                #[cfg(feature = "benchmark")]
                 let total_started_at = now_ms();
+                #[cfg(feature = "benchmark")]
                 let (delta_obj, serialize_added_ms, serialize_removed_ms, assemble_delta_ms) =
-                    trace_delta_batch_to_js_delta(
+                    trace_delta_batch_to_js_delta_profiled(
                         batch,
                         &materializer,
                         &mut materialization_cache.borrow_mut(),
                         &added_key,
                         &removed_key,
                     );
+                #[cfg(not(feature = "benchmark"))]
+                let delta_obj = trace_delta_batch_to_js_delta(
+                    batch,
+                    &materializer,
+                    &mut materialization_cache.borrow_mut(),
+                    &added_key,
+                    &removed_key,
+                );
+                #[cfg(feature = "benchmark")]
                 let added_row_count = batch.insert_count();
+                #[cfg(feature = "benchmark")]
                 let removed_row_count = batch.delete_count();
 
+                #[cfg(feature = "benchmark")]
                 let callback_started_at = now_ms();
                 callback.call1(&JsValue::NULL, &delta_obj).ok();
+                #[cfg(feature = "benchmark")]
                 let callback_call_ms = now_ms() - callback_started_at;
 
+                #[cfg(feature = "benchmark")]
                 bridge_profiler
                     .borrow_mut()
                     .record_sample(&IvmBridgeProfile {
@@ -362,7 +382,7 @@ impl JsIvmObservableQuery {
     pub fn get_result(&self) -> JsValue {
         let inner = self.inner.borrow();
         self.materializer.materialize_from_iter(
-            inner.result_row_refs(),
+            inner.result_rows(),
             inner.len(),
             &mut self.materialization_cache.borrow_mut(),
         )
@@ -372,7 +392,7 @@ impl JsIvmObservableQuery {
     #[wasm_bindgen(js_name = getResultBinary)]
     pub fn get_result_binary(&self) -> BinaryResult {
         let inner = self.inner.borrow();
-        encode_rc_rows_iter_to_binary(inner.result_row_refs(), inner.len(), &self.binary_layout)
+        encode_rows_iter_to_binary(inner.result_rows(), inner.len(), &self.binary_layout)
     }
 
     /// Returns the schema layout for decoding binary results.
@@ -400,7 +420,40 @@ impl JsIvmObservableQuery {
     }
 }
 
+#[cfg_attr(feature = "benchmark", allow(dead_code))]
 fn trace_delta_batch_to_js_delta(
+    batch: &TraceDeltaBatch,
+    materializer: &JsSnapshotRowsMaterializer,
+    cache: &mut JsSnapshotRowsCache,
+    added_key: &JsValue,
+    removed_key: &JsValue,
+) -> JsValue {
+    let added = js_sys::Array::new_with_length(batch.insert_count() as u32);
+    let removed = js_sys::Array::new_with_length(batch.delete_count() as u32);
+    let mut added_index = 0u32;
+    let mut removed_index = 0u32;
+
+    for delta in batch.deltas() {
+        let js_row = cache.materialize_trace_handle(materializer, batch.arena(), &delta.data);
+        if delta.is_insert() {
+            added.set(added_index, js_row);
+            added_index += 1;
+        } else if delta.is_delete() {
+            removed.set(removed_index, js_row);
+            removed_index += 1;
+            cache.remove_row(batch.arena().row_id(&delta.data));
+        }
+    }
+
+    let delta_obj = js_sys::Object::new();
+    js_sys::Reflect::set(&delta_obj, added_key, &added).ok();
+    js_sys::Reflect::set(&delta_obj, removed_key, &removed).ok();
+
+    delta_obj.into()
+}
+
+#[cfg(feature = "benchmark")]
+fn trace_delta_batch_to_js_delta_profiled(
     batch: &TraceDeltaBatch,
     materializer: &JsSnapshotRowsMaterializer,
     cache: &mut JsSnapshotRowsCache,
@@ -681,7 +734,7 @@ impl JsSnapshotRowsMaterializer {
     }
 
     fn materialize(&self, rows: &[Rc<Row>], cache: &mut JsSnapshotRowsCache) -> JsValue {
-        self.materialize_from_iter(rows.iter(), rows.len(), cache)
+        self.materialize_from_iter(rows.iter().map(|row| row.as_ref()), rows.len(), cache)
     }
 
     fn materialize_from_iter<'a, I>(
@@ -691,7 +744,7 @@ impl JsSnapshotRowsMaterializer {
         cache: &mut JsSnapshotRowsCache,
     ) -> JsValue
     where
-        I: IntoIterator<Item = &'a Rc<Row>>,
+        I: IntoIterator<Item = &'a Row>,
     {
         if cache.epoch == u64::MAX {
             cache.rows.clear();
@@ -706,7 +759,7 @@ impl JsSnapshotRowsMaterializer {
 
         let arr = js_sys::Array::new_with_length(row_count as u32);
         for (index, row) in rows.into_iter().enumerate() {
-            let js_row = self.materialize_row(row.as_ref(), cache, epoch);
+            let js_row = self.materialize_row(row, cache, epoch);
             arr.set(index as u32, js_row);
         }
 

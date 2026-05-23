@@ -167,6 +167,7 @@ pub(crate) struct GraphqlSnapshotQueryProfile {
     pub emit_ms: f64,
 }
 
+#[cfg(feature = "benchmark")]
 impl SnapshotFlushProfile {
     pub fn record_rows_query(&mut self, sample: &SnapshotQueryProfile) {
         self.rows_query_count += 1;
@@ -224,15 +225,18 @@ pub(crate) struct IvmBridgeProfile {
 
 #[derive(Default)]
 pub(crate) struct IvmBridgeProfiler {
+    #[cfg(feature = "benchmark")]
     current: IvmBridgeProfile,
     last: Option<IvmBridgeProfile>,
 }
 
 impl IvmBridgeProfiler {
+    #[cfg(feature = "benchmark")]
     pub fn begin_flush(&mut self) {
         self.current = IvmBridgeProfile::default();
     }
 
+    #[cfg(feature = "benchmark")]
     pub fn record_sample(&mut self, sample: &IvmBridgeProfile) {
         self.current.callback_count += sample.callback_count;
         self.current.added_row_count += sample.added_row_count;
@@ -244,6 +248,7 @@ impl IvmBridgeProfiler {
         self.current.total_ms += sample.total_ms;
     }
 
+    #[cfg(feature = "benchmark")]
     pub fn end_flush(&mut self) {
         self.last = Some(self.current.clone());
     }

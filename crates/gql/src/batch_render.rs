@@ -22,17 +22,47 @@ use crate::render_plan::{
 use crate::response::{GraphqlResponse, ResponseField, ResponseValue};
 
 trait RowRenderRef {
-    fn row_rc(&self) -> &Rc<Row>;
+    fn row(&self) -> &Row;
+
+    fn row_rc(&self) -> Option<&Rc<Row>> {
+        None
+    }
+
+    fn clone_row_rc(&self) -> Rc<Row> {
+        self.row_rc()
+            .cloned()
+            .unwrap_or_else(|| Rc::new(self.row().clone()))
+    }
 }
 
 impl RowRenderRef for Rc<Row> {
-    fn row_rc(&self) -> &Rc<Row> {
-        self
+    fn row(&self) -> &Row {
+        self.as_ref()
+    }
+
+    fn row_rc(&self) -> Option<&Rc<Row>> {
+        Some(self)
     }
 }
 
 impl RowRenderRef for &Rc<Row> {
-    fn row_rc(&self) -> &Rc<Row> {
+    fn row(&self) -> &Row {
+        self.as_ref()
+    }
+
+    fn row_rc(&self) -> Option<&Rc<Row>> {
+        Some(*self)
+    }
+}
+
+impl RowRenderRef for &Row {
+    fn row(&self) -> &Row {
+        self
+    }
+}
+
+impl RowRenderRef for Row {
+    fn row(&self) -> &Row {
         self
     }
 }
@@ -63,7 +93,7 @@ struct RowCacheKey {
 }
 
 impl RowCacheKey {
-    fn new(node_id: NodeId, row: &Rc<Row>) -> Self {
+    fn new(node_id: NodeId, row: &Row) -> Self {
         Self {
             node_id,
             row_id: row.id(),
@@ -203,8 +233,8 @@ impl GraphqlBatchState {
         }
     }
 
-    fn remember_row(&mut self, row_key: RowCacheKey, row: &Rc<Row>) {
-        self.row_sources.insert(row_key, row.clone());
+    fn remember_row<R: RowRenderRef + ?Sized>(&mut self, row_key: RowCacheKey, row: &R) {
+        self.row_sources.insert(row_key, row.clone_row_rc());
         self.node_row_index
             .entry(row_key.node_id)
             .or_insert_with(HashMap::new)
@@ -413,7 +443,7 @@ impl GraphqlBatchState {
                     continue;
                 };
                 for row in child_rows {
-                    pending.push(RowCacheKey::new(edge.child_node, row));
+                    pending.push(RowCacheKey::new(edge.child_node, row.as_ref()));
                 }
             }
         }
@@ -487,7 +517,7 @@ pub fn render_graphql_response_refs(
     field: &BoundRootField,
     plan: &GraphqlBatchPlan,
     state: &mut GraphqlBatchState,
-    rows: &[&Rc<Row>],
+    rows: &[&Row],
 ) -> GqlResult<GraphqlResponse> {
     render_graphql_response_impl(cache, catalog, field, plan, state, rows)
 }
@@ -523,7 +553,7 @@ fn render_root_field<R: RowRenderRef>(
         }
         BoundRootFieldKind::ByPk { .. } => match rows.first() {
             Some(row) => {
-                let row = row.row_rc();
+                let row = row.row();
                 if !row_is_cached(state, plan.root_node(), row) {
                     let singleton = [row];
                     prefetch_node_edges_with_children(
@@ -573,7 +603,7 @@ fn render_root_node_list<R: RowRenderRef>(
     let items = render_node_list(cache, catalog, plan, state, node_id, rows)?;
     let row_keys = rows
         .iter()
-        .map(|row| RowCacheKey::new(node_id, row.row_rc()))
+        .map(|row| RowCacheKey::new(node_id, row.row()))
         .collect();
     let list_value = state.update_root_list_cache(row_keys, items);
     state.prune_if_needed(plan);
@@ -617,15 +647,12 @@ fn try_render_root_node_list_cached<R: RowRenderRef>(
                     let mut applied_positions = Vec::with_capacity(dirty_positions.len());
 
                     for position in dirty_positions {
-                        let row =
-                            rows.get(position)
-                                .map(RowRenderRef::row_rc)
-                                .ok_or_else(|| {
-                                    GqlError::new(
-                                        GqlErrorKind::Execution,
-                                        "root row position out of bounds",
-                                    )
-                                })?;
+                        let row = rows.get(position).map(RowRenderRef::row).ok_or_else(|| {
+                            GqlError::new(
+                                GqlErrorKind::Execution,
+                                "root row position out of bounds",
+                            )
+                        })?;
                         if row.id() != cached.row_keys[position].row_id {
                             state.root_list_requires_full_rebuild = true;
                             break;
@@ -696,7 +723,7 @@ fn try_render_root_node_list_splice<R: RowRenderRef>(
 ) -> GqlResult<Option<(Vec<RowCacheKey>, Vec<ResponseValue>, GraphqlRootListPatch)>> {
     let row_keys = rows
         .iter()
-        .map(|row| RowCacheKey::new(node_id, row.row_rc()))
+        .map(|row| RowCacheKey::new(node_id, row.row()))
         .collect::<Vec<_>>();
     let new_row_positions = row_keys
         .iter()
@@ -750,7 +777,7 @@ fn try_render_root_node_list_splice<R: RowRenderRef>(
 
     let uncached_rows = positions_needing_render
         .iter()
-        .filter_map(|position| rows.get(*position).map(RowRenderRef::row_rc))
+        .filter_map(|position| rows.get(*position).map(RowRenderRef::row))
         .filter(|row| !row_is_cached(state, node_id, row))
         .collect::<Vec<_>>();
     if !uncached_rows.is_empty() {
@@ -768,12 +795,9 @@ fn try_render_root_node_list_splice<R: RowRenderRef>(
             }
         }
 
-        let row = rows
-            .get(position)
-            .map(RowRenderRef::row_rc)
-            .ok_or_else(|| {
-                GqlError::new(GqlErrorKind::Execution, "root row position out of bounds")
-            })?;
+        let row = rows.get(position).map(RowRenderRef::row).ok_or_else(|| {
+            GqlError::new(GqlErrorKind::Execution, "root row position out of bounds")
+        })?;
         let rendered = render_node_object(cache, catalog, plan, state, node_id, row)?;
         if let Some(old_position) = old_position {
             if cached.items[old_position] == rendered {
@@ -812,7 +836,7 @@ fn render_node_list<R: RowRenderRef>(
 
     let uncached_rows = rows
         .iter()
-        .map(RowRenderRef::row_rc)
+        .map(RowRenderRef::row)
         .filter(|row| !row_is_cached(state, node_id, row))
         .collect::<Vec<_>>();
     if !uncached_rows.is_empty() {
@@ -822,26 +846,22 @@ fn render_node_list<R: RowRenderRef>(
     let mut values = Vec::with_capacity(rows.len());
     for row in rows {
         values.push(render_node_object(
-            cache,
-            catalog,
-            plan,
-            state,
-            node_id,
-            row.row_rc(),
+            cache, catalog, plan, state, node_id, row,
         )?);
     }
     Ok(values)
 }
 
-fn render_node_object(
+fn render_node_object<R: RowRenderRef + ?Sized>(
     cache: &TableCache,
     catalog: &GraphqlCatalog,
     plan: &GraphqlBatchPlan,
     state: &mut GraphqlBatchState,
     node_id: NodeId,
-    row: &Rc<Row>,
+    row: &R,
 ) -> GqlResult<ResponseValue> {
-    let row_key = RowCacheKey::new(node_id, row);
+    let row_ref = row.row();
+    let row_key = RowCacheKey::new(node_id, row_ref);
     if let Some(cached) = state.row_cache.get(&row_key) {
         return Ok(cached.clone());
     }
@@ -855,16 +875,16 @@ fn render_node_object(
             RenderFieldKind::Typename { value } => {
                 ResponseValue::Scalar(Value::String(value.clone()))
             }
-            RenderFieldKind::Column { column_index } => row
+            RenderFieldKind::Column { column_index } => row_ref
                 .get(*column_index)
                 .cloned()
                 .map(ResponseValue::Scalar)
                 .unwrap_or(ResponseValue::Null),
             RenderFieldKind::ForwardRelation { edge_id } => {
-                render_forward_relation(cache, catalog, plan, state, *edge_id, row_key, row)?
+                render_forward_relation(cache, catalog, plan, state, *edge_id, row_key, row_ref)?
             }
             RenderFieldKind::ReverseRelation { edge_id } => {
-                render_reverse_relation(cache, catalog, plan, state, *edge_id, row_key, row)?
+                render_reverse_relation(cache, catalog, plan, state, *edge_id, row_key, row_ref)?
             }
         };
         fields.push(ResponseField::new(field.response_key.clone(), value));
@@ -882,7 +902,7 @@ fn render_forward_relation(
     state: &mut GraphqlBatchState,
     edge_id: EdgeId,
     parent_row_key: RowCacheKey,
-    row: &Rc<Row>,
+    row: &Row,
 ) -> GqlResult<ResponseValue> {
     let edge = plan.edge(edge_id);
     let Some(key) = row.get(edge.relation.child_column_index).cloned() else {
@@ -903,8 +923,8 @@ fn render_forward_relation(
 
     match child_row {
         Some(child_row) => {
-            if !row_is_cached(state, edge.child_node, &child_row) {
-                let singleton = [&child_row];
+            if !row_is_cached(state, edge.child_node, child_row.as_ref()) {
+                let singleton = [child_row.as_ref()];
                 prefetch_node_edges_with_children(
                     cache,
                     catalog,
@@ -914,13 +934,20 @@ fn render_forward_relation(
                     &singleton,
                 )?;
             }
-            render_node_object(cache, catalog, plan, state, edge.child_node, &child_row)
+            render_node_object(
+                cache,
+                catalog,
+                plan,
+                state,
+                edge.child_node,
+                child_row.as_ref(),
+            )
         }
         None => Ok(ResponseValue::Null),
     }
 }
 
-fn row_is_cached(state: &GraphqlBatchState, node_id: NodeId, row: &Rc<Row>) -> bool {
+fn row_is_cached(state: &GraphqlBatchState, node_id: NodeId, row: &Row) -> bool {
     state
         .row_cache
         .contains_key(&RowCacheKey::new(node_id, row))
@@ -933,7 +960,7 @@ fn render_reverse_relation(
     state: &mut GraphqlBatchState,
     edge_id: EdgeId,
     parent_row_key: RowCacheKey,
-    row: &Rc<Row>,
+    row: &Row,
 ) -> GqlResult<ResponseValue> {
     let edge = plan.edge(edge_id);
     let Some(key) = row.get(edge.relation.parent_column_index).cloned() else {
@@ -961,7 +988,7 @@ fn prefetch_node_edges(
     plan: &GraphqlBatchPlan,
     state: &mut GraphqlBatchState,
     node_id: NodeId,
-    rows: &[&Rc<Row>],
+    rows: &[&Row],
 ) -> GqlResult<()> {
     if rows.is_empty() {
         return Ok(());
@@ -1014,7 +1041,7 @@ fn prefetch_node_edges_with_children(
     plan: &GraphqlBatchPlan,
     state: &mut GraphqlBatchState,
     node_id: NodeId,
-    rows: &[&Rc<Row>],
+    rows: &[&Row],
 ) -> GqlResult<()> {
     prefetch_node_edges(cache, catalog, plan, state, node_id, rows)?;
 
@@ -1042,10 +1069,10 @@ fn prefetch_node_edges_with_children(
                 continue;
             };
             for child_row in child_rows {
-                if row_is_cached(state, edge.child_node, child_row) {
+                if row_is_cached(state, edge.child_node, child_row.as_ref()) {
                     continue;
                 }
-                let child_row_key = RowCacheKey::new(edge.child_node, child_row);
+                let child_row_key = RowCacheKey::new(edge.child_node, child_row.as_ref());
                 if !seen_child_rows.insert(child_row_key) {
                     continue;
                 }
@@ -1058,14 +1085,17 @@ fn prefetch_node_edges_with_children(
     }
 
     for (child_node, child_rows) in child_rows_by_node {
-        let child_row_refs = child_rows.iter().collect::<Vec<_>>();
+        let child_row_refs = child_rows
+            .iter()
+            .map(|row| row.as_ref())
+            .collect::<Vec<_>>();
         prefetch_node_edges(cache, catalog, plan, state, child_node, &child_row_refs)?;
     }
 
     Ok(())
 }
 
-fn collect_edge_keys(edge: &RelationEdgePlan, rows: &[&Rc<Row>]) -> HashSet<Value> {
+fn collect_edge_keys(edge: &RelationEdgePlan, rows: &[&Row]) -> HashSet<Value> {
     let mut keys = HashSet::new();
     for row in rows {
         let value = match edge.kind {
